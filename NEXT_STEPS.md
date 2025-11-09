@@ -1,3 +1,7 @@
+- Improve the words tokenization training in realtime for maximum performances, analyzing first the dataset and obtaining the most efficient splits.
+- Improve the "sentence part embedding" process, especially with the introduction of "emotional keywords", an example of additional tokens.
+- For sentence part embedding, you have to divide correctly complex string into small parts (divided by puntaction or with the help of grammar analysis tools) and then using a tool like all-mpnet-base-v2, all-MiniLM-L6-v2 or text-embedding-3 to have a base to tokenization (emotional part has to be added as different tokens). So you can help yourself with most effective embedding models, and remember to evaluate if available CUDA, MPS or CPU devices.
+- Flush on MySQL database less used data when SQLite DB begins to require too much memory.
 - Promote the new profiling/eval metrics into a structured `var/eval_logs/*.json` feed so multiple runs can be compared without scraping stdout.
 - Extend the MariaDB migration utility to support incremental upserts (avoid dropping tables) for faster roll-outs after nightly training.
 - Evaluate the paraphraser thresholds on long, multi-turn prompts and add guard rails so corrective instructions are never rewritten.
