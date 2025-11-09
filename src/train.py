@@ -21,6 +21,7 @@ from db_slm import DBSLMEngine
 from db_slm.evaluation import (
     EvalLogWriter,
     EvaluationRecord,
+    QualityGate,
     ResponseEvaluator,
     run_inference_records,
 )
@@ -312,6 +313,7 @@ class InferenceMonitor:
         samples_per_cycle: int,
         evaluator: ResponseEvaluator,
         logger: EvalLogWriter | None = None,
+        quality_gate: QualityGate | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -320,6 +322,7 @@ class InferenceMonitor:
         self.next_threshold = interval_tokens
         self.evaluator = evaluator
         self.logger = logger
+        self.quality_gate = quality_gate
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -334,15 +337,16 @@ class InferenceMonitor:
     def _run_cycle(self, threshold: int) -> None:
         sample_size = min(len(self.dataset), self.samples)
         selections = random.sample(self.dataset, sample_size)
-        run_inference_records(
-            self.engine,
-            self.evaluator,
-            selections,
-            label=f"{threshold} ingested tokens",
-            user_id="trainer",
-            agent_name="db-slm",
-            logger=self.logger,
-        )
+            run_inference_records(
+                self.engine,
+                self.evaluator,
+                selections,
+                label=f"{threshold} ingested tokens",
+                user_id="trainer",
+                agent_name="db-slm",
+                logger=self.logger,
+                quality_gate=self.quality_gate,
+            )
 
 
 class IngestProfiler:
@@ -414,6 +418,9 @@ def main() -> None:
         }
         metrics_writer = EvalLogWriter(metrics_path, run_metadata)
         print(f"[metrics] Exporting evaluation timeline to {metrics_writer.path}")
+    quality_gate: QualityGate | None = None
+    if getattr(settings, "quality_queue_path", None):
+        quality_gate = QualityGate(settings.quality_queue_path)
     engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order, settings=settings)
     flusher: ColdStorageFlusher | None = None
     if settings.backend == "sqlite":
@@ -447,6 +454,7 @@ def main() -> None:
         args.eval_samples,
         evaluator,
         logger=metrics_writer,
+        quality_gate=quality_gate,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -459,11 +467,20 @@ def main() -> None:
                 args.eval_samples,
                 evaluator,
                 logger=metrics_writer,
+                quality_gate=quality_gate,
             )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
             print(f"[eval] Warning: {exc}. Disabling evaluation probes.")
-            monitor = InferenceMonitor(engine, [], 0, args.eval_samples, evaluator, logger=metrics_writer)
+            monitor = InferenceMonitor(
+                engine,
+                [],
+                0,
+                args.eval_samples,
+                evaluator,
+                logger=metrics_writer,
+                quality_gate=quality_gate,
+            )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
     total_tokens = 0
@@ -495,6 +512,7 @@ def main() -> None:
                     user_id="trainer",
                     agent_name="db-slm",
                     logger=metrics_writer,
+                    quality_gate=quality_gate,
                 )
             if flusher:
                 flusher.maybe_flush()

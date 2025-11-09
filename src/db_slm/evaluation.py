@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from .inference_shared import issue_prompt
 from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
+from .quality import SentenceQualityScorer
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,8 @@ class EvaluationSampleResult:
     reference: str
     generated: str
     emotion: str
-    metrics: dict[str, float]
+    metrics: dict[str, float | int | None]
+    flagged: bool = False
 
 
 def preview(text: str, width: int = 1000) -> str:
@@ -44,18 +46,24 @@ class ResponseEvaluator:
 
     def __init__(self, engine: DBSLMEngine) -> None:
         self.engine = engine
+        embedder_model = getattr(getattr(engine, "settings", None), "embedder_model", "all-MiniLM-L6-v2")
+        shared_embedder = getattr(getattr(engine, "segment_embedder", None), "embedder", None)
+        self.quality = SentenceQualityScorer(embedder_model=embedder_model, embedder=shared_embedder)
 
-    def evaluate(self, prompt: str, reference: str, candidate: str) -> dict[str, float]:
+    def evaluate(self, prompt: str, reference: str, candidate: str) -> dict[str, float | int | None]:
         lexical = lexical_overlap(reference, candidate)
         rouge = rouge_l_score(reference, candidate)
         ppl_generated = self._perplexity(prompt, candidate)
         ppl_reference = self._perplexity(prompt, reference)
-        return {
+        metrics: dict[str, float | int | None] = {
             "lexical": lexical,
             "rougeL": rouge,
             "ppl_generated": ppl_generated,
             "ppl_reference": ppl_reference,
         }
+        metrics["lexical_novelty"] = max(0.0, 1.0 - lexical)
+        metrics.update(self.quality.combined_quality(candidate, reference, lexical))
+        return metrics
 
     def _perplexity(self, prompt: str, target: str) -> float:
         tokens = self.engine.tokenizer.encode(target, add_special_tokens=False)
@@ -95,12 +103,21 @@ def _mean_metric(
 def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, float | None]:
     if not samples:
         return {}
-    return {
-        "lexical_mean": _mean_metric(samples, "lexical"),
-        "rougeL_mean": _mean_metric(samples, "rougeL"),
-        "ppl_generated_mean": _mean_metric(samples, "ppl_generated"),
-        "ppl_reference_mean": _mean_metric(samples, "ppl_reference"),
+    summary_keys = {
+        "lexical_mean": "lexical",
+        "lexical_novelty_mean": "lexical_novelty",
+        "rougeL_mean": "rougeL",
+        "ppl_generated_mean": "ppl_generated",
+        "ppl_reference_mean": "ppl_reference",
+        "grammar_errors_mean": "grammar_errors",
+        "grammar_score_mean": "grammar_score",
+        "cola_acceptability_mean": "cola_acceptability",
+        "semantic_similarity_mean": "semantic_similarity",
+        "semantic_novelty_mean": "semantic_novelty",
+        "length_ratio_mean": "length_ratio",
+        "quality_score_mean": "quality_score",
     }
+    return {summary_name: _mean_metric(samples, metric_name) for summary_name, metric_name in summary_keys.items()}
 
 
 def run_inference_records(
@@ -112,6 +129,7 @@ def run_inference_records(
     user_id: str = "trainer",
     agent_name: str = "db-slm",
     logger: EvalLogWriter | None = None,
+    quality_gate: "QualityGate | None" = None,
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
@@ -120,24 +138,36 @@ def run_inference_records(
     )
     results: list[EvaluationSampleResult] = []
     for idx, record in enumerate(records, start=1):
+        ref_words = max(1, len(record.response.split()))
+        min_words = max(20, min(512, int(ref_words * 0.85)))
         _, generated = issue_prompt(
             engine,
             record.prompt,
             user_id=user_id,
             agent_name=agent_name,
             seed_history=False,
-            min_response_words=20,
+            min_response_words=min_words,
         )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
+        flagged = False
+        flag_reasons: list[str] = []
+        if quality_gate:
+            flagged, flag_reasons = quality_gate.process(record, generated, metrics)
+            if flagged:
+                joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
+                print(f"[eval] #{idx}: flagged for retraining ({joined}).")
         print(
             "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
-            "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} prompt='{prompt}' response='{response}'".format(
+            "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "
+            "prompt='{prompt}' response='{response}'".format(
                 idx=idx,
                 emotion=record.emotion,
                 lex=metrics["lexical"],
                 rouge=metrics["rougeL"],
                 ppl_gen=metrics["ppl_generated"],
                 ppl_ref=metrics["ppl_reference"],
+                sim=metrics.get("semantic_similarity") or 0.0,
+                ratio=metrics.get("length_ratio") or 0.0,
                 prompt=preview(record.prompt),
                 response=preview(generated),
             )
@@ -151,6 +181,7 @@ def run_inference_records(
                 generated=generated,
                 emotion=record.emotion,
                 metrics=metrics,
+                 flagged=flagged,
             )
         )
     summary = summarize_samples(results)
@@ -160,6 +191,9 @@ def run_inference_records(
             ("rougeL_mean", "rougeL"),
             ("ppl_generated_mean", "ppl(gen)"),
             ("ppl_reference_mean", "ppl(ref)"),
+            ("semantic_similarity_mean", "sim"),
+            ("length_ratio_mean", "len_ratio"),
+            ("quality_score_mean", "quality"),
         ]
         parts: list[str] = []
         for key, label_name in metric_order:
@@ -212,6 +246,7 @@ class EvalLogWriter:
                     "reference": preview(sample.reference, width=240),
                     "generated": preview(sample.generated, width=240),
                     "metrics": self._sanitize_metrics(sample.metrics),
+                    "flagged": sample.flagged,
                 }
                 for sample in samples
             ],
@@ -281,3 +316,59 @@ class EvalLogWriter:
     @staticmethod
     def _timestamp() -> str:
         return dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+class QualityGate:
+    """Collects low-quality generations for targeted retraining."""
+
+    def __init__(
+        self,
+        output_path: str | Path,
+        *,
+        grammar_threshold: int = 3,
+        cola_floor: float = 0.45,
+        similarity_floor: float = 0.55,
+    ) -> None:
+        self.path = Path(output_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.grammar_threshold = grammar_threshold
+        self.cola_floor = cola_floor
+        self.similarity_floor = similarity_floor
+
+    def process(
+        self,
+        record: EvaluationRecord,
+        candidate: str,
+        metrics: dict[str, Any],
+    ) -> tuple[bool, list[str]]:
+        flagged, reasons = self._should_flag(metrics)
+        if not flagged:
+            return False, []
+        event = {
+            "ts": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "prompt": record.prompt,
+            "reference": record.response,
+            "generated": candidate,
+            "emotion": record.emotion,
+            "metrics": metrics,
+            "reasons": reasons,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+        return True, reasons
+
+    def _should_flag(self, metrics: dict[str, Any]) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        grammar_errors = metrics.get("grammar_errors")
+        if isinstance(grammar_errors, (int, float)) and grammar_errors >= self.grammar_threshold:
+            reasons.append(f"grammar_errors>={self.grammar_threshold}")
+        cola = metrics.get("cola_acceptability")
+        if isinstance(cola, (int, float)) and cola < self.cola_floor:
+            reasons.append(f"cola<{self.cola_floor}")
+        similarity = metrics.get("semantic_similarity")
+        if isinstance(similarity, (int, float)) and similarity < self.similarity_floor:
+            reasons.append(f"semantic_similarity<{self.similarity_floor}")
+        length_ratio = metrics.get("length_ratio")
+        if isinstance(length_ratio, (int, float)) and (length_ratio < 0.6 or length_ratio > 1.4):
+            reasons.append("length_mismatch")
+        return (len(reasons) > 0, reasons)

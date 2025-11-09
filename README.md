@@ -150,6 +150,23 @@ ROUGE-L, generated/reference perplexity) after every probe and mirrors the raw s
 profiling records so you can diff long runs or export the JSON into your own dashboards. Point
 `--metrics-export` at a custom path when you need to archive the file elsewhere.
 
+Evaluation probes also call the new sentence-quality stack: LanguageTool for grammar deltas,
+`textattack/roberta-base-CoLA` for semantic acceptability, and the shared sentence-transformer
+embedder for similarity/novelty scores. Those numbers are appended to the JSON timeline alongside
+lexical/ROUGE/perplexity values, so you can catch regressions that only manifest as grammatical
+errors or semantic drift. Because `emotion_data.json` responses average ~347 words, the evaluator
+derives `min_response_words` from the reference length (capped at 512 words) to ensure the logged
+`|RESPONSE|` frame actually reaches the substantive part of the answer instead of truncating after
+128 words.
+
+Low-quality generations (grammar errors ≥ 3, CoLA < 0.45, semantic similarity < 0.55, or a >40%
+length mismatch) are streamed into `DBSLM_QUALITY_QUEUE_PATH` (defaults to
+`var/eval_logs/quality_retrain_queue.jsonl`). This “retrain queue” doubles as a regression fixture:
+drop the file back into `train.py` as an evaluation dataset and the weakest samples receive targeted
+attention during the next ingest. Heavy grammar/semantic scoring only runs when the adaptive CPU
+guard detects spare headroom, so long streaming ingests do not pay a latency penalty on saturated
+laptops.
+
 ## Inference CLI (`src/run.py`)
 
 `run.py` spins up a conversational REPL backed by the database produced during training. The loop
@@ -196,6 +213,11 @@ exchanges and paraphrases overly similar replies so you still get meaningful sum
 verbatim echo. Multi-turn prompts and corrective instructions are explicitly guarded, so the
 paraphraser never rewrites structured guidance or follow-up directions.
 
+`scripts/run_paraphraser_regression.py` exercises those guard rails against
+`studies/paraphraser_regression.jsonl`, which mixes multi-turn corrective threads, structural tags,
+and plain prompts that should still be rewritten. Wire it into CI or run it locally whenever you
+tweak `SimpleParaphraser`.
+
 Training-time evaluations were further hardened so the decoder always produces at least 20 words,
 even when the probabilistic backoff is uncertain. The new response backstop adds transparent filler
 sentences referencing the prompt keywords so ROUGE/perplexity measurements never silently drop rows.
@@ -212,23 +234,29 @@ make smoke-train
 
 Use `make clean-smoke` to remove the temporary database when you're done.
 
-## MariaDB Migration
+## SQLite vs. MariaDB Workflow
 
-Once the SQLite validation database looks healthy, run:
+SQLite stays in the loop for day-to-day training and interactive inference because it behaves well on
+laptops, WAL keeps ingest latency predictable, and the Level 1 counts fit comfortably inside a single
+file. Once the corpus grows, the `ColdStorageFlusher` starts streaming rarely accessed contexts into
+MariaDB so you get a lossless archival copy without ballooning local RSS. Downstream inference stacks
+(or analytics jobs) can attach directly to MariaDB, while SQLite keeps the hot contexts close to the
+trainer.
+
+When you're ready to sync the two stores, run:
 
 ```bash
-# Generate a portable SQL script
+# Generate a portable SQL script for QA/backup
 python scripts/migrate_sqlite_to_mariadb.py --sqlite var/db_slm.sqlite3 --output var/mariadb.sql
 
-# Optionally push it straight into MariaDB (requires mysql-connector-python)
-python scripts/migrate_sqlite_to_mariadb.py --apply --drop-existing
+# Dry-run the incremental upsert against the MariaDB DSN from .env
+python scripts/migrate_sqlite_to_mariadb.py --apply --incremental --dry-run
 
-# Or upsert rows in place without dropping tables
+# Apply the same bundle for real (no rollback) once the dry-run looks clean
 python scripts/migrate_sqlite_to_mariadb.py --apply --incremental
 ```
 
-The migration utility introspects the SQLite schema/tables, emits MariaDB-compatible DDL +
-INSERTs, and (when `--apply` is selected) replays them against the credentials from `.env`. This
-keeps the production backend in sync with the SQLite dev instance without manually rewriting schema
-definitions. Use `--incremental` for nightly refreshes that should avoid table drops while still
-upserting every SQLite row via `INSERT ... ON DUPLICATE KEY UPDATE`.
+`--dry-run` wraps the entire MariaDB session inside a rollback-only transaction, so you can confirm
+that upserts leave staging tables untouched before flipping the nightly job over. Use
+`--drop-existing` only when you explicitly need a full rebuild; the default incremental mode mirrors
+the SQLite counts via `INSERT ... ON DUPLICATE KEY UPDATE` so both backends stay logically identical.

@@ -155,6 +155,7 @@ def apply_bundle(
     env_file: str | Path,
     *,
     incremental: bool = False,
+    dry_run: bool = False,
 ) -> None:
     try:
         import mysql.connector  # type: ignore
@@ -192,14 +193,17 @@ def apply_bundle(
             column_list = ", ".join(f"`{col}`" for col in table.columns)
             query = f"INSERT INTO `{table.name}` ({column_list}) VALUES ({placeholders})"
         cursor.executemany(query, table.rows)
-        conn.commit()
     cursor.execute("SET FOREIGN_KEY_CHECKS=1")
-    conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
     cursor.close()
     conn.close()
     mode = "incremental upsert" if incremental else "replace"
+    suffix = " (dry-run)" if dry_run else ""
     print(
-        f"[migrate] Applied migration bundle ({mode}) to MariaDB database '{settings.mariadb_database}'."
+        f"[migrate] Applied migration bundle ({mode}{suffix}) to MariaDB database '{settings.mariadb_database}'."
     )
 
 
@@ -237,6 +241,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use INSERT ... ON DUPLICATE KEY UPDATE instead of deleting existing rows.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Execute the MariaDB session inside a rollback-only transaction (implies --apply).",
+    )
     return parser.parse_args()
 
 
@@ -247,6 +256,8 @@ def main() -> None:
         raise SystemExit(f"SQLite database not found: {sqlite_path}")
     if args.incremental and args.drop_existing:
         raise SystemExit("--incremental cannot be combined with --drop-existing.")
+    if args.dry_run and not args.apply:
+        raise SystemExit("--dry-run requires --apply.")
     bundle = build_bundle(sqlite_path)
     output_path = Path(args.output).expanduser()
     write_sql(bundle, output_path)
@@ -256,6 +267,7 @@ def main() -> None:
             drop_existing=args.drop_existing,
             env_file=args.env,
             incremental=args.incremental,
+            dry_run=args.dry_run,
         )
     else:
         print("[migrate] Skipped --apply (script written only).")

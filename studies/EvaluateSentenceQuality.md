@@ -191,3 +191,19 @@ For your needs, I would recommend a two-step process:
 2.  If it passes, run it through a **CoLA-fine-tuned model** to check for *semantic sense*.
 
 Would you like to dive deeper into how perplexity is calculated?
+
+### Automation inside `train.py`
+
+`src/train.py` now wires this two-step process directly into every evaluation probe:
+
+1.  A `SentenceQualityScorer` runs LanguageTool (grammar), `textattack/roberta-base-CoLA`
+    (acceptability), and the shared sentence-transformer embedder (semantic similarity/novelty).
+2.  The combined metrics are logged next to lexical/ROUGE/perplexity scores and any generation that
+    breaches the default guard rails (≥3 grammar errors, CoLA < 0.45, semantic similarity < 0.55, or
+    a >40% length gap) is appended to `DBSLM_QUALITY_QUEUE_PATH`
+    (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can feed the weakest samples back
+    into the next training pass without manual triage.
+
+Heavy quality checks only trigger when the adaptive CPU guard sees spare capacity, so long running
+ingests keep streaming even on constrained laptops. Set `DBSLM_QUALITY_QUEUE_PATH` to an empty value
+in `.env` if you need to opt out temporarily.

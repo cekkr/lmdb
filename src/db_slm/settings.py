@@ -27,6 +27,7 @@ class DBSLMSettings:
     backend: str
     sqlite_path: str
     dataset_path: str
+    quality_queue_path: str
     mariadb_host: str
     mariadb_port: int
     mariadb_user: str
@@ -62,6 +63,9 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     backend = read("DBSLM_BACKEND", "sqlite").lower()
     sqlite_path = read("DBSLM_SQLITE_PATH", "var/db_slm.sqlite3")
     dataset_path = read("DBSLM_DATASET_PATH", "datasets/emotion_data.json")
+    quality_queue_path = read(
+        "DBSLM_QUALITY_QUEUE_PATH", "var/eval_logs/quality_retrain_queue.jsonl"
+    )
     mariadb_host = read("DBSLM_MARIADB_HOST", "127.0.0.1")
     mariadb_port = int(read("DBSLM_MARIADB_PORT", "3306"))
     mariadb_user = read("DBSLM_MARIADB_USER", "dbslm")
@@ -77,6 +81,7 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         backend=backend,
         sqlite_path=sqlite_path,
         dataset_path=dataset_path,
+        quality_queue_path=quality_queue_path,
         mariadb_host=mariadb_host,
         mariadb_port=mariadb_port,
         mariadb_user=mariadb_user,

@@ -33,8 +33,9 @@ change so the next agent inherits the latest context.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
   real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`.
-- Evaluation probes now request at least 20 generated words via a response backstop so lexical /
-  ROUGE / perplexity logs never drop a row due to blank generations.
+- Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
+  via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
+  truncated generations.
 - `ColdStorageFlusher` (wired into `train.py`) monitors the SQLite file size and automatically
   migrates low-frequency contexts into MariaDB once `DBSLM_SQLITE_FLUSH_THRESHOLD_MB` is hit,
   removing the same rows locally to keep memory pressure in check.
@@ -57,11 +58,22 @@ change so the next agent inherits the latest context.
 - Evaluation summaries are written both to stdout and to structured JSON under
   `var/eval_logs/train-*.json`. Set `--metrics-export <path>` (or `-` to disable) to control the feed,
   which captures probe averages plus optional ingest profiling samples.
+- Sentence quality checks now combine LanguageTool grammar deltas, the CoLA acceptability head, and
+  embedder-based semantic similarity/novelty. Metrics land next to lexical/ROUGE/perplexity in the
+  eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
+  (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
+  samples later.
+- The evaluator infers `min_response_words` from the reference length (capped at 512) so long-form
+  corpora like `emotion_data.json` do not lose the substantive portion of the `|RESPONSE|` frame, and
+  CPU-heavy quality scoring is gated behind the adaptive load monitor to avoid starving ingestion.
 - Both `train.py` and `run.py` now rely on `db_slm.inference_shared.issue_prompt()` so scripted probes
   and the REPL reuse the same conversation bootstrapper.
 - `scripts/migrate_sqlite_to_mariadb.py` converts the SQLite store into MariaDB-ready DDL + data and
   can optionally apply it directly using credentials from `.env`. `--incremental` performs
   `INSERT ... ON DUPLICATE KEY UPDATE` cycles so nightly refreshes no longer need to drop tables.
+- `scripts/run_paraphraser_regression.py` consumes `studies/paraphraser_regression.jsonl` to ensure
+  multi-turn corrective threads, structural tags, and ordinary prompts all trigger the expected
+  paraphraser behavior.
 - `Makefile` now includes `smoke-train`, a capped ingest + inference probe suitable for CI health
   checks.
 
@@ -74,6 +86,8 @@ change so the next agent inherits the latest context.
   guidance: stay under ~2.5 GB RSS and <5 s per chunk on 16 GB laptops).
 - Let the held-out probes run with ROUGE/perplexity enabled so you can correlate throughput tweaks
   with quantitative gains instead of relying on overlap logs only.
+- `datasets.md` now tracks basic stats for `emotion_data.json` (avg response 347 words, max 1,251) so
+  chunk sizes, eval thresholds, and paraphraser guard rails stay grounded in the actual corpora.
 - Prefer `make smoke-train` for regressions since it wires the capped ingest + inference probe into
   a single command and exercises the paraphraser path automatically.
 
@@ -90,3 +104,7 @@ change so the next agent inherits the latest context.
 - Install `mysql-connector-python` locally before invoking `--apply`; it replays schema + data and
   will drop the destination tables only when `--drop-existing` is explicitly set (announce that step
   before touching prod).
+- `--dry-run` keeps the MariaDB session inside a rollback-only transaction so you can confirm
+  incremental upserts leave staging tables untouched before flipping cron jobs over to the real run.
+  Keep training on SQLite for locality; the `ColdStorageFlusher` and migration script keep MariaDB in
+  sync for archival queries and downstream inference.
