@@ -154,9 +154,7 @@ For order `n` with context (h) and candidate token (w):
   where (N_c(h,*)) counts the number of distinct followers of (h) with count (c).
 
 * **Lower‑order base (continuation probability, order=1)**
-  $$
-  P_{cont}(w) = \frac{#{h: c(h,w) > 0}}{\sum_{w'} #{h: c(h,w') > 0}}
-  $$
+  $$P_{cont}(w) = \frac{\#\{h: c(h,w) > 0\}}{\sum_{w'} \#\{h: c(h,w') > 0\}}$$  
 
 ### 2.3 SQL ETL to compute MKN parameters (sketch)
 
@@ -508,3 +506,147 @@ FROM (
 ---
 
 **Deliverable status:** This spec is sufficient to (a) fill all probability tables from counts, (b) decode with MKN + top‑K/top‑p, (c) bias outputs via memory, and (d) amortize latency with concept spans. It keeps the system tensor‑free while bringing it closer to the behavior of modern text generators.
+
+## 13. Reference Pseudocode (Engine, Training, Inference)
+
+The following pseudocode threads the CONCEPT blueprint, this spec, and the upcoming `src/db_slm` implementation. Each block is an executable recipe for the core algorithms: booting the database engine, running the statistical training/ETL loop, and serving inference with Level‑3 concepts plus Level‑2 memory.
+
+### 13.1 Engine Boot & Maintenance
+
+```text
+procedure InitializeEngine(cfg):
+    conn ← open_database(cfg.dsn)
+    apply_sqlite_pragmas(conn, wal=ON, synchronous=NORMAL)
+    run_migrations(conn, MIGRATIONS_DIR)
+
+    vocab ← load_vocabulary(conn)
+    quant_luts ← load_quantization_tables(conn)
+    concept_repo ← load_concept_catalog(conn)
+
+    hot_contexts ← fetch_hot_contexts(conn, cfg.hot_rank_threshold)
+    prediction_cache ← hydrate_topk_cache(conn, hot_contexts)
+
+    bias_index ← preload_active_biases(conn, since=cfg.bias_window)
+    return Engine(conn, vocab, quant_luts, concept_repo,
+                  prediction_cache, bias_index, cfg)
+
+procedure MaintenanceTick(engine, now):
+    dirty_orders ← collect_dirty_orders(engine.changelog, now)
+    if dirty_orders ≠ ∅:
+        lock(engine.maintenance_mutex)
+        for n in dirty_orders:
+            dirty_ctx ← pop_dirty_contexts(engine.changelog, n)
+            RebuildProbabilities(engine, n, dirty_ctx)
+            RefreshTopK(engine, n, dirty_ctx)
+        unlock(engine.maintenance_mutex)
+
+    if now - engine.last_prune ≥ engine.cfg.prune_interval:
+        run_entropy_pruning(engine.conn, engine.cfg.entropy_epsilon)
+        engine.last_prune ← now
+
+    decay_bias_cache(engine.bias_index, now)
+```
+
+*`dirty_orders`* is fed by training jobs inserting into `tbl_l1_ng_counts_n_delta`. `RebuildProbabilities` and `RefreshTopK` reuse the ETL steps in §2.3 and §6, while the cache hydration mirrors the adaptive cache already described in `AI_REFERENCE.md`.
+
+### 13.2 Training & ETL Loop
+
+```text
+procedure TrainBatch(engine, corpus_batch):
+    normalized_batch ← [normalize_text(doc) for doc in corpus_batch]
+    token_stream ← tokenize_batch(normalized_batch, engine.vocab)
+
+    context_registry_updates ← {}
+    for n in 1..engine.cfg.max_order:
+        ngram_counts ← slide_window(token_stream, n)
+        upsert_counts(engine.conn, table=tbl_l1_ng_counts_n, rows=ngram_counts)
+        mark_dirty(engine.changelog, order=n, contexts=ngram_counts.context_hashes)
+        accumulate_registry(context_registry_updates, ngram_counts)
+
+    upsert_context_registry(engine.conn, context_registry_updates)
+    log_training_batch(engine.conn, corpus_batch.meta)
+
+procedure RebuildProbabilities(engine, order_n, target_contexts):
+    compute_counts_of_counts(engine.conn, order_n, scope=target_contexts)
+    discounts ← solve_mkn_discounts(engine.conn, order_n)
+    ctx_buckets ← materialize_ctx_buckets(engine.conn, order_n, target_contexts)
+
+    discounted ← compute_discounted_mass(engine.conn, order_n, ctx_buckets, discounts)
+    alpha ← compute_backoff_alpha(discounted, ctx_buckets, discounts)
+    lower_order ← fetch_lower_order_probs(engine.conn, order_n-1, discounted.tokens)
+
+    final_mass ← apply_backoff(discounted, alpha, lower_order)
+    quantized ← quantize_probs(final_mass, engine.quant_luts)
+    replace_into_probs(engine.conn, order_n, quantized)
+
+procedure RefreshTopK(engine, order_n, target_contexts):
+    for ctx in target_contexts:
+        topk ← select_topk(engine.conn, order_n, ctx, K=engine.cfg.default_k)
+        replace_into_topk(engine.conn, order_n, ctx, topk)
+        if ctx in engine.prediction_cache:
+            engine.prediction_cache[ctx] ← topk
+```
+
+This loop mirrors §6: ingest text, extract n‑grams, update auxiliary stats, then rebuild `tbl_l1_ng_probs_n` and `tbl_l1_ng_topk_n`. The helper routines map directly to SQL fragments already described in §2.3 (counts‑of‑counts, discounted mass, alpha, quantization).
+
+### 13.3 Inference, Concept Execution, and Decoding
+
+```text
+procedure RunSession(engine, conversation_id, user_text):
+    log_message(engine.conn, conversation_id, role="user", text=user_text)
+    context_tokens ← window_tokens(engine.conn, conversation_id,
+                                   engine.cfg.window_size)
+
+    while session_active(conversation_id):
+        concept ← MaybeSelectConcept(engine, context_tokens, conversation_id)
+        if concept ≠ NONE:
+            span ← ExecuteConcept(engine, concept, conversation_id)
+            emit_to_client(span)
+            context_tokens ← append_tokens(context_tokens, tokenize(span))
+            continue
+
+        word ← DecodeLevel1(engine, conversation_id, context_tokens)
+        emit_to_client(engine.vocab[word])
+        context_tokens ← append_tokens(context_tokens, [word])
+
+        if stop_condition(word, context_tokens, engine.cfg):
+            break
+
+    log_message(engine.conn, conversation_id, role="assistant",
+                text=render_output(conversation_id))
+
+procedure MaybeSelectConcept(engine, ctx_tokens, conversation_id):
+    signals ← poll_execution_signals(engine.conn, conversation_id)
+    if signals ≠ ∅:
+        return highest_priority(signals)
+
+    concept_topk ← fetch_concept_topk(engine.conn, ctx_tokens)
+    scored ← apply_concept_wpriors(concept_topk, conversation_id)
+    if confidence(scored.best) ≥ engine.cfg.concept_threshold:
+        return scored.best
+    return NONE
+
+procedure ExecuteConcept(engine, concept, conversation_id):
+    payload ← hydrate_concept_payload(engine.conn, concept, conversation_id)
+    span ← verbalize_concept(engine.concept_repo, concept, payload)
+    store_concept_trace(engine.conn, conversation_id, concept, payload, span)
+    return span
+
+procedure DecodeLevel1(engine, conversation_id, ctx_tokens):
+    h ← hash_context(ctx_tokens, order=engine.cfg.max_order)
+    topk ← engine.prediction_cache.get(h)
+    if topk = NONE:
+        topk ← fetch_topk(engine.conn, h, engine.cfg.max_order)
+        engine.prediction_cache[h] ← topk
+
+    q ← apply_temperature(topk.q_logprob, engine.cfg.temperature)
+    q ← apply_biases(q, conversation_id, engine.bias_index)
+    q ← apply_pointer_mixture(q, ctx_tokens, engine.cfg.cache_lambda)
+    q ← apply_penalties(q, ctx_tokens, engine.cfg.penalties)
+
+    choice ← sample_top_p(q, engine.cfg.top_p, engine.quant_luts)
+    update_session_cache(engine.conn, conversation_id, choice)
+    return choice
+```
+
+`RunSession` extends the earlier §5.1 loop with concrete hooks: Level‑3 concept arbitration (`MaybeSelectConcept`), Level‑2 corrections via `apply_biases`, pointer/cache mixture (§2.5), and quantized sampling. The same routines back the CLI/REPL flow mentioned in `AI_REFERENCE.md`, ensuring the documentation, concept study, and source all point to identical algorithms.
