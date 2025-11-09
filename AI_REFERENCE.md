@@ -13,4 +13,4 @@ change so the next agent inherits the latest context.
 
 ### Next Steps
 
-`NEXT_STEPS.md` is now the single backlog source; consult it for active tooling tasks and update that file first before mirroring high-level context here. Remove already completed and no more important steps to remember.
+`NEXT_STEPS.md` is now the single backlog source; consult it for active tooling tasks and update that file first before mirroring high-level context here. Update it with your new objectives, remove already completed and no more important steps to remember.
