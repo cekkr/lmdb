@@ -51,6 +51,9 @@ change so the next agent inherits the latest context.
 - `DBSLMEngine` still seeds low-resource conversations with two caretaker turns, but the paraphraser
   now uses length-aware thresholds and explicit guard rails so multi-turn prompts or corrective
   instructions are never rewritten while we avoid verbatim echoes.
+- Responses produced via `train.py` probes and `run.py` REPL now emit tagged frames
+  (`|USER|`, `|RESPONSE|`, and similarly `|TAG_NAME|`) with randomized keyword-focused openers so evaluation logs and
+  training data never echo prompts verbatim and clearly distinguish generated text from context.
 - Evaluation summaries are written both to stdout and to structured JSON under
   `var/eval_logs/train-*.json`. Set `--metrics-export <path>` (or `-` to disable) to control the feed,
   which captures probe averages plus optional ingest profiling samples.
