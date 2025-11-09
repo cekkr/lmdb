@@ -1,3 +1,4 @@
+- While training, the evaluation tends to generate nothing as verbal response. Change the logic: even if you're unsure and with low score, generate at least 20 words: it's essential to evaluate training scoring
 - Improve the words tokenization training in realtime for maximum performances, analyzing first the dataset and obtaining the most efficient splits.
 - Improve the "sentence part embedding" process, especially with the introduction of "emotional keywords", an example of additional tokens.
 - For sentence part embedding, you have to divide correctly complex string into small parts (divided by puntaction or with the help of grammar analysis tools) and then using a tool like all-mpnet-base-v2, all-MiniLM-L6-v2 or text-embedding-3 to have a base to tokenization (emotional part has to be added as different tokens). So you can help yourself with most effective embedding models, and remember to evaluate if available CUDA, MPS or CPU devices.
