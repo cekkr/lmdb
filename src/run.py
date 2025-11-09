@@ -5,15 +5,16 @@ import sys
 from pathlib import Path
 
 from db_slm import DBSLMEngine
+from db_slm.settings import load_settings
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Interact with a trained DB-SLM instance for quick inference."
     )
     parser.add_argument(
         "--db",
-        default="var/db_slm.sqlite3",
+        default=default_db_path,
         help="Path to the SQLite database produced by train.py (default: %(default)s).",
     )
     parser.add_argument(
@@ -107,7 +108,8 @@ def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int |
 
 
 def main() -> None:
-    parser = build_parser()
+    settings = load_settings()
+    parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
 
     engine: DBSLMEngine | None = None

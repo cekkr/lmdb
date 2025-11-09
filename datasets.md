@@ -1,0 +1,1 @@
+First dataset used for training is emotion_data.json [https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b)]()

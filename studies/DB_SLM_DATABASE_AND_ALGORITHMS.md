@@ -414,6 +414,19 @@ LIMIT :K;
 * Append new corpus batches into `tbl_l1_ng_counts_n_delta`; nightly merge into base with `INSERT…ON DUPLICATE KEY UPDATE count = count + VALUES(count)`.
 * Rebuild Top‑K for contexts whose totals changed above a threshold.
 
+### 6.3 Emotion‑rich bootstrap corpus (`datasets/emotion_data.json`)
+
+* **Format.** Newline‑delimited JSON where each row contains `prompt`, `emotion`, and `response`. The `response` text already carries long‑form reasoning tied to the emotion label, making it ideal for kick‑starting Level‑1 statistics and Level‑3 concept cues.
+* **Normalization pass.**
+  1. Read JSON rows via Python (stream + `json.loads`) so we can record ingestion provenance.
+  2. Store `prompt || '\n\n' || response` into `tbl_corpus.text`, while persisting `emotion` inside `tbl_corpus_meta(doc_id, key, value)` to keep the label queryable.
+  3. Optionally insert the `prompt` alone into `tbl_l2_messages` as a seed “user” turn so inference smoke tests can replay it verbatim.
+* **Training split.** Reserve ~5 % of the rows (systematic sampling by doc_id hash) as a held‑out inference suite. The remaining 95 % flow through the standard pipeline: tokenize → extract n‑grams → recompute MKN parameters.
+* **Inference harness.**
+  * During decoding, replay a held‑out `prompt` and check whether the generated continuation overlaps qualitatively with the reference `response`. Track success via ROUGE‑L / overlap of sentiment adjectives.
+  * Record per‑emotion coverage: `SELECT emotion, COUNT(*)` from the held‑out table joined against decoded runs. This ensures jealousy/apathy/etc. all exercise the pointer/cache logic before we move to larger corpora.
+* **Automation hook.** `src/db_slm/settings.py` exposes `DBSLM_DATASET_PATH` so CLI tools (or dedicated ETL scripts) always pick up the same JSON file defined in `.env`. This keeps experimentation reproducible when we swap in more datasets later.
+
 ---
 
 ## 7. Quantization & Lookup LUTs
@@ -650,3 +663,12 @@ procedure DecodeLevel1(engine, conversation_id, ctx_tokens):
 ```
 
 `RunSession` extends the earlier §5.1 loop with concrete hooks: Level‑3 concept arbitration (`MaybeSelectConcept`), Level‑2 corrections via `apply_biases`, pointer/cache mixture (§2.5), and quantized sampling. The same routines back the CLI/REPL flow mentioned in `AI_REFERENCE.md`, ensuring the documentation, concept study, and source all point to identical algorithms.
+
+---
+
+## 14. Environment‑driven configuration
+
+* Copy `.env.example` → `.env` and fill the knobs: the active backend (`DBSLM_BACKEND`), `DBSLM_SQLITE_PATH`, the canonical emotional dataset (`DBSLM_DATASET_PATH`), and MariaDB credentials for staging/production.
+* `src/db_slm/settings.py::load_settings` is a zero‑dependency parser that reads `.env`, overlays real process env variables, and surfaces a `DBSLMSettings` dataclass. `train.py` / `run.py` already draw their default DB paths from `sqlite_dsn()`, so switching datasets or DB paths is a file edit rather than CLI surgery.
+* The same dataclass exposes `mariadb_dsn()` + raw credential fields so future ETL jobs (or SQLAlchemy migrations) can instantiate MariaDB connectors without touching the CLI entry points.
+* Keep `.env` out of version control; `.env.example` documents every knob while leaving secrets blank. This allows CI to inject passwords via env vars and local devs to pin paths that live on their workstation.

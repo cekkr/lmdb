@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 from db_slm import DBSLMEngine
+from db_slm.settings import load_settings
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Ingest raw text corpora into the DB-SLM SQLite backing store."
     )
@@ -19,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db",
-        default="var/db_slm.sqlite3",
+        default=default_db_path,
         help="Path to the SQLite database file (default: %(default)s).",
     )
     parser.add_argument(
@@ -89,7 +90,8 @@ def read_corpora(paths: Iterable[Path], encoding: str) -> List[Tuple[str, str]]:
 
 
 def main() -> None:
-    parser = build_parser()
+    settings = load_settings()
+    parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
 
     if not args.inputs and not args.stdin:
