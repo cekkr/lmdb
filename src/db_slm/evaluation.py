@@ -76,7 +76,13 @@ def run_inference_records(
         f"[eval] Running {len(records)} inference probe(s) from {label} to gauge training quality."
     )
     for idx, record in enumerate(records, start=1):
-        _, generated = issue_prompt(engine, record.prompt, user_id=user_id, agent_name=agent_name)
+        _, generated = issue_prompt(
+            engine,
+            record.prompt,
+            user_id=user_id,
+            agent_name=agent_name,
+            seed_history=False,
+        )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
         print(
             "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "

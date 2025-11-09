@@ -112,7 +112,10 @@ generated response and the held-out reference. This lets you confirm that quanti
 while you experiment with chunk sizes or smoothing tweaks, even when the qualitative samples look
 similar. When `--chunk-eval-percent` is supplied, the same metric stack runs immediately after each
 chunk ingest using its freshly carved-out hold-outs, giving you a rolling measure that tracks the
-latest corpus segment instead of relying solely on the static evaluation dataset.
+latest corpus segment instead of relying solely on the static evaluation dataset. Probes start a
+fresh conversation with the low-resource seeding helper disabled, so the reported generations will
+reflect the newly trained n-gram tables instead of the caretaker seed dialog you may see in
+interactive `run.py` sessions on tiny corpora.
 
 ## Inference CLI (`src/run.py`)
 

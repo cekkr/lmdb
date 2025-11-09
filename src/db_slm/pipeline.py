@@ -45,9 +45,12 @@ class DBSLMEngine:
     # ------------------------------------------------------------------ #
     # Conversation helpers
     # ------------------------------------------------------------------ #
-    def start_conversation(self, user_id: str, agent_name: str = "db-slm") -> str:
+    def start_conversation(
+        self, user_id: str, agent_name: str = "db-slm", *, seed_history: bool = True
+    ) -> str:
         conversation_id = self.memory.start_conversation(user_id, agent_name)
-        self._low_resource_helper.maybe_seed_history(conversation_id)
+        if seed_history:
+            self._low_resource_helper.maybe_seed_history(conversation_id)
         return conversation_id
 
     def respond(self, conversation_id: str, user_message: str, decoder_cfg: DecoderConfig | None = None) -> str:

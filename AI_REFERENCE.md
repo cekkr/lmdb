@@ -36,6 +36,9 @@ change so the next agent inherits the latest context.
   `--chunk-eval-percent`; those hold-out prompts/responses skip training and run through the same
   inference metrics the moment the chunk finishes ingesting, giving tighter feedback loops tied to
   the newest data.
+- Training-time probes now spin up seedless conversations so low-resource scaffolding never masks
+  evaluation outputs; if you still need the canned turns (e.g., via `run.py`) the helper stays
+  enabled for interactive sessions only.
 - `DBSLMEngine` seeds low-resource conversations with two example turns and paraphrases responses
   when lexical overlap with the prompt stays above ~0.65, which keeps tiny validation runs from
   degenerating into echoes.
