@@ -43,6 +43,8 @@ from the database.
   ```
 - The CLI utilities default to storing everything under `var/db_slm.sqlite3`. Feel free to point them
   at any other SQLite path or even `:memory:` when using the programmatic API.
+- Even though `.env` exposes MariaDB credentials, the reference CLI still targets SQLite until we run
+  the schema migration step. Seeing no MySQL tables during local training is therefore expected.
 
 ## Training CLI (`src/train.py`)
 
@@ -73,6 +75,28 @@ Key options:
 The script reports per-file token counts plus the aggregate number of stored N-grams. If the provided
 corpora are shorter than the N-gram order they are automatically skipped.
 
+Validation helpers shipped with `train.py` make it easier to work with huge NDJSON datasets such as
+`datasets/emotion_data.json`:
+
+- `--json-chunk-size`: stream JSON/NDJSON rows in fixed-size batches so the process never loads the
+  full file into memory.
+- `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
+- `--eval-interval`, `--eval-samples`, `--eval-dataset`, `--eval-pool-size`: enable periodic
+  inference probes during training to log qualitative progress without leaving the script.
+
+Example (quick validation run that ingests only 200 lines and probes the decoder every ~2k tokens):
+
+```bash
+python3 src/train.py datasets/emotion_data.json \
+  --db var/db_slm.sqlite3 \
+  --reset \
+  --json-chunk-size 100 \
+  --max-json-lines 200 \
+  --eval-interval 2000 \
+  --eval-samples 2 \
+  --eval-pool-size 20
+```
+
 ## Inference CLI (`src/run.py`)
 
 `run.py` spins up a conversational REPL backed by the database produced during training. The loop
@@ -94,6 +118,12 @@ Single-shot inference:
 
 ```bash
 python src/run.py --db var/db_slm.sqlite3 --prompt "Remind me what we covered."
+```
+
+After a limited validation run (like the example above) you can immediately inspect the model with:
+
+```bash
+python3 src/run.py --db var/db_slm.sqlite3 --prompt "Summarize the role of empathy in leadership."
 ```
 
 Useful flags:
