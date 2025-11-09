@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from .db import DatabaseEnvironment
+from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
 from .level1 import LogProbQuantizer, MKNSmoother, NGramStore, Tokenizer, Vocabulary
 from .level2 import BiasEngine, ConversationMemory, SessionCache
@@ -27,6 +29,7 @@ class DBSLMEngine:
         self.concepts = ConceptEngine(self.db, self.memory, self.quantizer)
         self.level1 = self.store  # backwards compatibility for callers expecting this attr
         self._ensure_seed_data()
+        self._low_resource_helper = LowResourceHelper(self)
 
     # ------------------------------------------------------------------ #
     # Training utilities
@@ -43,7 +46,9 @@ class DBSLMEngine:
     # Conversation helpers
     # ------------------------------------------------------------------ #
     def start_conversation(self, user_id: str, agent_name: str = "db-slm") -> str:
-        return self.memory.start_conversation(user_id, agent_name)
+        conversation_id = self.memory.start_conversation(user_id, agent_name)
+        self._low_resource_helper.maybe_seed_history(conversation_id)
+        return conversation_id
 
     def respond(self, conversation_id: str, user_message: str, decoder_cfg: DecoderConfig | None = None) -> str:
         self.memory.log_message(conversation_id, "user", user_message)
@@ -73,6 +78,7 @@ class DBSLMEngine:
         if decoded_text:
             segments.append(decoded_text)
         response = " ".join(segment.strip() for segment in segments if segment.strip()).strip()
+        response = self._low_resource_helper.maybe_paraphrase(user_message, response)
         self.memory.log_message(conversation_id, "assistant", response)
         return response
 
@@ -175,3 +181,94 @@ class DBSLMEngine:
             "context": memory.context_window(conversation_id),
             "stats": memory.conversation_stats(conversation_id),
         }
+
+
+class LowResourceHelper:
+    """Adds light scaffolding for tiny training runs (seed history + paraphrasing)."""
+
+    _SEED_DIALOG: Tuple[Tuple[str, str], ...] = (
+        (
+            "Can you keep track of our prior notes even if we only trained on a small slice?",
+            "I keep a lightweight journal of each exchange so even the short validation runs produce usable summaries.",
+        ),
+        (
+            "Summarize what the database-focused LM tries to prove.",
+            "It demonstrates that SQL tables alone can manage vocabulary stats, caches, and concepts without tensors.",
+        ),
+    )
+
+    def __init__(self, engine: DBSLMEngine) -> None:
+        self.engine = engine
+        self.enabled = self._detect_low_resource()
+        self._seeded: Set[str] = set()
+        self._paraphraser = SimpleParaphraser()
+
+    def _detect_low_resource(self) -> bool:
+        total_windows = self.engine.db.scalar(
+            "SELECT SUM(total_count) FROM tbl_l1_context_registry", default=0
+        ) or 0
+        vocab_size = self.engine.db.scalar("SELECT COUNT(*) FROM tbl_l1_vocabulary", default=0) or 0
+        return total_windows < 10_000 or vocab_size < 750
+
+    def maybe_seed_history(self, conversation_id: str) -> None:
+        if not self.enabled or conversation_id in self._seeded:
+            return
+        for user_msg, assistant_msg in self._SEED_DIALOG:
+            self.engine.memory.log_message(conversation_id, "user", user_msg)
+            self.engine.memory.log_message(conversation_id, "assistant", assistant_msg)
+        self._seeded.add(conversation_id)
+
+    def maybe_paraphrase(self, prompt: str, response: str) -> str:
+        if not self.enabled or not response.strip():
+            return response
+        similarity = lexical_overlap(prompt, response)
+        if similarity < 0.65:
+            return response
+        return self._paraphraser.rephrase(prompt, response)
+
+
+class SimpleParaphraser:
+    """String-level paraphraser to avoid verbatim echoes."""
+
+    _RE_WORD = re.compile(r"\b\w+\b")
+    _SYNONYMS = {
+        "remember": "recall",
+        "remind": "refresh",
+        "discussed": "covered",
+        "talked": "spoke",
+        "small": "compact",
+        "tiny": "minimal",
+        "repeat": "restate",
+        "echo": "mirror",
+        "explain": "clarify",
+        "summary": "synopsis",
+    }
+
+    def rephrase(self, prompt: str, response: str) -> str:
+        swapped = self._swap_terms(response)
+        if swapped.strip().lower() == response.strip().lower():
+            swapped = f"I'll restate it differently: {response}"
+        keywords = keyword_summary(prompt, limit=3)
+        suffix = ""
+        if keywords:
+            suffix = f" It still centers on {', '.join(keywords)}."
+        return f"Here's another take: {swapped.strip()}{suffix}"
+
+    def _swap_terms(self, text: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            token = match.group(0)
+            lookup = token.lower()
+            replacement = self._SYNONYMS.get(lookup)
+            if replacement is None:
+                return token
+            return self._match_case(token, replacement)
+
+        return self._RE_WORD.sub(_replace, text)
+
+    @staticmethod
+    def _match_case(source: str, replacement: str) -> str:
+        if source.isupper():
+            return replacement.upper()
+        if source[0].isupper():
+            return replacement.capitalize()
+        return replacement

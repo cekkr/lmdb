@@ -246,6 +246,34 @@ class NGramStore:
         token_id = row["next_token_id"]
         return TokenCandidate(token_id, self.vocab.token_text(token_id), prob, q)
 
+    def token_log_probability(self, context_ids: Sequence[int], next_token_id: int) -> float:
+        """Return log probability for the next token (natural log, fallback-smoothed)."""
+        if next_token_id <= 0:
+            return math.log(1e-12)
+        max_order = min(self.order, len(context_ids) + 1)
+        for order in range(max_order, 0, -1):
+            if order > 1:
+                ctx = context_ids[-(order - 1) :]
+                context_hash = self._hash(ctx)
+            else:
+                context_hash = "__root__"
+            table = self._prob_table(order)
+            rows = self.db.query(
+                f"""
+                SELECT q_logprob
+                FROM {table}
+                WHERE context_hash = ? AND next_token_id = ?
+                LIMIT 1
+                """,
+                (context_hash, next_token_id),
+            )
+            if rows:
+                prob = max(self.quantizer.dequantize_prob(rows[0]["q_logprob"]), 1e-12)
+                return math.log(prob)
+        vocab_size = self.db.scalar("SELECT COUNT(*) FROM tbl_l1_vocabulary", default=1) or 1
+        fallback = max(1.0 / float(vocab_size), 1e-12)
+        return math.log(fallback)
+
     def fetch_context_tokens(self, context_hash: str) -> List[int]:
         if context_hash == "__root__":
             return []

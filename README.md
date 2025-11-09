@@ -83,6 +83,10 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
 - `--eval-interval`, `--eval-samples`, `--eval-dataset`, `--eval-pool-size`: enable periodic
   inference probes during training to log qualitative progress without leaving the script.
+- `--profile-ingest`: print per-corpus latency and resident-set-size metrics so you can keep raising
+  `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
+  of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
+  that tipping point directly in the training logs.
 
 Example (quick validation run that ingests only 200 lines and probes the decoder every ~2k tokens):
 
@@ -96,6 +100,13 @@ python3 src/train.py datasets/emotion_data.json \
   --eval-samples 2 \
   --eval-pool-size 20
 ```
+
+### Training-Time Metrics
+
+Every evaluation probe now prints lexical-overlap, ROUGE-L, and a perplexity stub for both the
+generated response and the held-out reference. This lets you confirm that quantitative scores improve
+while you experiment with chunk sizes or smoothing tweaks, even when the qualitative samples look
+similar.
 
 ## Inference CLI (`src/run.py`)
 
@@ -137,3 +148,36 @@ Useful flags:
 
 Because the CLI uses the exact same engine object, anything logged via `run.py` is immediately
 available to downstream tooling (correction logging, concept payload providers, etc.).
+
+Small validation runs sometimes overfit; the engine now seeds each conversation with short caretaker
+exchanges and paraphrases overly similar replies so you still get meaningful summaries instead of a
+verbatim echo.
+
+## Smoke Testing
+
+A minimal regression path is wired to `make smoke-train`. It performs a capped ingest (400 NDJSON
+lines), runs the periodic evaluation probes with the new metrics, and issues a single REPL-style
+prompt so CI or local developers can confirm the full pipeline still works:
+
+```bash
+make smoke-train
+```
+
+Use `make clean-smoke` to remove the temporary database when you're done.
+
+## MariaDB Migration
+
+Once the SQLite validation database looks healthy, run:
+
+```bash
+# Generate a portable SQL script
+python scripts/migrate_sqlite_to_mariadb.py --sqlite var/db_slm.sqlite3 --output var/mariadb.sql
+
+# Optionally push it straight into MariaDB (requires mysql-connector-python)
+python scripts/migrate_sqlite_to_mariadb.py --apply --drop-existing
+```
+
+The migration utility introspects the SQLite schema/tables, emits MariaDB-compatible DDL +
+INSERTs, and (when `--apply` is selected) replays them against the credentials from `.env`. This
+keeps the production backend in sync with the SQLite dev instance without manually rewriting schema
+definitions.

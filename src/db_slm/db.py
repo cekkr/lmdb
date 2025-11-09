@@ -4,7 +4,7 @@ import contextlib
 import hashlib
 import sqlite3
 from pathlib import Path
-from typing import Generator, Iterable, Sequence
+from typing import Any, Generator, Iterable, Sequence
 
 
 class DatabaseEnvironment:
@@ -278,6 +278,15 @@ class DatabaseEnvironment:
         rows = cur.fetchall()
         cur.close()
         return rows
+
+    def scalar(self, sql: str, params: Sequence | None = None, default: Any | None = None) -> Any:
+        cur = self._conn.execute(sql, params or [])
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return default
+        value = row[0]
+        return value if value is not None else default
 
     def insert_with_id(self, sql: str, params: Sequence | None = None) -> int:
         cur = self._conn.execute(sql, params or [])

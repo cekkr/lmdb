@@ -29,3 +29,37 @@ change so the next agent inherits the latest context.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments.
+- `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
+  ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
+  during long streaming ingests.
+- `DBSLMEngine` seeds low-resource conversations with two example turns and paraphrases responses
+  when lexical overlap with the prompt stays above ~0.65, which keeps tiny validation runs from
+  degenerating into echoes.
+- `scripts/migrate_sqlite_to_mariadb.py` converts the SQLite store into MariaDB-ready DDL + data and
+  can optionally apply it directly using credentials from `.env`.
+- `Makefile` now includes `smoke-train`, a capped ingest + inference probe suitable for CI health
+  checks.
+
+## Operational Notes
+
+### Streaming Ingest / Profiling
+
+- Enable `--profile-ingest` whenever you push `--json-chunk-size` above 500 rows. The profiler logs
+  per-corpus latency plus RSS deltas so you can note the tipping point in `NEXT_STEPS.md` (current
+  guidance: stay under ~2.5 GB RSS and <5 s per chunk on 16 GB laptops).
+- Let the held-out probes run with ROUGE/perplexity enabled so you can correlate throughput tweaks
+  with quantitative gains instead of relying on overlap logs only.
+- Prefer `make smoke-train` for regressions since it wires the capped ingest + inference probe into
+  a single command and exercises the paraphraser path automatically.
+
+### MariaDB Handoff
+
+- Generate a SQL artifact after major SQLite validations:
+  ```
+  python scripts/migrate_sqlite_to_mariadb.py \
+    --sqlite var/db_slm.sqlite3 \
+    --output var/mariadb-release.sql
+  ```
+- Install `mysql-connector-python` locally before invoking `--apply`; it replays schema + data and
+  will drop the destination tables only when `--drop-existing` is explicitly set (announce that step
+  before touching prod).

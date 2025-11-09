@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import random
 import sys
 import textwrap
+import time
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Callable, Iterable, List, Sequence, Tuple
+
+try:  # resource is Unix-only but gives precise RSS readings when available.
+    import resource  # type: ignore
+except ImportError:  # pragma: no cover - Windows fallback
+    resource = None  # type: ignore
 
 from db_slm import DBSLMEngine
+from db_slm.metrics import lexical_overlap, rouge_l_score
 from db_slm.settings import load_settings
 
 
@@ -86,6 +94,11 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Optional cap on the number of JSON/NDJSON lines to ingest per file (default: 0 = unlimited).",
+    )
+    parser.add_argument(
+        "--profile-ingest",
+        action="store_true",
+        help="Measure ingest latency + RSS per corpus to size streaming runs.",
     )
     return parser
 
@@ -212,22 +225,48 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[dict[s
     return records
 
 
-def lexical_overlap_score(reference: str, candidate: str) -> float:
-    ref_tokens = {token.strip(".,!?\"'").lower() for token in reference.split() if token.strip()}
-    if not ref_tokens:
-        return 0.0
-    cand_tokens = {token.strip(".,!?\"'").lower() for token in candidate.split() if token.strip()}
-    if not cand_tokens:
-        return 0.0
-    overlap = ref_tokens & cand_tokens
-    return len(overlap) / len(ref_tokens)
-
-
 def preview(text: str, width: int = 80) -> str:
     collapsed = " ".join(text.split())
     if not collapsed:
         return ""
     return textwrap.shorten(collapsed, width=width, placeholder="…")
+
+
+class ResponseEvaluator:
+    """Aggregates lightweight eval metrics for streaming probes."""
+
+    def __init__(self, engine: DBSLMEngine) -> None:
+        self.engine = engine
+
+    def evaluate(self, prompt: str, reference: str, candidate: str) -> dict[str, float]:
+        lexical = lexical_overlap(reference, candidate)
+        rouge = rouge_l_score(reference, candidate)
+        ppl_generated = self._perplexity(prompt, candidate)
+        ppl_reference = self._perplexity(prompt, reference)
+        return {
+            "lexical": lexical,
+            "rougeL": rouge,
+            "ppl_generated": ppl_generated,
+            "ppl_reference": ppl_reference,
+        }
+
+    def _perplexity(self, prompt: str, target: str) -> float:
+        tokens = self.engine.tokenizer.encode(target, add_special_tokens=False)
+        if not tokens:
+            return float("inf")
+        history = self.engine.tokenizer.encode(prompt, add_special_tokens=False)
+        if not history:
+            history = [self.engine.vocab.token_id("<BOS>")]
+        log_sum = 0.0
+        for token_id in tokens:
+            log_prob = self.engine.store.token_log_probability(history, token_id)
+            log_sum += log_prob
+            history.append(token_id)
+        avg_log_prob = log_sum / len(tokens)
+        try:
+            return math.exp(-avg_log_prob)
+        except OverflowError:
+            return float("inf")
 
 
 class InferenceMonitor:
@@ -237,12 +276,14 @@ class InferenceMonitor:
         dataset: List[dict[str, str]],
         interval_tokens: int,
         samples_per_cycle: int,
+        evaluator: ResponseEvaluator,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
         self.interval = interval_tokens
         self.samples = max(1, samples_per_cycle)
         self.next_threshold = interval_tokens
+        self.evaluator = evaluator
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -263,10 +304,56 @@ class InferenceMonitor:
         for idx, record in enumerate(selections, start=1):
             conversation_id = self.engine.start_conversation(user_id="trainer", agent_name="db-slm")
             generated = self.engine.respond(conversation_id, record["prompt"])
-            score = lexical_overlap_score(record["response"], generated)
+            metrics = self.evaluator.evaluate(record["prompt"], record["response"], generated)
             print(
-                f"[eval] #{idx}: emotion={record['emotion']} score={score:.2f} prompt='{preview(record['prompt'])}' response='{preview(generated)}'"
+                "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
+                "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} prompt='{prompt}' response='{response}'".format(
+                    idx=idx,
+                    emotion=record["emotion"],
+                    lex=metrics["lexical"],
+                    rouge=metrics["rougeL"],
+                    ppl_gen=metrics["ppl_generated"],
+                    ppl_ref=metrics["ppl_reference"],
+                    prompt=preview(record["prompt"]),
+                    response=preview(generated),
+                )
             )
+
+
+class IngestProfiler:
+    """Optional profiler that logs ingest latency and current RSS."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def measure(self, label: str, fn: Callable[[], int]) -> int:
+        if not self.enabled:
+            return fn()
+        rss_before = self._rss_mb()
+        start = time.perf_counter()
+        tokens = fn()
+        duration = time.perf_counter() - start
+        rss_after = self._rss_mb()
+        rss_delta = rss_after - rss_before if rss_before is not None and rss_after is not None else None
+        suffix = ""
+        if rss_after is not None:
+            delta_str = f"{rss_delta:+.1f}MB" if rss_delta is not None else "n/a"
+            suffix = f" rss={rss_after:.1f}MB (Δ{delta_str})"
+        print(f"[profile] {label}: {tokens} tokens in {duration:.2f}s{suffix}")
+        return tokens
+
+    @staticmethod
+    def _rss_mb() -> float | None:
+        if resource is None:  # pragma: no cover - platform without resource
+            return None
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss = usage.ru_maxrss
+        # On macOS the value is in bytes, elsewhere it is kilobytes.
+        if sys.platform == "darwin":
+            rss_mb = rss / (1024 * 1024)
+        else:
+            rss_mb = rss / 1024
+        return float(rss_mb)
 
 
 def main() -> None:
@@ -293,18 +380,22 @@ def main() -> None:
     # can stream chunks without pre-loading them into memory.
 
     eval_dataset_path = args.eval_dataset or settings.dataset_path
+    evaluator = ResponseEvaluator(engine)
     eval_records: list[dict[str, str]] = []
-    monitor = InferenceMonitor(engine, eval_records, args.eval_interval, args.eval_samples)
+    monitor = InferenceMonitor(engine, eval_records, args.eval_interval, args.eval_samples, evaluator)
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
         try:
             eval_records = load_eval_dataset(dataset_path, args.eval_pool_size)
-            monitor = InferenceMonitor(engine, eval_records, args.eval_interval, args.eval_samples)
+            monitor = InferenceMonitor(
+                engine, eval_records, args.eval_interval, args.eval_samples, evaluator
+            )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
             print(f"[eval] Warning: {exc}. Disabling evaluation probes.")
-            monitor = InferenceMonitor(engine, [], 0, args.eval_samples)
+            monitor = InferenceMonitor(engine, [], 0, args.eval_samples, evaluator)
 
+    profiler = IngestProfiler(args.profile_ingest)
     total_tokens = 0
     total_windows = 0
     processed_corpora = 0
@@ -312,7 +403,7 @@ def main() -> None:
     for label, corpus in corpora_iter:
         processed_corpora += 1
         print(f"[train] Processing {label} ({len(corpus)} bytes)...")
-        token_count = engine.train_from_text(corpus)
+        token_count = profiler.measure(label, lambda text=corpus: engine.train_from_text(text))
         if token_count == 0:
             print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
             continue
