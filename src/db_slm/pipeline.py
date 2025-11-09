@@ -188,12 +188,12 @@ class LowResourceHelper:
 
     _SEED_DIALOG: Tuple[Tuple[str, str], ...] = (
         (
-            "Can you keep track of our prior notes even if we only trained on a small slice?",
-            "I keep a lightweight journal of each exchange so even the short validation runs produce usable summaries.",
+            "|SEED_PROMPT|: Track earlier notes even when training data is tiny?",
+            "|SEED_RESPONSE|: Maintain a lightweight journal per exchange so short validation runs still have summaries.",
         ),
         (
-            "Summarize what the database-focused LM tries to prove.",
-            "It demonstrates that SQL tables alone can manage vocabulary stats, caches, and concepts without tensors.",
+            "|SEED_PROMPT|: Summarize what the database-focused LM proves.",
+            "|SEED_RESPONSE|: SQL tables alone can handle vocabulary stats, caches, concepts, and decoding without tensors.",
         ),
     )
 
