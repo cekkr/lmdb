@@ -48,13 +48,17 @@ change so the next agent inherits the latest context.
 - Training-time probes now spin up seedless conversations so low-resource scaffolding never masks
   evaluation outputs; if you still need the canned turns (e.g., via `run.py`) the helper stays
   enabled for interactive sessions only.
-- `DBSLMEngine` seeds low-resource conversations with two example turns and paraphrases responses
-  when lexical overlap with the prompt stays above ~0.65, which keeps tiny validation runs from
-  degenerating into echoes.
+- `DBSLMEngine` still seeds low-resource conversations with two caretaker turns, but the paraphraser
+  now uses length-aware thresholds and explicit guard rails so multi-turn prompts or corrective
+  instructions are never rewritten while we avoid verbatim echoes.
+- Evaluation summaries are written both to stdout and to structured JSON under
+  `var/eval_logs/train-*.json`. Set `--metrics-export <path>` (or `-` to disable) to control the feed,
+  which captures probe averages plus optional ingest profiling samples.
 - Both `train.py` and `run.py` now rely on `db_slm.inference_shared.issue_prompt()` so scripted probes
   and the REPL reuse the same conversation bootstrapper.
 - `scripts/migrate_sqlite_to_mariadb.py` converts the SQLite store into MariaDB-ready DDL + data and
-  can optionally apply it directly using credentials from `.env`.
+  can optionally apply it directly using credentials from `.env`. `--incremental` performs
+  `INSERT ... ON DUPLICATE KEY UPDATE` cycles so nightly refreshes no longer need to drop tables.
 - `Makefile` now includes `smoke-train`, a capped ingest + inference probe suitable for CI health
   checks.
 
@@ -78,6 +82,8 @@ change so the next agent inherits the latest context.
     --sqlite var/db_slm.sqlite3 \
     --output var/mariadb-release.sql
   ```
+- Use `--apply --incremental` to upsert rows in place for nightly refreshes that should avoid table
+  drops. Fall back to `--drop-existing` only when you explicitly need a clean rebuild.
 - Install `mysql-connector-python` locally before invoking `--apply`; it replays schema + data and
   will drop the destination tables only when `--drop-existing` is explicitly set (announce that step
   before touching prod).

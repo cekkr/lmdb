@@ -91,6 +91,9 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
   `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
   of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
   that tipping point directly in the training logs.
+- `--metrics-export <path>`: write the rolling ROUGE/perplexity timeline plus profiling samples to a
+  JSON artifact. When omitted, `train.py` automatically drops `var/eval_logs/train-<timestamp>.json`
+  so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
 
 Example (quick validation run that ingests only 200 lines and probes the decoder every ~2k tokens):
 
@@ -141,6 +144,12 @@ fresh conversation with the low-resource seeding helper disabled, so the reporte
 reflect the newly trained n-gram tables instead of the caretaker seed dialog you may see in
 interactive `run.py` sessions on tiny corpora.
 
+In addition to the per-sample logs, `train.py` now prints run-level averages (lexical overlap,
+ROUGE-L, generated/reference perplexity) after every probe and mirrors the raw samples into
+`var/eval_logs/*.json`. The feed includes hold-out probes, periodic evaluation sets, and optional
+profiling records so you can diff long runs or export the JSON into your own dashboards. Point
+`--metrics-export` at a custom path when you need to archive the file elsewhere.
+
 ## Inference CLI (`src/run.py`)
 
 `run.py` spins up a conversational REPL backed by the database produced during training. The loop
@@ -184,7 +193,8 @@ available to downstream tooling (correction logging, concept payload providers, 
 
 Small validation runs sometimes overfit; the engine now seeds each conversation with short caretaker
 exchanges and paraphrases overly similar replies so you still get meaningful summaries instead of a
-verbatim echo.
+verbatim echo. Multi-turn prompts and corrective instructions are explicitly guarded, so the
+paraphraser never rewrites structured guidance or follow-up directions.
 
 Training-time evaluations were further hardened so the decoder always produces at least 20 words,
 even when the probabilistic backoff is uncertain. The new response backstop adds transparent filler
@@ -212,9 +222,13 @@ python scripts/migrate_sqlite_to_mariadb.py --sqlite var/db_slm.sqlite3 --output
 
 # Optionally push it straight into MariaDB (requires mysql-connector-python)
 python scripts/migrate_sqlite_to_mariadb.py --apply --drop-existing
+
+# Or upsert rows in place without dropping tables
+python scripts/migrate_sqlite_to_mariadb.py --apply --incremental
 ```
 
 The migration utility introspects the SQLite schema/tables, emits MariaDB-compatible DDL +
 INSERTs, and (when `--apply` is selected) replays them against the credentials from `.env`. This
 keeps the production backend in sync with the SQLite dev instance without manually rewriting schema
-definitions.
+definitions. Use `--incremental` for nightly refreshes that should avoid table drops while still
+upserting every SQLite row via `INSERT ... ON DUPLICATE KEY UPDATE`.

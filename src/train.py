@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import random
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Sequence, Tuple
@@ -16,7 +18,12 @@ except ImportError:  # pragma: no cover - Windows fallback
     resource = None  # type: ignore
 
 from db_slm import DBSLMEngine
-from db_slm.evaluation import EvaluationRecord, ResponseEvaluator, run_inference_records
+from db_slm.evaluation import (
+    EvalLogWriter,
+    EvaluationRecord,
+    ResponseEvaluator,
+    run_inference_records,
+)
 from db_slm.settings import load_settings
 from db_slm.storage import ColdStorageFlusher
 
@@ -106,6 +113,13 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         action="store_true",
         help="Measure ingest latency + RSS per corpus to size streaming runs.",
     )
+    parser.add_argument(
+        "--metrics-export",
+        help=(
+            "Path to a JSON file that will store the evaluation/perplexity timeline."
+            " Defaults to var/eval_logs/train-<timestamp>.json. Use '-' to disable."
+        ),
+    )
     return parser
 
 
@@ -119,6 +133,20 @@ def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
     if reset and path.exists():
         path.unlink()
     return str(path), path
+
+
+def resolve_metrics_export_path(raw: str | None) -> Path | None:
+    if raw is None or not raw.strip():
+        base = Path("var/eval_logs")
+        base.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        return base / f"train-{timestamp}.json"
+    cleaned = raw.strip()
+    if cleaned == "-":
+        return None
+    path = Path(cleaned).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
@@ -283,6 +311,7 @@ class InferenceMonitor:
         interval_tokens: int,
         samples_per_cycle: int,
         evaluator: ResponseEvaluator,
+        logger: EvalLogWriter | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -290,6 +319,7 @@ class InferenceMonitor:
         self.samples = max(1, samples_per_cycle)
         self.next_threshold = interval_tokens
         self.evaluator = evaluator
+        self.logger = logger
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -311,14 +341,16 @@ class InferenceMonitor:
             label=f"{threshold} ingested tokens",
             user_id="trainer",
             agent_name="db-slm",
+            logger=self.logger,
         )
 
 
 class IngestProfiler:
     """Optional profiler that logs ingest latency and current RSS."""
 
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, logger: EvalLogWriter | None = None) -> None:
         self.enabled = enabled
+        self.logger = logger
 
     def measure(self, label: str, fn: Callable[[], int]) -> int:
         if not self.enabled:
@@ -328,12 +360,23 @@ class IngestProfiler:
         tokens = fn()
         duration = time.perf_counter() - start
         rss_after = self._rss_mb()
-        rss_delta = rss_after - rss_before if rss_before is not None and rss_after is not None else None
+        rss_delta = (
+            rss_after - rss_before if rss_before is not None and rss_after is not None else None
+        )
         suffix = ""
         if rss_after is not None:
             delta_str = f"{rss_delta:+.1f}MB" if rss_delta is not None else "n/a"
             suffix = f" rss={rss_after:.1f}MB (Δ{delta_str})"
         print(f"[profile] {label}: {tokens} tokens in {duration:.2f}s{suffix}")
+        if self.logger:
+            self.logger.log_profile(
+                label,
+                tokens=tokens,
+                duration=duration,
+                rss_before=rss_before,
+                rss_after=rss_after,
+                rss_delta=rss_delta,
+            )
         return tokens
 
     @staticmethod
@@ -359,6 +402,18 @@ def main() -> None:
         parser.error("Provide at least one input path or enable --stdin")
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
+    metrics_path = resolve_metrics_export_path(args.metrics_export)
+    metrics_writer: EvalLogWriter | None = None
+    if metrics_path is not None:
+        arg_snapshot = vars(args).copy()
+        run_metadata = {
+            "args": arg_snapshot,
+            "db_path": db_path_str,
+            "pid": os.getpid(),
+            "metrics_file": str(metrics_path),
+        }
+        metrics_writer = EvalLogWriter(metrics_path, run_metadata)
+        print(f"[metrics] Exporting evaluation timeline to {metrics_writer.path}")
     engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order, settings=settings)
     flusher: ColdStorageFlusher | None = None
     if settings.backend == "sqlite":
@@ -385,63 +440,90 @@ def main() -> None:
     eval_dataset_path = args.eval_dataset or settings.dataset_path
     evaluator = ResponseEvaluator(engine)
     eval_records: list[EvaluationRecord] = []
-    monitor = InferenceMonitor(engine, eval_records, args.eval_interval, args.eval_samples, evaluator)
+    monitor = InferenceMonitor(
+        engine,
+        eval_records,
+        args.eval_interval,
+        args.eval_samples,
+        evaluator,
+        logger=metrics_writer,
+    )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
         try:
             eval_records = load_eval_dataset(dataset_path, args.eval_pool_size)
             monitor = InferenceMonitor(
-                engine, eval_records, args.eval_interval, args.eval_samples, evaluator
+                engine,
+                eval_records,
+                args.eval_interval,
+                args.eval_samples,
+                evaluator,
+                logger=metrics_writer,
             )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
             print(f"[eval] Warning: {exc}. Disabling evaluation probes.")
-            monitor = InferenceMonitor(engine, [], 0, args.eval_samples, evaluator)
+            monitor = InferenceMonitor(engine, [], 0, args.eval_samples, evaluator, logger=metrics_writer)
 
-    profiler = IngestProfiler(args.profile_ingest)
+    profiler = IngestProfiler(args.profile_ingest, metrics_writer)
     total_tokens = 0
     total_windows = 0
     processed_corpora = 0
-    print(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
-    for chunk in corpora_iter:
-        label = chunk.label
-        corpus = chunk.train_text
-        processed_corpora += 1
-        print(f"[train] Processing {label} ({len(corpus)} bytes)...")
-        token_count = profiler.measure(label, lambda text=corpus: engine.train_from_text(text))
-        if token_count == 0:
-            print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
-            continue
-        window = max(0, token_count - engine.store.order + 1)
-        total_tokens += token_count
-        total_windows += window
-        print(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
-        monitor.maybe_run(total_tokens)
-        if chunk.eval_records:
-            run_inference_records(
-                engine,
-                evaluator,
-                chunk.eval_records,
-                label=f"{label} hold-out",
-                user_id="trainer",
-                agent_name="db-slm",
+    success = False
+    try:
+        print(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
+        for chunk in corpora_iter:
+            label = chunk.label
+            corpus = chunk.train_text
+            processed_corpora += 1
+            print(f"[train] Processing {label} ({len(corpus)} bytes)...")
+            token_count = profiler.measure(label, lambda text=corpus: engine.train_from_text(text))
+            if token_count == 0:
+                print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
+                continue
+            window = max(0, token_count - engine.store.order + 1)
+            total_tokens += token_count
+            total_windows += window
+            print(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
+            monitor.maybe_run(total_tokens)
+            if chunk.eval_records:
+                run_inference_records(
+                    engine,
+                    evaluator,
+                    chunk.eval_records,
+                    label=f"{label} hold-out",
+                    user_id="trainer",
+                    agent_name="db-slm",
+                    logger=metrics_writer,
+                )
+            if flusher:
+                flusher.maybe_flush()
+
+        if processed_corpora == 0:
+            parser.error("No readable corpora found in the provided inputs")
+
+        if total_windows == 0:
+            parser.error(
+                "No usable training windows were produced. Provide larger corpora or reduce --ngram-order."
             )
-        if flusher:
-            flusher.maybe_flush()
 
-    if processed_corpora == 0:
-        parser.error("No readable corpora found in the provided inputs")
-
-    if total_windows == 0:
-        parser.error(
-            "No usable training windows were produced. Provide larger corpora or reduce --ngram-order."
+        location = db_path if db_path is not None else db_path_str
+        print(
+            f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
         )
-
-    location = db_path if db_path is not None else db_path_str
-    print(
-        f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
-    )
-    engine.db.close()
+        success = True
+    finally:
+        engine.db.close()
+        if metrics_writer:
+            metrics_writer.finalize(
+                totals={
+                    "tokens": total_tokens,
+                    "windows": total_windows,
+                    "processed_corpora": processed_corpora,
+                    "db_path": db_path_str if db_path is None else str(db_path),
+                },
+                status="success" if success else "aborted",
+            )
 
 
 if __name__ == "__main__":

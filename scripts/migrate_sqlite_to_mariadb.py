@@ -36,6 +36,8 @@ def convert_sqlite_create(sql: str) -> str:
     ]
     for pattern, replacement in conversions:
         converted = re.sub(pattern, replacement, converted, flags=re.IGNORECASE)
+    if "create table if not exists" not in converted.lower():
+        converted = converted.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
     converted = converted.replace("WITHOUT ROWID", "")
     converted = converted.rstrip().rstrip(";")
     return f"{converted} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
@@ -137,7 +139,23 @@ def write_sql(bundle: MigrationBundle, output_path: Path) -> None:
     print(f"[migrate] Wrote MariaDB SQL script to {output_path}")
 
 
-def apply_bundle(bundle: MigrationBundle, drop_existing: bool, env_file: str | Path) -> None:
+def _upsert_query_for(table: TableDump) -> str:
+    column_list = ", ".join(f"`{col}`" for col in table.columns)
+    placeholders = ", ".join(["%s"] * len(table.columns))
+    assignments = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in table.columns)
+    return (
+        f"INSERT INTO `{table.name}` ({column_list}) VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {assignments}"
+    )
+
+
+def apply_bundle(
+    bundle: MigrationBundle,
+    drop_existing: bool,
+    env_file: str | Path,
+    *,
+    incremental: bool = False,
+) -> None:
     try:
         import mysql.connector  # type: ignore
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -153,6 +171,8 @@ def apply_bundle(bundle: MigrationBundle, drop_existing: bool, env_file: str | P
         password=settings.mariadb_password,
         database=settings.mariadb_database,
     )
+    if drop_existing and incremental:
+        raise ValueError("--incremental cannot be combined with --drop-existing.")
     cursor = conn.cursor()
     cursor.execute("SET FOREIGN_KEY_CHECKS=0")
     if drop_existing:
@@ -165,18 +185,22 @@ def apply_bundle(bundle: MigrationBundle, drop_existing: bool, env_file: str | P
     for table in bundle.tables:
         if not table.rows:
             continue
-        placeholders = ", ".join(["%s"] * len(table.columns))
-        column_list = ", ".join(f"`{col}`" for col in table.columns)
-        cursor.executemany(
-            f"INSERT INTO `{table.name}` ({column_list}) VALUES ({placeholders})",
-            table.rows,
-        )
+        if incremental:
+            query = _upsert_query_for(table)
+        else:
+            placeholders = ", ".join(["%s"] * len(table.columns))
+            column_list = ", ".join(f"`{col}`" for col in table.columns)
+            query = f"INSERT INTO `{table.name}` ({column_list}) VALUES ({placeholders})"
+        cursor.executemany(query, table.rows)
         conn.commit()
     cursor.execute("SET FOREIGN_KEY_CHECKS=1")
     conn.commit()
     cursor.close()
     conn.close()
-    print(f"[migrate] Applied migration bundle to MariaDB database '{settings.mariadb_database}'.")
+    mode = "incremental upsert" if incremental else "replace"
+    print(
+        f"[migrate] Applied migration bundle ({mode}) to MariaDB database '{settings.mariadb_database}'."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,6 +232,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Drop destination tables before applying --apply migrations (use with caution).",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Use INSERT ... ON DUPLICATE KEY UPDATE instead of deleting existing rows.",
+    )
     return parser.parse_args()
 
 
@@ -216,11 +245,18 @@ def main() -> None:
     sqlite_path = Path(args.sqlite).expanduser()
     if not sqlite_path.exists():
         raise SystemExit(f"SQLite database not found: {sqlite_path}")
+    if args.incremental and args.drop_existing:
+        raise SystemExit("--incremental cannot be combined with --drop-existing.")
     bundle = build_bundle(sqlite_path)
     output_path = Path(args.output).expanduser()
     write_sql(bundle, output_path)
     if args.apply:
-        apply_bundle(bundle, drop_existing=args.drop_existing, env_file=args.env)
+        apply_bundle(
+            bundle,
+            drop_existing=args.drop_existing,
+            env_file=args.env,
+            incremental=args.incremental,
+        )
     else:
         print("[migrate] Skipped --apply (script written only).")
 

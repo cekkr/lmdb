@@ -1,12 +1,3 @@
-- Promote the new profiling/eval metrics into a structured `var/eval_logs/*.json` feed so multiple runs can be compared without scraping stdout.
-- Extend the MariaDB migration utility to support incremental upserts (avoid dropping tables) for faster roll-outs after nightly training.
-- Evaluate the paraphraser thresholds on long, multi-turn prompts and add guard rails so corrective instructions are never rewritten.
-- Add a `--metrics-export <path>` option to `train.py` that dumps the ROUGE/perplexity timeline for downstream dashboards.
-- Training is inefficient, lacks of response:
-A structure of a line is this one: {"prompt": "Examine how Jealousy affects motivation and drive in achieving personal and team goals.", "emotion": "Jealousy", "response": "Jealousy, defined as the feeling of resentment and insecurity arising from the perceived superiority or advantage of others (...)"}
-
-But instead, seems that evaluation is able only to "rewrite" (sometime) the prompt itself but no more. As already said, make an average statistic of average score, and accept "next tokens" in this range, or the is no way to evaluate the response. See, the RESPONSE tag is empty: 
-[eval] #3: emotion=Gratitude lexical=0.08 rougeL=0.07 ppl(gen)=35.8 ppl(ref)=7.9 prompt='Evaluate the impact of Gratitude on health care decisions and patient care.' response='|RESPONSE|: |RESTATE|: |CONTEXT|: user: Evaluate the impact of Gratitude on health care decisions and patient care. decisions |KEYWORD|: care, evaluate, impact.'
-[eval] Running 3 inference probe(s) from 813300 ingested tokens to gauge training quality.
-[eval] #1: emotion=Envy lexical=0.07 rougeL=0.04 ppl(gen)=30.5 ppl(ref)=7.5 prompt='Examine how Envy plays a role in leadership, management, and organizational behavior.' response='|RESPONSE|: |RESTATE|: |CONTEXT|: user: Examine how Envy plays a role in leadership, management, and organizational behavior. |emo_key| organizational| segment| organizational role |KEYWORD|: examine, how, envy.'
-[eval] #2: emotion=Curiosity lexical=0.09 rougeL=0.08 ppl(gen)=12.9 ppl(ref)=8.6 prompt='Evaluate the effect of Curiosity on navigating ethical dilemmas and moral decision-making.' response='|RESPONSE|: |RESTATE|: |CONTEXT|: user: Evaluate the effect of Curiosity on navigating ethical dilemmas and moral decision-making. 5.|emo_key| 3| segment|:- 0. 002 they| segment making |KEYWORD|: evaluate, effect, curiosity.'
+- Run a dedicated smoke-train and inspect the generated `var/eval_logs/*.json` file to baseline the new lexical / ROUGE / perplexity averages for future alerts (capture the summary in `studies/datasets.md`).
+- Dry-run `scripts/migrate_sqlite_to_mariadb.py --apply --incremental` against the staging MariaDB instance to confirm upserts leave existing tables untouched before wiring it into the nightly job.
+- Collect a multi-turn paraphraser regression set (include corrective turns) so the new guard rails can be re-verified automatically after future pipeline tweaks.

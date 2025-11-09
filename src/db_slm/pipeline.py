@@ -242,8 +242,11 @@ class LowResourceHelper:
     def maybe_paraphrase(self, prompt: str, response: str) -> str:
         if not self.enabled or not response.strip():
             return response
+        if self._paraphraser.should_guard(prompt):
+            return response
         similarity = lexical_overlap(prompt, response)
-        if similarity < 0.65:
+        threshold = self._paraphraser.threshold(prompt)
+        if similarity < threshold:
             return response
         return self._paraphraser.rephrase(prompt, response)
 
@@ -264,16 +267,54 @@ class SimpleParaphraser:
         "explain": "clarify",
         "summary": "synopsis",
     }
+    _STRUCTURAL_MARKERS = ("|RESPONSE|", "|CONTEXT|", "|INSTRUCTION|", "|CORRECTION|")
+    _GUARDED_KEYWORDS = (
+        "correct",
+        "correction",
+        "fix",
+        "guard",
+        "instruction",
+        "do not",
+        "don't",
+        "never",
+    )
+
+    def threshold(self, prompt: str) -> float:
+        """Dynamic similarity threshold that scales with prompt length."""
+        tokens = len(prompt.split())
+        if tokens >= 120:
+            return 0.85
+        if tokens >= 60:
+            return 0.72
+        return 0.65
+
+    def should_guard(self, prompt: str) -> bool:
+        normalized = prompt.lower()
+        if any(marker in prompt for marker in self._STRUCTURAL_MARKERS):
+            return True
+        if any(keyword in normalized for keyword in self._GUARDED_KEYWORDS):
+            return True
+        return self._looks_multi_turn(normalized)
 
     def rephrase(self, prompt: str, response: str) -> str:
-        swapped = self._swap_terms(response)
-        if swapped.strip().lower() == response.strip().lower():
-            swapped = f"\n|RESTATE|: {response}"
+        swapped = self._swap_terms(response).strip()
+        if not swapped:
+            return response
+        base_response = swapped
+        original = response.strip()
+        if original and swapped.lower() == original.lower():
+            base_response = f"I'll restate it more directly: {original}"
         keywords = keyword_summary(prompt, limit=3)
-        suffix = ""
         if keywords:
-            suffix = f"\n|KEYWORD|: {', '.join(keywords)}."
-        return f"\n|RESPONSE|: {swapped.strip()}{suffix}"
+            base_response = f"{base_response} Key terms: {', '.join(keywords)}."
+        return base_response
+
+    def _looks_multi_turn(self, normalized_prompt: str) -> bool:
+        turn_markers = ("user:", "assistant:", "system:")
+        matches = sum(normalized_prompt.count(marker) for marker in turn_markers)
+        if matches >= 2:
+            return True
+        return normalized_prompt.count("\n") >= 2
 
     def _swap_terms(self, text: str) -> str:
         def _replace(match: re.Match[str]) -> str:
