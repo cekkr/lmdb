@@ -13,6 +13,7 @@ def issue_prompt(
     user_id: str = "trainer",
     agent_name: str = "db-slm",
     seed_history: bool = True,
+    min_response_words: int = 0,
 ) -> Tuple[str, str]:
     """
     Send a prompt through DBSLMEngine, starting a conversation when needed.
@@ -23,5 +24,5 @@ def issue_prompt(
     convo_id = conversation_id or engine.start_conversation(
         user_id, agent_name, seed_history=seed_history
     )
-    response = engine.respond(convo_id, prompt)
+    response = engine.respond(convo_id, prompt, min_response_words=min_response_words)
     return convo_id, response

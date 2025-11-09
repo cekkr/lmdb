@@ -33,6 +33,10 @@ class DBSLMSettings:
     mariadb_password: str
     mariadb_database: str
     env_file: Path | None
+    embedder_model: str
+    sqlite_flush_threshold_mb: int
+    sqlite_flush_batch_size: int
+    sqlite_flush_cold_threshold: int
 
     def sqlite_dsn(self) -> str:
         """Return the SQLite DSN currently used by the CLI utilities."""
@@ -63,6 +67,10 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     mariadb_user = read("DBSLM_MARIADB_USER", "dbslm")
     mariadb_password = read("DBSLM_MARIADB_PASSWORD", "change-me")
     mariadb_database = read("DBSLM_MARIADB_DATABASE", "db_slm")
+    embedder_model = read("DBSLM_EMBEDDER_MODEL", "all-MiniLM-L6-v2")
+    flush_threshold = int(read("DBSLM_SQLITE_FLUSH_THRESHOLD_MB", "1024"))
+    flush_batch = int(read("DBSLM_SQLITE_FLUSH_BATCH", "500"))
+    flush_cold_threshold = int(read("DBSLM_SQLITE_FLUSH_COLD_THRESHOLD", "2"))
 
     env_file_used = env_file if env_file.exists() else None
     return DBSLMSettings(
@@ -75,4 +83,8 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         mariadb_password=mariadb_password,
         mariadb_database=mariadb_database,
         env_file=env_file_used,
+        embedder_model=embedder_model,
+        sqlite_flush_threshold_mb=flush_threshold,
+        sqlite_flush_batch_size=flush_batch,
+        sqlite_flush_cold_threshold=flush_cold_threshold,
     )

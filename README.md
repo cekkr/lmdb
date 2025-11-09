@@ -39,7 +39,7 @@ from the database.
   ```bash
   python3 -m venv .venv
   source .venv/bin/activate
-  pip install -r requirements.txt  # currently empty but preserves the workflow
+  pip install -r requirements.txt
   ```
 - The CLI utilities default to storing everything under `var/db_slm.sqlite3`. Feel free to point them
   at any other SQLite path or even `:memory:` when using the programmatic API.
@@ -105,6 +105,30 @@ python3 src/train.py datasets/emotion_data.json \
   --eval-pool-size 20
 ```
 
+### Adaptive Tokenization + Emotional Embeddings
+
+`DBSLMEngine` now performs a realtime corpus scan before every ingest to discover the most productive
+punctuation splits, slice long responses into manageable segments, and tag those fragments with
+device-aware embeddings from `sentence-transformers` (defaults to `all-MiniLM-L6-v2`, configurable
+via `DBSLM_EMBEDDER_MODEL`). Each segment is annotated with a compact embedding signature plus an
+`|EMO_KEY|` list that surfaces emotional keywords derived from both the dataset metadata (the
+`Emotion:` header) and the embedding energy. These annotations are injected ahead of the regex
+tokenizer, ensuring the vocabulary learns explicit emotional cues and higher quality boundary splits
+even while the underlying Level 1 tables remain purely relational. When the optional dependency is
+missing, the pipeline falls back to deterministic hashed vectors so tokenization still benefits from
+the dataset profiler.
+
+### Automatic MariaDB Flush for Cold Contexts
+
+Long-running SQLite sessions can now hand cold Level 1 contexts to MariaDB automatically. Set the
+threshold via `.env` (`DBSLM_SQLITE_FLUSH_THRESHOLD_MB`, defaults to 1024 MB). When the on-disk file
+exceeds that value, the new `ColdStorageFlusher` ships up to `DBSLM_SQLITE_FLUSH_BATCH` low-usage
+contexts—ranked by `hot_rank`, `total_count`, and `updated_at`—into the MariaDB tables (creating them
+if they do not already exist) and deletes the same rows from SQLite. This keeps local training runs
+from exhausting RAM while preserving a lossless copy of the rarely used statistics in the downstream
+database for later replay. Install `mysql-connector-python` (already included in
+`requirements.txt`) and provide valid MariaDB credentials in `.env` to activate the flush path.
+
 ### Training-Time Metrics
 
 Every evaluation probe now prints lexical-overlap, ROUGE-L, and a perplexity stub for both the
@@ -161,6 +185,10 @@ available to downstream tooling (correction logging, concept payload providers, 
 Small validation runs sometimes overfit; the engine now seeds each conversation with short caretaker
 exchanges and paraphrases overly similar replies so you still get meaningful summaries instead of a
 verbatim echo.
+
+Training-time evaluations were further hardened so the decoder always produces at least 20 words,
+even when the probabilistic backoff is uncertain. The new response backstop adds transparent filler
+sentences referencing the prompt keywords so ROUGE/perplexity measurements never silently drop rows.
 
 ## Smoke Testing
 

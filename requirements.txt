@@ -1,1 +1,2 @@
-# Currently only Python's standard library is required.
+sentence-transformers>=2.7.0
+mysql-connector-python>=8.1.0

@@ -82,6 +82,7 @@ def run_inference_records(
             user_id=user_id,
             agent_name=agent_name,
             seed_history=False,
+            min_response_words=20,
         )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
         print(

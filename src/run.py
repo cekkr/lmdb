@@ -116,7 +116,7 @@ def main() -> None:
     engine: DBSLMEngine | None = None
     try:
         db_path = resolve_db_path(args.db)
-        engine = DBSLMEngine(db_path, ngram_order=args.ngram_order)
+        engine = DBSLMEngine(db_path, ngram_order=args.ngram_order, settings=settings)
         conversation_id = ensure_conversation(engine, args)
         print(f"[run] Using conversation: {conversation_id}")
 

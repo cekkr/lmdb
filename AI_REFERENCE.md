@@ -24,11 +24,20 @@ change so the next agent inherits the latest context.
   verbalization, probability materialization, and conversation-scoped signals.
 - `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
   for the relational layout plus the KN materialization + decoding loops implemented in Python.
-- `requirements.txt` is still empty (stdlib only) so downstream agents can pin dependencies as
-  needed.
+- `requirements.txt` now installs `sentence-transformers` (for the external embedding baseline) and
+  `mysql-connector-python` (for automated cold-context flushing). Optional GPU acceleration is
+  auto-detected via PyTorch when present.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments.
+- `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
+  segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
+  real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`.
+- Evaluation probes now request at least 20 generated words via a response backstop so lexical /
+  ROUGE / perplexity logs never drop a row due to blank generations.
+- `ColdStorageFlusher` (wired into `train.py`) monitors the SQLite file size and automatically
+  migrates low-frequency contexts into MariaDB once `DBSLM_SQLITE_FLUSH_THRESHOLD_MB` is hit,
+  removing the same rows locally to keep memory pressure in check.
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.

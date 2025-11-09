@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 from db_slm import DBSLMEngine
 from db_slm.evaluation import EvaluationRecord, ResponseEvaluator, run_inference_records
 from db_slm.settings import load_settings
+from db_slm.storage import ColdStorageFlusher
 
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
@@ -358,7 +359,10 @@ def main() -> None:
         parser.error("Provide at least one input path or enable --stdin")
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
-    engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order)
+    engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order, settings=settings)
+    flusher: ColdStorageFlusher | None = None
+    if settings.backend == "sqlite":
+        flusher = ColdStorageFlusher(engine, settings)
 
     file_inputs = collect_files(args.inputs, args.recursive)
     corpora_iter: Iterable[CorpusChunk] = iter_corpora(
@@ -422,6 +426,8 @@ def main() -> None:
                 user_id="trainer",
                 agent_name="db-slm",
             )
+        if flusher:
+            flusher.maybe_flush()
 
     if processed_corpora == 0:
         parser.error("No readable corpora found in the provided inputs")
