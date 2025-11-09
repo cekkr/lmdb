@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Callable, Dict, Optional, Sequence
 
 from .db import DatabaseEnvironment
@@ -164,6 +166,7 @@ class ConceptEngine:
     """
 
     def __init__(self, db: DatabaseEnvironment, memory: ConversationMemory) -> None:
+        self.db = db
         self.repo = ConceptRepository(db)
         self.verbalizer = Verbalizer(db)
         self.predictor = ConceptPredictor(db)
@@ -177,7 +180,9 @@ class ConceptEngine:
         self, conversation_id: str, context_tokens: Sequence[str], language_code: str = "en"
     ) -> Optional[ConceptExecution]:
         context_hash = self.repo.db.hash_tokens(context_tokens)
-        prediction = self.predictor.predict(context_hash)
+        prediction = self._next_signal(conversation_id)
+        if not prediction:
+            prediction = self.predictor.predict(context_hash)
         if not prediction:
             return None
         concept = self.repo.fetch_by_id(prediction.concept_id)
@@ -200,4 +205,59 @@ class ConceptEngine:
         generic key `context`. Concepts can override via custom payload providers.
         """
         context_text = memory.context_window(conversation_id)
-        return {"context": context_text, "tokens": " ".join(context_tokens)}
+        stats = memory.conversation_stats(conversation_id)
+        corrections = [
+            correction.payload for correction in memory.correction_digest(conversation_id, limit=3) if correction.payload
+        ]
+        return {
+            "context": context_text,
+            "tokens": " ".join(context_tokens),
+            "stats": stats,
+            "corrections": corrections,
+        }
+    def push_signal(
+        self,
+        conversation_id: str,
+        concept_name: str,
+        score: float = 1.0,
+        ttl_seconds: int | None = 300,
+        consume_once: bool = True,
+    ) -> str:
+        """
+        Hint the concept engine toward a specific concept for a short horizon.
+        Useful for surfacing corrections or forced follow-ups.
+        """
+        concept = self.repo.fetch_by_name(concept_name)
+        if not concept:
+            raise ValueError(f"Concept '{concept_name}' is not registered")
+        expires_at = None
+        if ttl_seconds:
+            expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        signal_id = str(uuid.uuid4())
+        self.db.execute(
+            """
+            INSERT INTO tbl_l3_concept_signals(signal_id, conversation_id, concept_id, score, expires_at, consume_once)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (signal_id, conversation_id, concept.concept_id, score, expires_at, 1 if consume_once else 0),
+        )
+        return signal_id
+
+    def _next_signal(self, conversation_id: str) -> Optional[ConceptPrediction]:
+        rows = self.db.query(
+            """
+            SELECT signal_id, concept_id, score, consume_once
+            FROM tbl_l3_concept_signals
+            WHERE conversation_id = ?
+              AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+            ORDER BY score DESC, created_at DESC
+            LIMIT 1
+            """,
+            (conversation_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if row["consume_once"]:
+            self.db.execute("DELETE FROM tbl_l3_concept_signals WHERE signal_id = ?", (row["signal_id"],))
+        return ConceptPrediction(row["concept_id"], row["score"])

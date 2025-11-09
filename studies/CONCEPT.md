@@ -125,6 +125,15 @@ LIMIT 1;
 
 The performance of this single query, executed once *per token*, is the primary latency bottleneck of the entire system. Its speed is entirely dependent on the Aria engine's optimization for this WHERE...ORDER BY...LIMIT 1 pattern.22
 
+### **3.3 Hot Context Registry + Real-Time Caching**
+
+The practical implementation inside `src/db_slm` now mirrors these requirements with two auxiliary Aria tables:
+
+1. **tbl\_l1\_context\_registry (Aria simulated):** Tracks every hashed context with cumulative token counts, last-access timestamps, and a rolling "hot rank". This registry is what allows the engine to pre-compute denominators for Laplace smoothing, prioritize warm cache pages, and expose quick telemetry (e.g., number of turns per conversation) without re-scanning tbl\_l1\_ngram\_probs.
+2. **tbl\_l1\_ngram\_counts (Aria simulated):** Stores the deduplicated `(context_hash, next_token)` counts that back the probability mass. Inserts rely on `ON CONFLICT` upserts so that high-volume training jobs can increment counts without exploding row cardinality.
+
+SQLite runs in WAL mode to reflect Aria's concurrent-read bias, and the Python layer now keeps an adaptive prediction cache keyed by `(context_hash, limit)` so the most frequent queries are served from memory after the first hit. Cache invalidation happens lazily whenever the corresponding context hash is re-ingested, which keeps the whole Level 1 loop viable even when new data arrives mid-session.
+
 ## **Part 4: Level 2 Implementation (The Stateful Memory and Learning System)**
 
 This layer provides the model with stateful memory and the ability to "learn" from corrections. This is not "retraining" the Level 1 model; rather, it is a **Correctional Retrieval-Augmented Generation (RAG)** loop that intercepts and overrides the statistical model. This component draws inspiration from schemas designed for agent memory.29
@@ -246,6 +255,19 @@ This is the synthesized query loop that combines all three levels:
 4. **Level 1 (Token Stitching):** The *end* of that verbalized string ("...is sunny.") becomes the *new* context. The application now queries the Level 1 tbl\_l1\_ngram\_probs (from Part 3.2) to generate "stitching" tokens (e.g., "Furthermore,", "Is there..."). This continues until the Level 3 model predicts a new, high-probability concept.
 
 This hierarchical process solves the "dynamic embedding" problem without vectors. The query about "dynamic embeddings" 41 implies a need for vector search.43 This architecture *bypasses* vector math entirely. The "embedding" is not a high-dimensional vector; it is a *structured, relational concept* (concept\_id) linked to *procedural, template-based logic* (template\_string).
+
+### **5.4 Conversation-Scoped Concept Signals**
+
+Level 3 now exposes an explicit bridge to Level 2 via **tbl\_l3\_concept\_signals (InnoDB)**. Whenever the memory layer records a correction (or any other event that should deterministically shape the next utterance), the application pushes a short-lived signal row:
+
+* `signal_id UUID PRIMARY KEY`
+* `conversation_id UUID`
+* `concept_id INT`
+* `score FLOAT` (acts as a probability override)
+* `expires_at TIMESTAMP NULL`
+* `consume_once BOOLEAN`
+
+During generation the concept engine first checks tbl\_l3\_concept\_signals for unexpired hints. If one is present, it supersedes the statistical concept predictor, guaranteeing that high-priority actions (like replaying the last correction with the `CorrectionReplay` template) execute immediately. Signals default to "consume once", mimicking a message queue, and expire automatically after a configurable TTL so the system can fall back to pure statistics when the intervention window closes.
 
 ## **Part 6: Systemic Bottlenecks and Strategic Recommendations**
 

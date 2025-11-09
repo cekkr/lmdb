@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import Dict, Iterable, List
 
 from .db import DatabaseEnvironment
 
@@ -108,8 +108,10 @@ class ConversationMemory:
         return correction_id
 
     def lookup_corrections(
-        self, conversation_id: str, context_snippet: str, limit: int = 5
+        self, conversation_id: str, context_snippet: str, limit: int = 5, match_any: bool = False
     ) -> List[Correction]:
+        snippet = context_snippet or ""
+        placeholder = "" if match_any else snippet
         rows = self.db.query(
             """
             SELECT correction_id, conversation_id, corrected_fact_json
@@ -117,12 +119,14 @@ class ConversationMemory:
             WHERE conversation_id = ?
               AND (
                     error_context IS NULL
+                    OR error_context = ''
+                    OR ? = ''
                     OR ? LIKE '%' || error_context || '%'
                   )
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (conversation_id, context_snippet, limit),
+            (conversation_id, placeholder, placeholder, limit),
         )
         corrections: list[Correction] = []
         for row in rows:
@@ -156,3 +160,44 @@ class ConversationMemory:
             prefix = "User" if row["sender"] == "user" else "Assistant"
             chunks.append(f"{prefix}: {row['content']}")
         return "\n".join(chunks)
+
+    def conversation_stats(self, conversation_id: str) -> Dict[str, int | str | None]:
+        """
+        Aggregate lightweight metrics leveraged by higher-level engines.
+        """
+        rows = self.db.query(
+            """
+            SELECT
+                COUNT(*) AS message_count,
+                SUM(CASE WHEN sender = 'user' THEN 1 ELSE 0 END) AS user_turns,
+                SUM(CASE WHEN sender = 'assistant' THEN 1 ELSE 0 END) AS assistant_turns,
+                MIN(created_at) AS started_at,
+                MAX(created_at) AS updated_at
+            FROM tbl_l2_messages
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        )
+        if not rows:
+            return {
+                "message_count": 0,
+                "user_turns": 0,
+                "assistant_turns": 0,
+                "started_at": None,
+                "updated_at": None,
+            }
+        row = rows[0]
+        return {
+            "message_count": row["message_count"] or 0,
+            "user_turns": row["user_turns"] or 0,
+            "assistant_turns": row["assistant_turns"] or 0,
+            "started_at": row["started_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def correction_digest(self, conversation_id: str, limit: int = 5) -> List[Correction]:
+        """
+        Retrieve the newest corrections irrespective of context filters. Used to
+        bias concept prediction toward known adjustments.
+        """
+        return self.lookup_corrections(conversation_id, "", limit=limit, match_any=True)
