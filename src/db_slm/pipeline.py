@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
@@ -40,6 +41,7 @@ class DBSLMEngine:
         self._ensure_seed_data()
         self._low_resource_helper = LowResourceHelper(self)
         self._response_backstop = ResponseBackstop()
+        self._tag_formatter = TaggedResponseFormatter()
 
     # ------------------------------------------------------------------ #
     # Training utilities
@@ -100,6 +102,7 @@ class DBSLMEngine:
         response = " ".join(segment.strip() for segment in segments if segment.strip()).strip()
         response = self._low_resource_helper.maybe_paraphrase(user_message, response)
         response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
+        response = self._tag_formatter.wrap(user_message, response)
         self.memory.log_message(conversation_id, "assistant", response)
         return response
 
@@ -267,7 +270,7 @@ class SimpleParaphraser:
         "explain": "clarify",
         "summary": "synopsis",
     }
-    _STRUCTURAL_MARKERS = ("|RESPONSE|", "|CONTEXT|", "|INSTRUCTION|", "|CORRECTION|")
+    _STRUCTURAL_MARKERS = ("|RESPONSE|", "|CONTEXT|", "|INSTRUCTION|", "|CORRECTION|", "|USER|", "|TAGS|")
     _GUARDED_KEYWORDS = (
         "correct",
         "correction",
@@ -277,6 +280,19 @@ class SimpleParaphraser:
         "do not",
         "don't",
         "never",
+    )
+    _OPENERS = (
+        "Focusing on {tag},",
+        "Considering {tag},",
+        "Looking at {tag},",
+        "Zooming in on {tag},",
+        "Grounding the reply in {tag},",
+    )
+    _VARIATION_TEMPLATES = (
+        "Linking {tag_list} shows how the themes layer together.",
+        "The interaction across {tag_list} exposes the moving pieces.",
+        "Studying {tag_list} together keeps the narrative anchored.",
+        "Across {tag_list}, the signal is to connect causes with effects.",
     )
 
     def threshold(self, prompt: str) -> float:
@@ -300,14 +316,11 @@ class SimpleParaphraser:
         swapped = self._swap_terms(response).strip()
         if not swapped:
             return response
-        base_response = swapped
         original = response.strip()
         if original and swapped.lower() == original.lower():
-            base_response = f"I'll restate it more directly: {original}"
-        keywords = keyword_summary(prompt, limit=3)
-        if keywords:
-            base_response = f"{base_response} Key terms: {', '.join(keywords)}."
-        return base_response
+            swapped = self._synthesize_variation(prompt)
+        swapped = self._inject_random_opening(prompt, swapped)
+        return swapped
 
     def _looks_multi_turn(self, normalized_prompt: str) -> bool:
         turn_markers = ("user:", "assistant:", "system:")
@@ -315,6 +328,26 @@ class SimpleParaphraser:
         if matches >= 2:
             return True
         return normalized_prompt.count("\n") >= 2
+
+    def _synthesize_variation(self, prompt: str) -> str:
+        keywords = keyword_summary(prompt, limit=4)
+        if not keywords:
+            return "I'll expand on the request with new framing."
+        tag_list = ", ".join(keywords)
+        template = random.choice(self._VARIATION_TEMPLATES)
+        return template.format(tag_list=tag_list)
+
+    def _inject_random_opening(self, prompt: str, text: str) -> str:
+        if not text.strip():
+            return text
+        keywords = keyword_summary(prompt, limit=4)
+        if not keywords:
+            return text
+        chosen_tag = random.choice(keywords)
+        opener = random.choice(self._OPENERS).format(tag=chosen_tag)
+        if text.lower().startswith(opener.lower()):
+            return text
+        return f"{opener} {text}"
 
     def _swap_terms(self, text: str) -> str:
         def _replace(match: re.Match[str]) -> str:
@@ -375,3 +408,40 @@ class ResponseBackstop:
         if len(tokens) > needed_words:
             tokens = tokens[:needed_words]
         return " ".join(tokens)
+
+
+class TaggedResponseFormatter:
+    """Wraps responses with |USER| / |RESPONSE| / |TAGS| scaffolding plus random openers."""
+
+    _OPENERS = (
+        "Exploring {tag},",
+        "Zooming in on {tag},",
+        "Grounding the response in {tag},",
+        "Connecting back to {tag},",
+        "Focusing on {tag},",
+    )
+
+    def wrap(self, prompt: str, generated: str) -> str:
+        prompt_clean = prompt.strip()
+        response_clean = generated.strip()
+        keywords = keyword_summary(prompt, limit=4)
+        response_tagged = self._randomize_opening(response_clean, keywords)
+        lines: list[str] = []
+        if prompt_clean:
+            lines.append(f"|USER|: {prompt_clean}")
+        if response_tagged:
+            lines.append(f"|RESPONSE|: {response_tagged}")
+        if keywords:
+            lines.append(f"|TAGS|: {', '.join(keywords)}")
+        return "\n".join(lines) if lines else ""
+
+    def _randomize_opening(self, response: str, keywords: list[str]) -> str:
+        if not response:
+            return response
+        if not keywords:
+            return response
+        tag = random.choice(keywords)
+        opener = random.choice(self._OPENERS).format(tag=tag)
+        if response.lower().startswith(opener.lower()):
+            return response
+        return f"{opener} {response}"
