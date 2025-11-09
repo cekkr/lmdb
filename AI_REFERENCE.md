@@ -1,0 +1,16 @@
+# AI Reference
+
+Fast-access knowledge base for CUDAway. Update this alongside `README.md` whenever code or docs
+change so the next agent inherits the latest context.
+
+## Collaboration Rules
+
+- Mirror meaningful changes into `README.md`, `AI_REFERENCE.md`, and (if a study) `studies/*`.
+- Read and record research results under `studies/` and cross-link them here so we avoid re-running the same
+  investigations.
+- Work incrementally, document breaking changes, and run the available build/test commands before
+  yielding control.
+
+### Next Steps
+
+`NEXT_STEPS.md` is now the single backlog source; consult it for active tooling tasks and update that file first before mirroring high-level context here. Remove already completed and no more important steps to remember.
