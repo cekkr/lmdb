@@ -1,1 +1,5 @@
-Insert here next passages to complete the project implementation
+- Run a longer streaming ingest: progressively raise `--max-json-lines` and `--json-chunk-size`, monitor eval logs, and document the tipping point for memory/latency so others can reproduce full-dataset runs.
+- Add quantitative evals (e.g., ROUGE-L / perplexity stub) alongside the current lexical-overlap scores to better judge improvements during training.
+- Wire up the MariaDB migration tooling so the pipeline can target the production backend once SQLite validation looks good; record the required commands in `README.md`.
+- Improve inference behavior after tiny training runs by seeding level-2 history examples or adding a simple paraphraser so responses are not verbatim echoes.
+- Automate the limited training + inference probe as a `make smoke-train` or similar script to keep regressions visible in CI.
