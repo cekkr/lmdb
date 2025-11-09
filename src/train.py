@@ -228,11 +228,11 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[dict[s
     return records
 
 
-def preview(text: str, width: int = 500) -> str:
+def preview(text: str, width: int = 1000) -> str:
     collapsed = " ".join(text.split())
     if not collapsed:
         return ""
-    return textwrap.shorten(collapsed, width=width, placeholder="…")
+    return textwrap.shorten(collapsed, width=width, placeholder="…\n")
 
 
 class ResponseEvaluator:
