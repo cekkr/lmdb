@@ -3,17 +3,21 @@
 
 ## Overview
 
-This repository explores the database-native statistical language model (DB-SLM) designed in
-`studies/CONCEPT.md`. Instead of tensors, all generation stages are persisted as relational tables:
+This repository explores the production-grade database-native statistical language model (DB-SLM)
+described in `studies/CONCEPT.md` and refined in
+`studies/DB_SLM_DATABASE_AND_ALGORITHMS.md`. The Python implementation under `src/db_slm` now mirrors
+the spec end-to-end:
 
-- **Level 1 — Statistical N-grams (Aria-like):** Lookup tables for token probabilities.
-- **Level 2 — Stateful Memory (MyRocks + InnoDB):** Conversation logs and correctional RAG.
-- **Level 3 — Conceptual Generation (InnoDB):** Concept dictionaries, templates, and selection logic.
+- **Level 1 — Aria-style n-gram engine:** Byte-free (regex) tokenization backed by a relational
+  vocabulary, hashed contexts, Modified Kneser–Ney smoothing, quantized log-prob tables, and a
+  Top-K materialization path for fast sampling. All stats live inside SQLite tables that mirror the
+  MariaDB layout.
+- **Level 2 — Episodic memory + biasing:** Conversation logging, correction digests, logit-bias
+  materialization, and pointer-sentinel session caches that feed the decoder without tensors.
+- **Level 3 — Concept model:** Concept dictionaries, templates, and probability tables that can
+  output multi-token spans before the Level 1 stitcher runs.
 
-See `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` for the storage layout plus the training and inference
-playbooks that tie these levels together.
-
-The first Python scaffolding for this design now lives under `src/db_slm`.
+Training, inference, cache mixtures, and bias application all happen through SQL updates and lookups.
 
 ## Quick Start
 
@@ -25,8 +29,9 @@ conversation_id = engine.start_conversation(user_id="demo")
 print(engine.respond(conversation_id, "Remind me what we discussed."))
 ```
 
-Use `train_from_text()` to ingest small corpora and extend the concept repository through the
-`ConceptEngine` exposed on `engine.concepts`.
+Use `train_from_text()` to ingest corpora. It automatically updates counts, rebuilds the KN
+probabilities, and refreshes the Top-K cache so the decoder can read quantized distributions directly
+from the database.
 
 ## Environment Setup
 
@@ -41,9 +46,10 @@ Use `train_from_text()` to ingest small corpora and extend the concept repositor
 
 ## Training CLI (`src/train.py`)
 
-`train.py` is the canonical way to populate the Level 1 N-gram table from plain-text corpora. It wires
-directly into `DBSLMEngine.train_from_text()` so Level 2/3 seed data is left intact while Level 1
-statistics are extended.
+`train.py` is the canonical way to populate the Level 1 n-gram tables from plain-text corpora. Each
+file is streamed into `DBSLMEngine.train_from_text()`, which updates hashed context counts, rebuilds
+Modified Kneser–Ney statistics for every order up to the configured `--ngram-order`, refreshes
+continuation counts, and re-materializes quantized probability tables plus the Top-K head cache.
 
 ```bash
 python src/train.py \
@@ -69,8 +75,9 @@ corpora are shorter than the N-gram order they are automatically skipped.
 
 ## Inference CLI (`src/run.py`)
 
-`run.py` spins up a conversational REPL backed by the database produced during training. It uses the
-same `DBSLMEngine` façade as developers use from Python.
+`run.py` spins up a conversational REPL backed by the database produced during training. The loop
+invokes the full decoding pipeline: Level 3 concept prediction (with signal overrides), Level 2 bias
+and cache adjustments, and Level 1 top-p decoding with quantized probabilities.
 
 Interactive session:
 

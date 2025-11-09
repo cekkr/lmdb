@@ -110,13 +110,11 @@ def main() -> None:
     total_tokens = 0
     total_windows = 0
     for label, corpus in corpora:
-        tokens = engine.level1.tokenize(corpus)
-        token_count = len(tokens)
-        window = max(0, token_count - engine.level1.order + 1)
-        if window == 0:
-            print(f"[train] Skipping {label} (contains fewer than {engine.level1.order} tokens)")
+        token_count = engine.train_from_text(corpus)
+        if token_count == 0:
+            print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
             continue
-        engine.train_from_text(corpus)
+        window = max(0, token_count - engine.store.order + 1)
         total_tokens += token_count
         total_windows += window
         print(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")

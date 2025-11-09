@@ -17,7 +17,15 @@ change so the next agent inherits the latest context.
 
 ## Codebase State
 
-- `src/db_slm` now implements the three-level DB-SLM blueprint with realistic database behavior: Level 1 persists context registries and Aria-simulated count tables (with WAL + smoothing + prediction caches), Level 2 exposes richer episodic stats/correction digests, and Level 3 adds conversation-scoped concept signals plus correction replay payloads tied to Level 2.
-- `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` documents the current relational schema along with the corpus-ingest, concept seeding, and inference loops so future changes can stay aligned with the CONCEPT blueprint.
-- `requirements.txt` is currently empty (stdlib only) so downstream agents can add dependencies explicitly when needed.
-- `src/train.py` ingests corpora into the SQLite store (default `var/db_slm.sqlite3`) with options for directory traversal, stdin ingestion, and database resets; `src/run.py` exposes a CLI REPL plus single-shot inference that records conversations inside Level 2.
+- `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, regex tokenizer, hashed
+  context registry, Modified Kneser–Ney smoother, quantized probability tables, and Top-K cache.
+  Level 2 combines episodic logging, concept-ready correction digests, pointer-sentinel session
+  caches, and token-level bias plumbing. Level 3 provides concept dictionaries, template
+  verbalization, probability materialization, and conversation-scoped signals.
+- `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
+  for the relational layout plus the KN materialization + decoding loops implemented in Python.
+- `requirements.txt` is still empty (stdlib only) so downstream agents can pin dependencies as
+  needed.
+- `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
+  ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
+  cache/bias adjustments.
