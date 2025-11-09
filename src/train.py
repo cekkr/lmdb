@@ -337,7 +337,7 @@ class InferenceMonitor:
     def _run_cycle(self, threshold: int) -> None:
         sample_size = min(len(self.dataset), self.samples)
         selections = random.sample(self.dataset, sample_size)
-            run_inference_records(
+        run_inference_records(
                 self.engine,
                 self.evaluator,
                 selections,
