@@ -87,6 +87,73 @@ hierarchical \"concept → verbalization → token stitching\" loop defined in t
 - **Smoothing parameters:** `smoothing_alpha` in `NGramModel` implements additive smoothing to avoid
   zero-probability contexts, mirroring GPT's logit bias floor.
 
+### 2.6 Table Specification Reference
+
+#### Level 1 (Aria hint)
+
+`tbl_l1_context_registry`
+- Columns: `context_hash TEXT PK`, `order_size INTEGER`, `total_count INTEGER`, `last_seen_at TEXT`,
+  `hot_rank REAL`, `engine_hint TEXT DEFAULT 'Aria'`.
+- Indexes: `idx_l1_context_heat(hot_rank DESC, last_seen_at DESC)`.
+- Notes: Holds one row per `(n-1)`-token window and acts as the denominator cache for smoothing.
+
+`tbl_l1_ngram_counts`
+- Columns: `context_hash TEXT`, `next_token TEXT`, `observed_count REAL`, `last_seen_at TEXT`,
+  `engine_hint TEXT DEFAULT 'Aria'`.
+- Constraints: `PRIMARY KEY(context_hash, next_token)`.
+- Indexes: `idx_l1_counts_context(context_hash, observed_count DESC)`.
+- Notes: Primary training target; each upsert increments `observed_count`.
+
+`tbl_l1_ngram_probs`
+- Columns: `id INTEGER PK AUTOINCREMENT`, `context_hash TEXT`, `next_token TEXT`, `probability REAL`,
+  `engine_hint TEXT DEFAULT 'Aria'`.
+- Indexes: `idx_l1_context(context_hash)`.
+- Notes: Optional materialization layer for offline analytics or future quantization.
+
+#### Level 2 (MyRocks + InnoDB hints)
+
+`tbl_l2_conversations`
+- Columns: `id TEXT PK`, `user_id TEXT`, `agent_name TEXT`, `created_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+  `engine_hint TEXT DEFAULT 'InnoDB'`.
+- Notes: One row per session; referenced by all Level 2/3 child tables.
+
+`tbl_l2_messages`
+- Columns: `id TEXT PK`, `conversation_id TEXT`, `sender TEXT CHECK sender IN ('user','assistant')`,
+  `content TEXT`, `created_at TEXT`, `engine_hint TEXT DEFAULT 'MyRocks'`.
+- Indexes: `idx_l2_messages_conv(conversation_id, created_at)`.
+- Notes: Represents the append-only turn log; chronological scans reconstruct the prompt window.
+
+`tbl_l2_correction_log`
+- Columns: `correction_id TEXT PK`, `conversation_id TEXT`, `error_message_id TEXT`,
+  `correction_message_id TEXT`, `error_context TEXT`, `corrected_fact_json TEXT`,
+  `created_at TEXT`, `engine_hint TEXT DEFAULT 'InnoDB'`.
+- Notes: Stores structured corrections that override statistical predictions.
+
+#### Level 3 (InnoDB + Aria hints)
+
+`tbl_l3_concept_repo`
+- Columns: `concept_id INTEGER PK AUTOINCREMENT`, `concept_name TEXT UNIQUE`,
+  `metadata_schema TEXT`, `engine_hint TEXT DEFAULT 'InnoDB'`.
+- Notes: Catalog of semantic actions; schemas describe required payload fields.
+
+`tbl_l3_verbal_templates`
+- Columns: `template_id INTEGER PK AUTOINCREMENT`, `concept_id INTEGER`, `template_string TEXT`,
+  `language_code TEXT DEFAULT 'en'`, `engine_hint TEXT DEFAULT 'InnoDB'`.
+- Indexes: `idx_l3_templates(concept_id, language_code)`.
+- Notes: Stores language-specific render strings; `{placeholders}` map to payload keys.
+
+`tbl_l3_concept_probs`
+- Columns: `id INTEGER PK AUTOINCREMENT`, `context_hash TEXT`, `next_concept_id INTEGER`,
+  `quantized_prob REAL`, `engine_hint TEXT DEFAULT 'Aria'`.
+- Indexes: `idx_l3_context(context_hash)`.
+- Notes: Mirrors Level 1 but over concept IDs; future work quantizes `quantized_prob` to bytes.
+
+`tbl_l3_concept_signals`
+- Columns: `signal_id TEXT PK`, `conversation_id TEXT`, `concept_id INTEGER`, `score REAL`,
+  `expires_at TEXT`, `consume_once INTEGER`, `created_at TEXT`, `engine_hint TEXT DEFAULT 'InnoDB'`.
+- Indexes: `idx_l3_signals_conv(conversation_id, score DESC)`.
+- Notes: Implements deterministic overrides so that corrections or workflows can force a concept.
+
 ---
 
 ## 3. Training Algorithm
@@ -144,6 +211,39 @@ This mirrors GPT's practice of periodically writing checkpointed weights for fas
 3. Corrections remain queryable for payload generation, acting as a structured memory bank and
    eliminating the need for GPT-style gradient updates.
 
+### 3.5 Pseudocode Reference
+
+```pseudo
+procedure TrainCorpus(corpus_text, order, db)
+    tokens ← Tokenize(corpus_text)
+    if length(tokens) < order:
+        return
+    for window in SlidingWindows(tokens, order):
+        context_tokens ← window[0 : order-1]
+        next_token ← window[-1]
+        hash ← HashTokens(context_tokens)
+        Upsert(tbl_l1_context_registry, hash, order-1, increment=1)
+        Upsert(tbl_l1_ngram_counts, (hash, next_token), increment=1)
+        InvalidatePredictionCache(hash)
+
+procedure Upsert(table, key, order_size=None, increment)
+    if table == tbl_l1_context_registry:
+        execute SQL:
+            INSERT ... ON CONFLICT(context_hash)
+            DO UPDATE SET total_count = total_count + increment,
+                         last_seen_at = CURRENT_TIMESTAMP
+    else if table == tbl_l1_ngram_counts:
+        execute SQL:
+            INSERT ... ON CONFLICT(context_hash, next_token)
+            DO UPDATE SET observed_count = observed_count + increment,
+                         last_seen_at = CURRENT_TIMESTAMP
+
+procedure RegisterConcept(concept_name, schema, template, default_prob)
+    concept_id ← repo.register(concept_name, schema)
+    verbalizer.register_template(concept_id, template)
+    predictor.record_probability("__default__", concept_id, default_prob)
+```
+
 ---
 
 ## 4. Inference Algorithm
@@ -180,6 +280,51 @@ This mirrors GPT's practice of periodically writing checkpointed weights for fas
 - If no concept probability rows exist for a context, the engine falls back to `__default__`.
 - If the Level 1 predictor cannot find rows for the stitched context, `seed_defaults` ensures
   generic discourse markers keep the reply grammatical.
+
+### 4.5 Pseudocode Reference
+
+```pseudo
+function Respond(conversation_id, user_message):
+    message_id ← memory.log_message(conversation_id, "user", user_message)
+    context_text ← memory.context_window(conversation_id)
+    context_tokens ← Tokenize(context_text)
+    concept_exec ← RunConceptLayer(conversation_id, context_tokens)
+    concept_text ← ""
+    if concept_exec exists:
+        concept_text ← concept_exec.text
+        context_tokens ← context_tokens + Tokenize(concept_exec.text)
+    stitching ← level1.stitch_tokens(context_tokens, target_length=18)
+    response ← JoinSegments(concept_text, stitching)
+    memory.log_message(conversation_id, "assistant", response)
+    return response
+
+function RunConceptLayer(conversation_id, context_tokens):
+    hash ← HashTokens(context_tokens)
+    signal ← pop_next_signal(conversation_id)
+    if signal exists:
+        concept ← repo.fetch_by_id(signal.concept_id)
+        probability ← signal.score
+    else:
+        prediction ← predictor.predict(hash, fallback="__default__")
+        if prediction is None:
+            return None
+        concept ← repo.fetch_by_id(prediction.concept_id)
+        probability ← prediction.probability
+    payload ← payload_provider(conversation_id, concept, context_tokens, memory)
+    text ← verbalizer.render(concept.concept_id, payload)
+    return {name: concept.name, text: text, probability: probability}
+
+function StitchTokens(context_tokens, target_length):
+    output ← []
+    current ← context_tokens[-(order-1):]
+    repeat target_length times:
+        preds ← PredictNext(current, limit=3)
+        if preds empty: break
+        token ← WeightedSample(preds)
+        append token to output
+        append token to current; current ← last (order-1) tokens
+    return Detokenize(output)
+```
 
 ---
 
