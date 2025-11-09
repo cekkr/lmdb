@@ -247,12 +247,12 @@ class SimpleParaphraser:
     def rephrase(self, prompt: str, response: str) -> str:
         swapped = self._swap_terms(response)
         if swapped.strip().lower() == response.strip().lower():
-            swapped = f"I'll restate it differently: {response}"
+            swapped = f"\n|RESTATE|: {response}"
         keywords = keyword_summary(prompt, limit=3)
         suffix = ""
         if keywords:
-            suffix = f" It still centers on {', '.join(keywords)}."
-        return f"Here's another take: {swapped.strip()}{suffix}"
+            suffix = f"\n|KEYWORD|: {', '.join(keywords)}."
+        return f"\n|RESPONSE|: {swapped.strip()}{suffix}"
 
     def _swap_terms(self, text: str) -> str:
         def _replace(match: re.Match[str]) -> str:

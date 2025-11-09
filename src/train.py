@@ -179,7 +179,7 @@ def iter_json_chunks(path: Path, chunk_size: int, max_lines: int) -> Iterable[Tu
                 )
             )
 
-            print("Trained line #", line_no, "\t (", segment,")")
+            print("Trained line #", line_no, "\t (Prompt: ", prompt,")")
 
             buffer.append(segment)
             consumed += 1
