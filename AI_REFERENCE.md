@@ -32,9 +32,15 @@ change so the next agent inherits the latest context.
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
+- `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
+  `--chunk-eval-percent`; those hold-out prompts/responses skip training and run through the same
+  inference metrics the moment the chunk finishes ingesting, giving tighter feedback loops tied to
+  the newest data.
 - `DBSLMEngine` seeds low-resource conversations with two example turns and paraphrases responses
   when lexical overlap with the prompt stays above ~0.65, which keeps tiny validation runs from
   degenerating into echoes.
+- Both `train.py` and `run.py` now rely on `db_slm.inference_shared.issue_prompt()` so scripted probes
+  and the REPL reuse the same conversation bootstrapper.
 - `scripts/migrate_sqlite_to_mariadb.py` converts the SQLite store into MariaDB-ready DDL + data and
   can optionally apply it directly using credentials from `.env`.
 - `Makefile` now includes `smoke-train`, a capped ingest + inference probe suitable for CI health

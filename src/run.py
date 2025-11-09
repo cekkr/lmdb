@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from db_slm import DBSLMEngine
+from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 
 
@@ -74,7 +75,7 @@ def ensure_conversation(engine: DBSLMEngine, args: argparse.Namespace) -> str:
 
 
 def respond_once(engine: DBSLMEngine, conversation_id: str, prompt: str) -> None:
-    response = engine.respond(conversation_id, prompt)
+    _, response = issue_prompt(engine, prompt, conversation_id)
     print(f"user> {prompt}")
     print(f"assistant> {response}")
 
@@ -101,7 +102,7 @@ def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int |
             print(history or "(empty)")
             print("----------------------------")
             continue
-        response = engine.respond(conversation_id, user_input)
+        conversation_id, response = issue_prompt(engine, user_input, conversation_id)
         print(f"assistant> {response}")
         turns += 1
     print(f"[run] Conversation {conversation_id} closed after {turns} turn(s).")

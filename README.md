@@ -83,6 +83,10 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
 - `--eval-interval`, `--eval-samples`, `--eval-dataset`, `--eval-pool-size`: enable periodic
   inference probes during training to log qualitative progress without leaving the script.
+- `--chunk-eval-percent`: when ingesting JSON/NDJSON corpora, reserve this percentage of every chunk
+  as hold-out prompts/responses. Those samples skip training entirely and are immediately replayed
+  through the inference path so you can spot regressions tied to the latest data instead of a fixed
+  seed set.
 - `--profile-ingest`: print per-corpus latency and resident-set-size metrics so you can keep raising
   `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
   of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
@@ -106,7 +110,9 @@ python3 src/train.py datasets/emotion_data.json \
 Every evaluation probe now prints lexical-overlap, ROUGE-L, and a perplexity stub for both the
 generated response and the held-out reference. This lets you confirm that quantitative scores improve
 while you experiment with chunk sizes or smoothing tweaks, even when the qualitative samples look
-similar.
+similar. When `--chunk-eval-percent` is supplied, the same metric stack runs immediately after each
+chunk ingest using its freshly carved-out hold-outs, giving you a rolling measure that tracks the
+latest corpus segment instead of relying solely on the static evaluation dataset.
 
 ## Inference CLI (`src/run.py`)
 
