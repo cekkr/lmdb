@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import textwrap
@@ -32,6 +33,40 @@ class EvaluationSampleResult:
     emotion: str
     metrics: dict[str, float | int | None]
     flagged: bool = False
+
+
+_MAX_BATCH_ATTEMPTS = 2
+_MAX_FUTURE_BATCH_RETRIES = 3
+_flagged_retry_budget: dict[str, int] = {}
+
+
+def _record_signature(record: EvaluationRecord) -> str:
+    hasher = hashlib.sha1()
+    hasher.update(record.prompt.encode("utf-8", errors="ignore"))
+    hasher.update(b"\x1f")
+    hasher.update(record.response.encode("utf-8", errors="ignore"))
+    hasher.update(b"\x1f")
+    hasher.update(record.emotion.encode("utf-8", errors="ignore"))
+    return hasher.hexdigest()
+
+
+def _consume_future_retry_budget(record_key: str) -> bool:
+    """Return True if the sample should be skipped because the budget is exhausted."""
+    remaining = _flagged_retry_budget.get(record_key)
+    if remaining is None:
+        return False
+    if remaining <= 0:
+        return True
+    _flagged_retry_budget[record_key] = remaining - 1
+    return False
+
+
+def _schedule_future_retries(record_key: str) -> None:
+    _flagged_retry_budget.setdefault(record_key, _MAX_FUTURE_BATCH_RETRIES)
+
+
+def _clear_future_retries(record_key: str) -> None:
+    _flagged_retry_budget.pop(record_key, None)
 
 
 def preview(text: str, width: int = 1000) -> str:
@@ -138,24 +173,49 @@ def run_inference_records(
     )
     results: list[EvaluationSampleResult] = []
     for idx, record in enumerate(records, start=1):
+        record_key = _record_signature(record)
+        if _consume_future_retry_budget(record_key):
+            print(
+                f"[eval] #{idx}: skipping flagged sample; retry budget exhausted "
+                f"(prompt='{preview(record.prompt, 120)}')."
+            )
+            continue
+        attempts = 0
+        generated = ""
+        metrics: dict[str, float | int | None] = {}
         ref_words = max(1, len(record.response.split()))
         min_words = max(20, min(512, int(ref_words * 0.85)))
-        _, generated = issue_prompt(
-            engine,
-            record.prompt,
-            user_id=user_id,
-            agent_name=agent_name,
-            seed_history=False,
-            min_response_words=min_words,
-        )
-        metrics = evaluator.evaluate(record.prompt, record.response, generated)
         flagged = False
         flag_reasons: list[str] = []
-        if quality_gate:
-            flagged, flag_reasons = quality_gate.process(record, generated, metrics)
-            if flagged:
+        while attempts < _MAX_BATCH_ATTEMPTS:
+            attempts += 1
+            _, generated = issue_prompt(
+                engine,
+                record.prompt,
+                user_id=user_id,
+                agent_name=agent_name,
+                seed_history=False,
+                min_response_words=min_words,
+            )
+            metrics = evaluator.evaluate(record.prompt, record.response, generated)
+            flagged = False
+            flag_reasons = []
+            if quality_gate:
+                flagged, flag_reasons = quality_gate.process(record, generated, metrics)
+                if flagged:
+                    joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
+                    print(f"[eval] #{idx}: flagged for retraining ({joined}).")
+            if not flagged:
+                _clear_future_retries(record_key)
+                break
+            if attempts < _MAX_BATCH_ATTEMPTS:
                 joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-                print(f"[eval] #{idx}: flagged for retraining ({joined}).")
+                print(
+                    f"[eval] #{idx}: retrying flagged sample "
+                    f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
+                )
+        if flagged:
+            _schedule_future_retries(record_key)
         print(
             "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
             "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "
@@ -181,7 +241,7 @@ def run_inference_records(
                 generated=generated,
                 emotion=record.emotion,
                 metrics=metrics,
-                 flagged=flagged,
+                flagged=flagged,
             )
         )
     summary = summarize_samples(results)

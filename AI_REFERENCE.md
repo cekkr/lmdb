@@ -63,6 +63,9 @@ change so the next agent inherits the latest context.
   eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
   (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
   samples later.
+- Evaluation retries for flagged samples are now capped at two attempts per batch and at most three
+  additional appearances in later random batches so probes cannot loop forever when the generator
+  keeps emitting low-quality responses.
 - The evaluator infers `min_response_words` from the reference length (capped at 512) so long-form
   corpora like `emotion_data.json` do not lose the substantive portion of the `|RESPONSE|` frame, and
   CPU-heavy quality scoring is gated behind the adaptive load monitor to avoid starving ingestion.
