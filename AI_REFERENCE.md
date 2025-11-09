@@ -18,5 +18,6 @@ change so the next agent inherits the latest context.
 ## Codebase State
 
 - `src/db_slm` now implements the three-level DB-SLM blueprint with realistic database behavior: Level 1 persists context registries and Aria-simulated count tables (with WAL + smoothing + prediction caches), Level 2 exposes richer episodic stats/correction digests, and Level 3 adds conversation-scoped concept signals plus correction replay payloads tied to Level 2.
+- `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` documents the current relational schema along with the corpus-ingest, concept seeding, and inference loops so future changes can stay aligned with the CONCEPT blueprint.
 - `requirements.txt` is currently empty (stdlib only) so downstream agents can add dependencies explicitly when needed.
 - `src/train.py` ingests corpora into the SQLite store (default `var/db_slm.sqlite3`) with options for directory traversal, stdin ingestion, and database resets; `src/run.py` exposes a CLI REPL plus single-shot inference that records conversations inside Level 2.

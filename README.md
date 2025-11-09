@@ -10,6 +10,9 @@ This repository explores the database-native statistical language model (DB-SLM)
 - **Level 2 — Stateful Memory (MyRocks + InnoDB):** Conversation logs and correctional RAG.
 - **Level 3 — Conceptual Generation (InnoDB):** Concept dictionaries, templates, and selection logic.
 
+See `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` for the storage layout plus the training and inference
+playbooks that tie these levels together.
+
 The first Python scaffolding for this design now lives under `src/db_slm`.
 
 ## Quick Start
