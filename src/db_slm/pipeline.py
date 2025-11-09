@@ -130,7 +130,7 @@ class DBSLMEngine:
             )
         else:
             summary_id = summary.concept_id
-        self._ensure_template(summary_id, "Based on our latest exchange: {context}")
+        self._ensure_template(summary_id, "|CONTEXT|: {context}")
         self.concepts.predictor.record_probability("__default__", summary_id, 0.7)
 
         correction = self.concepts.repo.fetch_by_name("CorrectionReplay")
