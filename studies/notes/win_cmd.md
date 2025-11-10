@@ -1,3 +1,3 @@
-python3.11 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive --reset --json-chunk-size 200 --eval-samples 3 --eval-pool-size 200 --chunk-eval-percent 10.0 --eval-interval 1000 --profile-ingest
+python3.11 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive --reset --json-chunk-size 250 --eval-samples 3 --eval-pool-size 200 --chunk-eval-percent 10.0 --eval-interval 1000 --profile-ingest
 
 # Number of evaluation to do: --eval-interval 50
