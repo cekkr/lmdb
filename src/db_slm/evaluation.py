@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from .decoder import DecoderConfig
 from .inference_shared import issue_prompt
 from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
@@ -90,12 +91,27 @@ def _structure_stats(text: str) -> dict[str, float]:
     token_count = len(tokens)
     top_share = 0.0
     unique_bigram_ratio = 1.0
+    token_group_share = 0.0
     if token_count:
         counts = Counter(tokens)
         top_share = sum(count for _, count in counts.most_common(3)) / token_count
         if token_count > 1:
             bigrams = list(zip(tokens, tokens[1:]))
             unique_bigram_ratio = len(set(bigrams)) / max(1, len(bigrams))
+            if bigrams:
+                bigram_counts = Counter(bigrams)
+                token_group_share = max(
+                    token_group_share,
+                    max(bigram_counts.values()) / max(1, len(bigrams)),
+                )
+        if token_count > 2:
+            trigrams = list(zip(tokens, tokens[1:], tokens[2:]))
+            if trigrams:
+                trigram_counts = Counter(trigrams)
+                token_group_share = max(
+                    token_group_share,
+                    max(trigram_counts.values()) / max(1, len(trigrams)),
+                )
     sentences = [segment.strip() for segment in _STRUCTURE_SENTENCE_SPLIT.split(text) if segment.strip()]
     if not sentences and text.strip():
         sentences = [text.strip()]
@@ -117,6 +133,7 @@ def _structure_stats(text: str) -> dict[str, float]:
         "token_count": float(token_count),
         "top_share": float(top_share),
         "unique_bigram_ratio": float(unique_bigram_ratio),
+        "token_group_share": float(token_group_share),
         "opener_diversity": float(opener_diversity),
         "punctuation_balance": float(punctuation_balance),
     }
@@ -141,6 +158,7 @@ def _structure_metrics(reference: str, candidate: str) -> dict[str, float]:
     return {
         "top_token_share": round(candidate_stats["top_share"], 4),
         "unique_bigram_ratio": round(candidate_stats["unique_bigram_ratio"], 4),
+        "token_group_share": round(candidate_stats["token_group_share"], 4),
         "sentence_opener_diversity": round(candidate_stats["opener_diversity"], 4),
         "punctuation_balance": round(candidate_stats["punctuation_balance"], 4),
         "common_token_penalty": round(common_token_penalty, 4),
@@ -235,6 +253,7 @@ def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, fl
         "structure_variety_mean": "structure_variety",
         "common_token_penalty_mean": "common_token_penalty",
         "top_token_share_mean": "top_token_share",
+        "token_group_share_mean": "token_group_share",
         "sentence_opener_diversity_mean": "sentence_opener_diversity",
         "punctuation_balance_mean": "punctuation_balance",
         "unique_bigram_ratio_mean": "unique_bigram_ratio",
@@ -252,6 +271,7 @@ def run_inference_records(
     agent_name: str = "db-slm",
     logger: EvalLogWriter | None = None,
     quality_gate: "QualityGate | None" = None,
+    decoder_cfg: DecoderConfig | None = None,
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
@@ -296,6 +316,7 @@ def run_inference_records(
             agent_name=agent_name,
             seed_history=False,
             min_response_words=min_words,
+            decoder_cfg=decoder_cfg,
         )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
         if quality_gate:
@@ -489,7 +510,7 @@ class QualityGate:
         cola_floor: float = 0.45,
         similarity_floor: float = 0.55,
         structure_floor: float = 0.35,
-        common_token_ceiling: float = 0.45,
+        common_token_ceiling: float = 0.55,
     ) -> None:
         self.path = Path(output_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     resource = None  # type: ignore
 
 from db_slm import DBSLMEngine
+from db_slm.decoder import DecoderConfig
 from db_slm.evaluation import (
     EvalLogWriter,
     EvaluationRecord,
@@ -119,6 +120,24 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help=(
             "Path to a JSON file that will store the evaluation/perplexity timeline."
             " Defaults to var/eval_logs/train-<timestamp>.json. Use '-' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override DecoderConfig.presence_penalty during evaluation probes/hold-outs "
+            "(default: decoder profile value)."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-frequency-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override DecoderConfig.frequency_penalty during evaluation probes/hold-outs "
+            "(default: decoder profile value)."
         ),
     )
     return parser
@@ -362,6 +381,7 @@ class InferenceMonitor:
         logger: EvalLogWriter | None = None,
         quality_gate: QualityGate | None = None,
         max_dataset_size: int | None = None,
+        decoder_cfg: DecoderConfig | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -373,6 +393,7 @@ class InferenceMonitor:
         self.logger = logger
         self.quality_gate = quality_gate
         self.max_dataset_size = max_dataset_size if max_dataset_size and max_dataset_size > 0 else None
+        self.decoder_cfg = decoder_cfg
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -396,6 +417,7 @@ class InferenceMonitor:
                 agent_name="db-slm",
                 logger=self.logger,
                 quality_gate=self.quality_gate,
+                decoder_cfg=self.decoder_cfg,
             )
 
     def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
@@ -471,6 +493,14 @@ def main() -> None:
     parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
 
+    for field_name, cli_name in (
+        ("decoder_presence_penalty", "--decoder-presence-penalty"),
+        ("decoder_frequency_penalty", "--decoder-frequency-penalty"),
+    ):
+        value = getattr(args, field_name, None)
+        if value is not None and value < 0:
+            parser.error(f"{cli_name} must be >= 0 (got {value})")
+
     if not args.inputs and not args.stdin:
         parser.error("Provide at least one input path or enable --stdin")
 
@@ -491,6 +521,15 @@ def main() -> None:
     if getattr(settings, "quality_queue_path", None):
         quality_gate = QualityGate(settings.quality_queue_path)
     engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order, settings=settings)
+    decoder_cfg_override: DecoderConfig | None = None
+    decoder_overrides: dict[str, float] = {}
+    if args.decoder_presence_penalty is not None:
+        decoder_overrides["presence_penalty"] = float(args.decoder_presence_penalty)
+    if args.decoder_frequency_penalty is not None:
+        decoder_overrides["frequency_penalty"] = float(args.decoder_frequency_penalty)
+    if decoder_overrides:
+        decoder_cfg_override = DecoderConfig(**decoder_overrides)
+
     flusher: ColdStorageFlusher | None = None
     if settings.backend == "sqlite":
         flusher = ColdStorageFlusher(engine, settings)
@@ -527,6 +566,7 @@ def main() -> None:
         logger=metrics_writer,
         quality_gate=quality_gate,
         max_dataset_size=args.eval_pool_size,
+        decoder_cfg=decoder_cfg_override,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -541,6 +581,7 @@ def main() -> None:
                 logger=metrics_writer,
                 quality_gate=quality_gate,
                 max_dataset_size=args.eval_pool_size,
+                decoder_cfg=decoder_cfg_override,
             )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
@@ -554,6 +595,7 @@ def main() -> None:
                 logger=metrics_writer,
                 quality_gate=quality_gate,
                 max_dataset_size=args.eval_pool_size,
+                decoder_cfg=decoder_cfg_override,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -605,6 +647,7 @@ def main() -> None:
                     agent_name="db-slm",
                     logger=metrics_writer,
                     quality_gate=quality_gate,
+                    decoder_cfg=decoder_cfg_override,
                 )
                 monitor.refresh_dataset(chunk.eval_records)
             if flusher:

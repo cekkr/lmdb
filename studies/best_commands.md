@@ -23,6 +23,7 @@ python3.11 src/train.py datasets/emotion_data.json \
 - Larger chunks amortize the MKNS smoother rebuilds; aim for ≥400 unless memory says otherwise.
 - `--eval-interval 5000` keeps evaluation overhead below ~2% of wall clock while still providing checkpoints every ~250k tokens for the 500-token chunks.
 - The `--profile-ingest` flag records chunk duration and RSS deltas; append the best run to `studies/datasets.md`.
+- When sweeping repeat penalties, append `--decoder-presence-penalty <value> --decoder-frequency-penalty <value>` so the overrides propagate to the held-out probes and land in the metrics metadata for later comparisons.
 
 ## Queue-Drain Retrain
 

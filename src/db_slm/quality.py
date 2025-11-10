@@ -213,9 +213,11 @@ class SentenceQualityScorer:
         lexical_novelty = max(0.0, 1.0 - lexical_similarity)
         structure_variety = 0.0
         common_token_penalty = 0.0
+        token_group_share = 0.0
         if structure_metrics:
             structure_variety = structure_metrics.get("structure_variety") or 0.0
             common_token_penalty = structure_metrics.get("common_token_penalty") or 0.0
+            token_group_share = structure_metrics.get("token_group_share") or 0.0
         base_score = (
             0.35 * semantic
             + 0.3 * cola
@@ -224,5 +226,8 @@ class SentenceQualityScorer:
             + 0.1 * structure_variety
         )
         penalty_scale = max(0.5, 1.0 - 0.35 * common_token_penalty)
+        repeat_excess = max(0.0, token_group_share - 0.3)
+        repeat_scale = max(0.35, 1.0 - 1.1 * repeat_excess)
+        penalty_scale = max(0.35, penalty_scale * repeat_scale)
         metrics["quality_score"] = round(max(0.0, min(1.0, base_score * penalty_scale)), 4)
         return metrics

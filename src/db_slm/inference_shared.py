@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
+from .decoder import DecoderConfig
 from .pipeline import DBSLMEngine
 
 
@@ -14,6 +15,7 @@ def issue_prompt(
     agent_name: str = "db-slm",
     seed_history: bool = True,
     min_response_words: int = 0,
+    decoder_cfg: DecoderConfig | None = None,
 ) -> Tuple[str, str]:
     """
     Send a prompt through DBSLMEngine, starting a conversation when needed.
@@ -24,5 +26,10 @@ def issue_prompt(
     convo_id = conversation_id or engine.start_conversation(
         user_id, agent_name, seed_history=seed_history
     )
-    response = engine.respond(convo_id, prompt, min_response_words=min_response_words)
+    response = engine.respond(
+        convo_id,
+        prompt,
+        decoder_cfg=decoder_cfg,
+        min_response_words=min_response_words,
+    )
     return convo_id, response

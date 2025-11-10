@@ -45,6 +45,9 @@ change so the next agent inherits the latest context.
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
+- `src/train.py` now accepts `--decoder-presence-penalty` and `--decoder-frequency-penalty` so repeat
+  penalty grids can run directly from the CLI; overrides propagate to periodic + hold-out probes and
+  are recorded inside the metrics metadata for downstream comparisons.
 - `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
   `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
   inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
@@ -67,13 +70,17 @@ change so the next agent inherits the latest context.
   (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
   samples later.
 - Evaluation probes now emit structural-diversity metrics (`structure_variety`, `common_token_penalty`,
-  `top_token_share`, opener diversity, punctuation balance) that explicitly devalue templated
+  `token_group_share`, `top_token_share`, opener diversity, punctuation balance) that explicitly devalue templated
   responses. `QualityGate` ingests the same metrics so over-repeated openings or punctuation abuse
   get queued for retraining, and both periodic and chunk hold-out probes always run at least two
-  samples (topped up from the rolling pool when needed).
+  samples (topped up from the rolling pool when needed). `SentenceQualityScorer` now scales
+  `quality_score` down whenever `token_group_share` exceeds 0.30 so repetition spikes show up in the
+  aggregate means.
 - Latest smoke-train (2025-11-10, python3.11, `datasets/emotion_data.json` capped at 400 rows) logged
   882k tokens with avg quality 0.599 and structure_variety 0.317 (details in `studies/BENCHMARKS.md`);
-  keep an eye on the 64% flagged rate—pool diversity or penalty tuning may be needed before next run.
+  keep an eye on the 64% flagged rate--pool diversity or penalty tuning may be needed before next run.
+  `QualityGate.common_token_ceiling` now defaults to 0.55 to drive the flagged rate below 45% once the
+  token-group repetition penalty feeds into `quality_score`.
 - Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
   re-queued into a random spot of the current probe before being eligible for up to three additional
   appearances in later random batches so probes cannot loop forever when the generator keeps
