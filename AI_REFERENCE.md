@@ -66,6 +66,11 @@ change so the next agent inherits the latest context.
   eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
   (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
   samples later.
+- Evaluation probes now emit structural-diversity metrics (`structure_variety`, `common_token_penalty`,
+  `top_token_share`, opener diversity, punctuation balance) that explicitly devalue templated
+  responses. `QualityGate` ingests the same metrics so over-repeated openings or punctuation abuse
+  get queued for retraining, and both periodic and chunk hold-out probes always run at least two
+  samples (topped up from the rolling pool when needed).
 - Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
   re-queued into a random spot of the current probe before being eligible for up to three additional
   appearances in later random batches so probes cannot loop forever when the generator keeps

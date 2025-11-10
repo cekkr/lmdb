@@ -5,8 +5,10 @@ import hashlib
 import json
 import math
 import random
+import re
 import textwrap
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -77,6 +79,75 @@ def preview(text: str, width: int = 1000) -> str:
     return textwrap.shorten(collapsed, width=width, placeholder="…\n")
 
 
+_STRUCTURE_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+_STRUCTURE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_STRUCTURE_PUNCTUATION = set(".,;:!?-")
+
+
+def _structure_stats(text: str) -> dict[str, float]:
+    lowered = text.lower()
+    tokens = _STRUCTURE_WORD_RE.findall(lowered)
+    token_count = len(tokens)
+    top_share = 0.0
+    unique_bigram_ratio = 1.0
+    if token_count:
+        counts = Counter(tokens)
+        top_share = sum(count for _, count in counts.most_common(3)) / token_count
+        if token_count > 1:
+            bigrams = list(zip(tokens, tokens[1:]))
+            unique_bigram_ratio = len(set(bigrams)) / max(1, len(bigrams))
+    sentences = [segment.strip() for segment in _STRUCTURE_SENTENCE_SPLIT.split(text) if segment.strip()]
+    if not sentences and text.strip():
+        sentences = [text.strip()]
+    openers: list[str] = []
+    for sentence in sentences:
+        match = _STRUCTURE_WORD_RE.search(sentence)
+        if match:
+            openers.append(match.group(0).lower())
+    opener_diversity = len(set(openers)) / len(openers) if openers else 1.0
+    punctuation_chars = [char for char in text if char in _STRUCTURE_PUNCTUATION]
+    punctuation_density = len(punctuation_chars) / max(1, token_count or len(text))
+    punctuation_target = 0.065
+    punctuation_tolerance = 0.04
+    punctuation_balance = 1.0
+    if punctuation_tolerance > 0:
+        delta = abs(punctuation_density - punctuation_target)
+        punctuation_balance = max(0.0, 1.0 - (delta / punctuation_tolerance))
+    return {
+        "token_count": float(token_count),
+        "top_share": float(top_share),
+        "unique_bigram_ratio": float(unique_bigram_ratio),
+        "opener_diversity": float(opener_diversity),
+        "punctuation_balance": float(punctuation_balance),
+    }
+
+
+def _structure_metrics(reference: str, candidate: str) -> dict[str, float]:
+    reference_stats = _structure_stats(reference or "")
+    candidate_stats = _structure_stats(candidate or "")
+    opener_penalty = 1.0 - candidate_stats["opener_diversity"]
+    relative_top_share = max(0.0, candidate_stats["top_share"] - reference_stats["top_share"])
+    base_penalty = 0.65 * candidate_stats["top_share"] + 0.35 * (opener_penalty + relative_top_share)
+    length_factor = 1.0
+    if candidate_stats["token_count"] <= 25.0:
+        length_factor = max(0.25, candidate_stats["token_count"] / 25.0)
+    common_token_penalty = max(0.0, min(1.0, base_penalty * length_factor))
+    structure_variety = (
+        0.6 * candidate_stats["unique_bigram_ratio"]
+        + 0.25 * candidate_stats["opener_diversity"]
+        + 0.15 * candidate_stats["punctuation_balance"]
+    )
+    structure_variety = max(0.0, min(1.0, structure_variety))
+    return {
+        "top_token_share": round(candidate_stats["top_share"], 4),
+        "unique_bigram_ratio": round(candidate_stats["unique_bigram_ratio"], 4),
+        "sentence_opener_diversity": round(candidate_stats["opener_diversity"], 4),
+        "punctuation_balance": round(candidate_stats["punctuation_balance"], 4),
+        "common_token_penalty": round(common_token_penalty, 4),
+        "structure_variety": round(structure_variety, 4),
+    }
+
+
 class ResponseEvaluator:
     """Aggregates lightweight eval metrics for streaming probes."""
 
@@ -98,7 +169,16 @@ class ResponseEvaluator:
             "ppl_reference": ppl_reference,
         }
         metrics["lexical_novelty"] = max(0.0, 1.0 - lexical)
-        metrics.update(self.quality.combined_quality(candidate, reference, lexical))
+        structure_metrics = _structure_metrics(reference, candidate)
+        metrics.update(structure_metrics)
+        metrics.update(
+            self.quality.combined_quality(
+                candidate,
+                reference,
+                lexical,
+                structure_metrics=structure_metrics,
+            )
+        )
         return metrics
 
     def _perplexity(self, prompt: str, target: str) -> float:
@@ -152,6 +232,12 @@ def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, fl
         "semantic_novelty_mean": "semantic_novelty",
         "length_ratio_mean": "length_ratio",
         "quality_score_mean": "quality_score",
+        "structure_variety_mean": "structure_variety",
+        "common_token_penalty_mean": "common_token_penalty",
+        "top_token_share_mean": "top_token_share",
+        "sentence_opener_diversity_mean": "sentence_opener_diversity",
+        "punctuation_balance_mean": "punctuation_balance",
+        "unique_bigram_ratio_mean": "unique_bigram_ratio",
     }
     return {summary_name: _mean_metric(samples, metric_name) for summary_name, metric_name in summary_keys.items()}
 
@@ -402,12 +488,16 @@ class QualityGate:
         grammar_threshold: int = 3,
         cola_floor: float = 0.45,
         similarity_floor: float = 0.55,
+        structure_floor: float = 0.35,
+        common_token_ceiling: float = 0.45,
     ) -> None:
         self.path = Path(output_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.grammar_threshold = grammar_threshold
         self.cola_floor = cola_floor
         self.similarity_floor = similarity_floor
+        self.structure_floor = structure_floor
+        self.common_token_ceiling = common_token_ceiling
 
     def process(
         self,
@@ -445,4 +535,10 @@ class QualityGate:
         length_ratio = metrics.get("length_ratio")
         if isinstance(length_ratio, (int, float)) and (length_ratio < 0.6 or length_ratio > 1.4):
             reasons.append("length_mismatch")
+        structure_variety = metrics.get("structure_variety")
+        if isinstance(structure_variety, (int, float)) and structure_variety < self.structure_floor:
+            reasons.append(f"structure_variety<{self.structure_floor}")
+        token_penalty = metrics.get("common_token_penalty")
+        if isinstance(token_penalty, (int, float)) and token_penalty > self.common_token_ceiling:
+            reasons.append(f"common_token_penalty>{self.common_token_ceiling}")
         return (len(reasons) > 0, reasons)

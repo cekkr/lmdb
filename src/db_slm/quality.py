@@ -197,17 +197,32 @@ class SentenceQualityScorer:
         candidate: str,
         reference: str,
         lexical_similarity: float,
+        *,
+        structure_metrics: dict[str, float] | None = None,
     ) -> dict[str, float | int | None]:
         metrics: dict[str, float | int | None] = {}
         metrics.update(self.grammar_metrics(candidate))
         metrics.update(self.acceptability_metrics(candidate))
         metrics.update(self.semantic_comparison(reference, candidate, lexical_similarity))
+        if structure_metrics:
+            for key, value in structure_metrics.items():
+                metrics.setdefault(key, value)
         grammar = metrics.get("grammar_score") or 0.0
         cola = metrics.get("cola_acceptability") or 0.0
         semantic = metrics.get("semantic_similarity") or 0.0
         lexical_novelty = max(0.0, 1.0 - lexical_similarity)
-        metrics["quality_score"] = round(
-            0.45 * semantic + 0.35 * cola + 0.2 * grammar + 0.15 * lexical_novelty,
-            4,
+        structure_variety = 0.0
+        common_token_penalty = 0.0
+        if structure_metrics:
+            structure_variety = structure_metrics.get("structure_variety") or 0.0
+            common_token_penalty = structure_metrics.get("common_token_penalty") or 0.0
+        base_score = (
+            0.35 * semantic
+            + 0.3 * cola
+            + 0.15 * grammar
+            + 0.1 * lexical_novelty
+            + 0.1 * structure_variety
         )
+        penalty_scale = max(0.5, 1.0 - 0.35 * common_token_penalty)
+        metrics["quality_score"] = round(max(0.0, min(1.0, base_score * penalty_scale)), 4)
         return metrics

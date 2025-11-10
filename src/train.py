@@ -350,6 +350,8 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
 
 
 class InferenceMonitor:
+    _MIN_SAMPLES = 2
+
     def __init__(
         self,
         engine: DBSLMEngine,
@@ -364,7 +366,8 @@ class InferenceMonitor:
         self.engine = engine
         self.dataset = dataset
         self.interval = interval_tokens
-        self.samples = max(1, samples_per_cycle)
+        self.min_samples = self._MIN_SAMPLES
+        self.samples = max(self.min_samples, samples_per_cycle)
         self.next_threshold = interval_tokens
         self.evaluator = evaluator
         self.logger = logger
@@ -407,6 +410,12 @@ class InferenceMonitor:
                 continue
             replace_idx = random.randrange(self.max_dataset_size)
             self.dataset[replace_idx] = record
+
+    def borrow_records(self, count: int) -> list[EvaluationRecord]:
+        if count <= 0 or not self.dataset:
+            return []
+        sample_size = min(count, len(self.dataset))
+        return random.sample(self.dataset, sample_size)
 
 
 class IngestProfiler:
@@ -576,10 +585,21 @@ def main() -> None:
             print(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
             monitor.maybe_run(total_tokens)
             if chunk.eval_records:
+                eval_batch = list(chunk.eval_records)
+                min_batch = getattr(monitor, "min_samples", 2)
+                if len(eval_batch) < min_batch:
+                    needed = min_batch - len(eval_batch)
+                    eval_batch.extend(monitor.borrow_records(needed))
+                if len(eval_batch) < min_batch and eval_batch:
+                    seed_records = list(eval_batch)
+                    idx = 0
+                    while len(eval_batch) < min_batch:
+                        eval_batch.append(seed_records[idx % len(seed_records)])
+                        idx += 1
                 run_inference_records(
                     engine,
                     evaluator,
-                    chunk.eval_records,
+                    eval_batch,
                     label=f"{label} hold-out",
                     user_id="trainer",
                     agent_name="db-slm",
