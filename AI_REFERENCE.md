@@ -71,6 +71,9 @@ change so the next agent inherits the latest context.
   responses. `QualityGate` ingests the same metrics so over-repeated openings or punctuation abuse
   get queued for retraining, and both periodic and chunk hold-out probes always run at least two
   samples (topped up from the rolling pool when needed).
+- Latest smoke-train (2025-11-10, python3.11, `datasets/emotion_data.json` capped at 400 rows) logged
+  882k tokens with avg quality 0.599 and structure_variety 0.317 (details in `studies/BENCHMARKS.md`);
+  keep an eye on the 64% flagged rate—pool diversity or penalty tuning may be needed before next run.
 - Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
   re-queued into a random spot of the current probe before being eligible for up to three additional
   appearances in later random batches so probes cannot loop forever when the generator keeps
