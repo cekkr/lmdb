@@ -94,6 +94,11 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--metrics-export <path>`: write the rolling ROUGE/perplexity timeline plus profiling samples to a
   JSON artifact. When omitted, `train.py` automatically drops `var/eval_logs/train-<timestamp>.json`
   so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
+- `--decoder-presence-penalty` / `--decoder-frequency-penalty`: override the decoder repeat-penalty
+  pair used during evaluation probes and chunk hold-outs. When unset, the default sampling profile
+  applies; supplying these flags lets you sweep repeat penalties (e.g., `--decoder-presence-penalty 0.22 --decoder-frequency-penalty 0.08`)
+  without editing code, and the chosen values are recorded inside the metrics export for later
+  comparisons.
 
 Large batches can take a while to finish a single call to `train_from_text()`, so the trainer now
 prints progress lines for the vocabulary pass, every n-gram order, and the KN rebuilds. The logs
@@ -165,6 +170,12 @@ derives `min_response_words` from the reference length (capped at 512 words) to 
 128 words. When a sample is flagged for retraining it now re-enters the current batch at a random
 position (up to two total attempts) before being scheduled for future probes, so the decoder gets a
 fresh shot without holding up the rest of the evaluation.
+
+Supplying `--decoder-presence-penalty` or `--decoder-frequency-penalty` only affects the inference
+path used by those probes (including chunk hold-outs); training statistics stay unchanged. The chosen
+values flow into the `DecoderConfig` passed to `issue_prompt()` and are emitted in the metadata block
+inside `var/eval_logs/*.json`, so repeat-penalty sweeps can be compared later without scraping the
+console logs.
 
 Low-quality generations (grammar errors ≥ 3, CoLA < 0.45, semantic similarity < 0.55, or a >40%
 length mismatch) are streamed into `DBSLM_QUALITY_QUEUE_PATH` (defaults to
