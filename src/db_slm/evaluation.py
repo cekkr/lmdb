@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import random
 import textwrap
 import uuid
 from dataclasses import dataclass
@@ -172,6 +173,7 @@ def run_inference_records(
         f"[eval] Running {len(records)} inference probe(s) from {label} to gauge training quality."
     )
     results: list[EvaluationSampleResult] = []
+    pending: list[dict[str, Any]] = []
     for idx, record in enumerate(records, start=1):
         record_key = _record_signature(record)
         if _consume_future_retry_budget(record_key):
@@ -180,42 +182,54 @@ def run_inference_records(
                 f"(prompt='{preview(record.prompt, 120)}')."
             )
             continue
-        attempts = 0
+        pending.append(
+            {
+                "index": idx,
+                "record": record,
+                "record_key": record_key,
+                "attempts": 0,
+            }
+        )
+    while pending:
+        entry = pending.pop(0)
+        record = entry["record"]
+        idx = entry["index"]
+        record_key = entry["record_key"]
+        entry["attempts"] += 1
+        attempts = entry["attempts"]
         generated = ""
         metrics: dict[str, float | int | None] = {}
         ref_words = max(1, len(record.response.split()))
         min_words = max(20, min(512, int(ref_words * 0.85)))
         flagged = False
         flag_reasons: list[str] = []
-        while attempts < _MAX_BATCH_ATTEMPTS:
-            attempts += 1
-            _, generated = issue_prompt(
-                engine,
-                record.prompt,
-                user_id=user_id,
-                agent_name=agent_name,
-                seed_history=False,
-                min_response_words=min_words,
-            )
-            metrics = evaluator.evaluate(record.prompt, record.response, generated)
-            flagged = False
-            flag_reasons = []
-            if quality_gate:
-                flagged, flag_reasons = quality_gate.process(record, generated, metrics)
-                if flagged:
-                    joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-                    print(f"[eval] #{idx}: flagged for retraining ({joined}).")
-            if not flagged:
-                _clear_future_retries(record_key)
-                break
-            if attempts < _MAX_BATCH_ATTEMPTS:
+        _, generated = issue_prompt(
+            engine,
+            record.prompt,
+            user_id=user_id,
+            agent_name=agent_name,
+            seed_history=False,
+            min_response_words=min_words,
+        )
+        metrics = evaluator.evaluate(record.prompt, record.response, generated)
+        if quality_gate:
+            flagged, flag_reasons = quality_gate.process(record, generated, metrics)
+            if flagged:
                 joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-                print(
-                    f"[eval] #{idx}: retrying flagged sample "
-                    f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
-                )
+                print(f"[eval] #{idx}: flagged for retraining ({joined}).")
+        if flagged and attempts < _MAX_BATCH_ATTEMPTS:
+            joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
+            print(
+                f"[eval] #{idx}: re-queueing flagged sample "
+                f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
+            )
+            insert_at = random.randint(0, len(pending))
+            pending.insert(insert_at, entry)
+            continue
         if flagged:
             _schedule_future_retries(record_key)
+        else:
+            _clear_future_retries(record_key)
         print(
             "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
             "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "

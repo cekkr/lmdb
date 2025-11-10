@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import re
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from .db import DatabaseEnvironment
 from .metrics import keyword_summary, lexical_overlap
@@ -46,14 +46,26 @@ class DBSLMEngine:
     # ------------------------------------------------------------------ #
     # Training utilities
     # ------------------------------------------------------------------ #
-    def train_from_text(self, corpus: str) -> int:
+    def train_from_text(
+        self,
+        corpus: str,
+        *,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> int:
+        if progress_callback:
+            progress_callback("prepare", 0, 1)
         prepared = self.segment_embedder.prepare_for_training(corpus)
+        if progress_callback:
+            progress_callback("prepare", 1, 1)
         token_ids = self.tokenizer.encode(prepared or corpus)
-        if len(token_ids) < 2:
+        total_tokens = len(token_ids)
+        if total_tokens < 2:
             return 0
-        self.store.ingest(token_ids)
-        self.smoother.rebuild_all()
-        return len(token_ids)
+        if progress_callback:
+            progress_callback("tokenize", total_tokens, total_tokens)
+        self.store.ingest(token_ids, progress_callback=progress_callback)
+        self.smoother.rebuild_all(progress_callback=progress_callback)
+        return total_tokens
 
     # ------------------------------------------------------------------ #
     # Conversation helpers

@@ -30,6 +30,9 @@ change so the next agent inherits the latest context.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments.
+- Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
+  large JSON chunks no longer look frozen; the logs include approximate line counts to show where
+  the trainer is spending time.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
   real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`.
@@ -43,9 +46,9 @@ change so the next agent inherits the latest context.
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
 - `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
-  `--chunk-eval-percent`; those hold-out prompts/responses skip training and run through the same
-  inference metrics the moment the chunk finishes ingesting, giving tighter feedback loops tied to
-  the newest data.
+  `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
+  inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
+  so future periodic probes always contain freshly sampled rows instead of the initial fixed set.
 - Training-time probes now spin up seedless conversations so low-resource scaffolding never masks
   evaluation outputs; if you still need the canned turns (e.g., via `run.py`) the helper stays
   enabled for interactive sessions only.
@@ -63,9 +66,10 @@ change so the next agent inherits the latest context.
   eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
   (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
   samples later.
-- Evaluation retries for flagged samples are now capped at two attempts per batch and at most three
-  additional appearances in later random batches so probes cannot loop forever when the generator
-  keeps emitting low-quality responses.
+- Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
+  re-queued into a random spot of the current probe before being eligible for up to three additional
+  appearances in later random batches so probes cannot loop forever when the generator keeps
+  emitting low-quality responses.
 - The evaluator infers `min_response_words` from the reference length (capped at 512) so long-form
   corpora like `emotion_data.json` do not lose the substantive portion of the `|RESPONSE|` frame, and
   CPU-heavy quality scoring is gated behind the adaptive load monitor to avoid starving ingestion.

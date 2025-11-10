@@ -4,7 +4,7 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 from .db import DatabaseEnvironment
 
@@ -148,16 +148,29 @@ class NGramStore:
     # ------------------------------------------------------------------ #
     # Ingestion
     # ------------------------------------------------------------------ #
-    def ingest(self, token_ids: Sequence[int]) -> None:
+    def ingest(
+        self,
+        token_ids: Sequence[int],
+        *,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None:
         if len(token_ids) < 2:
             return
-        for token_id in token_ids:
+        total_tokens = len(token_ids)
+        vocab_stride = max(1, total_tokens // 20) if total_tokens else 1
+        for idx, token_id in enumerate(token_ids, start=1):
             self.vocab.increment_frequency(token_id)
+            if progress_callback and (idx % vocab_stride == 0 or idx == total_tokens):
+                progress_callback("vocab", idx, total_tokens)
         for n in range(1, self.order + 1):
             if len(token_ids) < n:
                 break
             table = self._counts_table(n)
-            for idx in range(len(token_ids) - n + 1):
+            windows = len(token_ids) - n + 1
+            if windows <= 0:
+                continue
+            window_stride = max(1, windows // 20)
+            for idx in range(windows):
                 ngram = token_ids[idx : idx + n]
                 context = ngram[:-1]
                 next_token = ngram[-1]
@@ -182,6 +195,9 @@ class NGramStore:
                     """,
                     (context_hash,),
                 )
+                processed = idx + 1
+                if progress_callback and (processed % window_stride == 0 or processed == windows):
+                    progress_callback(f"order_{n}", processed, windows)
 
     def _counts_table(self, order: int) -> str:
         return f"tbl_l1_ng_counts_{order}"
@@ -333,10 +349,17 @@ class MKNSmoother:
         self.quantizer = quantizer
         self.topk = topk
 
-    def rebuild_all(self) -> None:
+    def rebuild_all(
+        self,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None:
         self._rebuild_continuations()
+        if progress_callback:
+            progress_callback("smooth_continuations", 1, 1)
         for order in range(1, self.store.order + 1):
             self.rebuild_order(order)
+            if progress_callback:
+                progress_callback(f"smooth_{order}", order, self.store.order)
 
     def rebuild_order(self, order: int) -> None:
         rows = self.store.iter_counts(order)

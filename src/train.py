@@ -172,6 +172,48 @@ class CorpusChunk:
     label: str
     train_text: str
     eval_records: list[EvaluationRecord]
+    total_rows: int
+    train_rows: int
+
+
+class TrainingProgressPrinter:
+    """Provides throttle-controlled training progress logs."""
+
+    def __init__(self, label: str, train_rows: int) -> None:
+        self.label = label
+        self.train_rows = max(1, train_rows)
+        self._last_emit = 0.0
+
+    def __call__(self, stage: str, completed: int, total: int) -> None:
+        if total <= 0:
+            return
+        now = time.perf_counter()
+        if completed != total and (now - self._last_emit) < 0.75:
+            return
+        self._last_emit = now
+        pct = (completed / total) * 100.0
+        approx_row = min(self.train_rows, max(1, int(round(self.train_rows * (completed / total)))))
+        stage_label = self._format_stage(stage)
+        print(
+            f"[train] {self.label}: {stage_label} {pct:5.1f}% "
+            f"({completed}/{total}) ~line {approx_row}/{self.train_rows}"
+        )
+
+    def _format_stage(self, stage: str) -> str:
+        if stage.startswith("order_"):
+            return f"{stage.replace('_', '-')} windows"
+        if stage.startswith("smooth_"):
+            suffix = stage.split("_", 1)[1]
+            if suffix.isdigit():
+                return f"smoothing order-{suffix}"
+            return "smoothing"
+        labels = {
+            "prepare": "preparing segments",
+            "tokenize": "tokenizing corpus",
+            "vocab": "updating vocabulary",
+            "smooth_continuations": "continuation stats",
+        }
+        return labels.get(stage, stage)
 
 
 def iter_corpora(
@@ -188,7 +230,8 @@ def iter_corpora(
             yield from iter_json_chunks(path, json_chunk_size, max_json_lines, holdout_fraction)
             continue
         text = path.read_text(encoding=encoding)
-        yield CorpusChunk(str(path), text, [])
+        row_count = max(1, len([line for line in text.splitlines() if line.strip()]))
+        yield CorpusChunk(str(path), text, [], total_rows=row_count, train_rows=row_count)
 
 
 def iter_json_chunks(
@@ -229,7 +272,7 @@ def iter_json_chunks(
             )
             record = EvaluationRecord(prompt=prompt or "", response=response, emotion=emotion)
 
-            print(f"[train] Trained line #{line_no} (Prompt: {prompt})")
+            print(f"[train] Staged line #{line_no} (Prompt: {prompt})")
 
             entries.append((segment, record))
             consumed += 1
@@ -257,7 +300,9 @@ def _build_chunk(
         record for idx, (_, record) in enumerate(entries) if idx in holdout_indexes
     ]
     train_text = "\n\n".join(train_segments)
-    return CorpusChunk(label, train_text, holdout_records)
+    total_rows = len(entries) or 1
+    train_rows = len(train_segments) or 1
+    return CorpusChunk(label, train_text, holdout_records, total_rows=total_rows, train_rows=train_rows)
 
 
 def _sample_holdouts(total_entries: int, fraction: float) -> set[int]:
@@ -314,6 +359,7 @@ class InferenceMonitor:
         evaluator: ResponseEvaluator,
         logger: EvalLogWriter | None = None,
         quality_gate: QualityGate | None = None,
+        max_dataset_size: int | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -323,6 +369,7 @@ class InferenceMonitor:
         self.evaluator = evaluator
         self.logger = logger
         self.quality_gate = quality_gate
+        self.max_dataset_size = max_dataset_size if max_dataset_size and max_dataset_size > 0 else None
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -347,6 +394,19 @@ class InferenceMonitor:
                 logger=self.logger,
                 quality_gate=self.quality_gate,
             )
+
+    def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
+        if not new_records:
+            return
+        if self.max_dataset_size is None or self.max_dataset_size <= 0:
+            self.dataset.extend(new_records)
+            return
+        for record in new_records:
+            if len(self.dataset) < self.max_dataset_size:
+                self.dataset.append(record)
+                continue
+            replace_idx = random.randrange(self.max_dataset_size)
+            self.dataset[replace_idx] = record
 
 
 class IngestProfiler:
@@ -437,8 +497,10 @@ def main() -> None:
     if args.stdin:
         stdin_payload = sys.stdin.read()
         if stdin_payload.strip():
+            stdin_rows = max(1, len([line for line in stdin_payload.splitlines() if line.strip()]))
             corpora_iter = itertools.chain(
-                corpora_iter, [CorpusChunk("<stdin>", stdin_payload, [])]
+                corpora_iter,
+                [CorpusChunk("<stdin>", stdin_payload, [], total_rows=stdin_rows, train_rows=stdin_rows)],
             )
 
     # We defer the "empty" validation until after attempting to iterate so JSON inputs
@@ -455,6 +517,7 @@ def main() -> None:
         evaluator,
         logger=metrics_writer,
         quality_gate=quality_gate,
+        max_dataset_size=args.eval_pool_size,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -468,6 +531,7 @@ def main() -> None:
                 evaluator,
                 logger=metrics_writer,
                 quality_gate=quality_gate,
+                max_dataset_size=args.eval_pool_size,
             )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
@@ -480,6 +544,7 @@ def main() -> None:
                 evaluator,
                 logger=metrics_writer,
                 quality_gate=quality_gate,
+                max_dataset_size=args.eval_pool_size,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -493,8 +558,15 @@ def main() -> None:
             label = chunk.label
             corpus = chunk.train_text
             processed_corpora += 1
-            print(f"[train] Processing {label} ({len(corpus)} bytes)...")
-            token_count = profiler.measure(label, lambda text=corpus: engine.train_from_text(text))
+            print(
+                f"[train] Processing {label} ({len(corpus)} bytes, "
+                f"{chunk.train_rows}/{chunk.total_rows} training rows)..."
+            )
+            reporter = TrainingProgressPrinter(label, chunk.train_rows)
+            token_count = profiler.measure(
+                label,
+                lambda text=corpus, rep=reporter: engine.train_from_text(text, progress_callback=rep),
+            )
             if token_count == 0:
                 print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
                 continue
@@ -514,6 +586,7 @@ def main() -> None:
                     logger=metrics_writer,
                     quality_gate=quality_gate,
                 )
+                monitor.refresh_dataset(chunk.eval_records)
             if flusher:
                 flusher.maybe_flush()
 

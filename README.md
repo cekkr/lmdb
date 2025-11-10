@@ -84,9 +84,9 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--eval-interval`, `--eval-samples`, `--eval-dataset`, `--eval-pool-size`: enable periodic
   inference probes during training to log qualitative progress without leaving the script.
 - `--chunk-eval-percent`: when ingesting JSON/NDJSON corpora, reserve this percentage of every chunk
-  as hold-out prompts/responses. Those samples skip training entirely and are immediately replayed
-  through the inference path so you can spot regressions tied to the latest data instead of a fixed
-  seed set.
+  as hold-out prompts/responses. Those samples skip training entirely, immediately run through the
+  inference path, and are injected into the rolling evaluation pool so every batch swaps a random
+  slice of the validation set with the freshest rows.
 - `--profile-ingest`: print per-corpus latency and resident-set-size metrics so you can keep raising
   `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
   of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
@@ -94,6 +94,11 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--metrics-export <path>`: write the rolling ROUGE/perplexity timeline plus profiling samples to a
   JSON artifact. When omitted, `train.py` automatically drops `var/eval_logs/train-<timestamp>.json`
   so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
+
+Large batches can take a while to finish a single call to `train_from_text()`, so the trainer now
+prints progress lines for the vocabulary pass, every n-gram order, and the KN rebuilds. The logs
+include an approximate row number so you can tell which part of the chunk is currently in flight
+instead of staring at a silent terminal.
 
 Example (quick validation run that ingests only 200 lines and probes the decoder every ~2k tokens):
 
@@ -157,7 +162,9 @@ lexical/ROUGE/perplexity values, so you can catch regressions that only manifest
 errors or semantic drift. Because `emotion_data.json` responses average ~347 words, the evaluator
 derives `min_response_words` from the reference length (capped at 512 words) to ensure the logged
 `|RESPONSE|` frame actually reaches the substantive part of the answer instead of truncating after
-128 words.
+128 words. When a sample is flagged for retraining it now re-enters the current batch at a random
+position (up to two total attempts) before being scheduled for future probes, so the decoder gets a
+fresh shot without holding up the rest of the evaluation.
 
 Low-quality generations (grammar errors ≥ 3, CoLA < 0.45, semantic similarity < 0.55, or a >40%
 length mismatch) are streamed into `DBSLM_QUALITY_QUEUE_PATH` (defaults to
