@@ -140,21 +140,24 @@ change so the next agent inherits the latest context.
 
 ### DB Adapters
 
-- `sqlite` remains the default adapter surfaced through `DBSLMSettings.backend`. The Python stack
-  depends on its WAL tuning plus the Level 1–3 schema bootstrapped by `DatabaseEnvironment`, so keep
-  it authoritative for migrations and spec changes.
-- `mariadb` is the current cold-storage / replication target. The migration script + flusher expect a
-  1:1 column layout with SQLite tables, so any schema edits must land in both backends before new
-  ingests run.
+- `sqlite` remains the compatibility backend exposed through `DBSLMSettings.backend`, but it is now
+  considered legacy. Keep it only for metadata bootstrapping while the Level 1 pipelines move over
+  to cheetah; new work should avoid adding tables or features that would be SQLite-only and instead
+  target the Go engine.
+- `mariadb` (MySQL) served as the cold-storage target for `ColdStorageFlusher`. With cheetah
+  streaming online the flusher is slated for removal, so treat the `DBSLM_MARIADB_*` knobs as
+  deprecated and plan to delete them once cheetah owns archival duties.
 - `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts and Top-K
   slices. Setting `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and enabling
   `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS Top-K
   bucket into the Go service via its TCP commands; the decoder then queries cheetah first and falls
-  back to SQLite when a key is missing. This satisfies the “adapter boundary” item on the roadmap
-  and gives us byte-faithful keying plus deterministic Top-K ordering without paying extra SQL
-  round-trips. The remaining roadmap items still stand:
-  - expose server-side reducers so Level 1 statistics can be recomputed in place;
-  - extend the pair trie RPCs to stream ordered slices by byte range;
-  - add brute-force sweep helpers so Level 2/3 jobs can shard across cheetah files.
+  back to SQLite when a key is missing. As of this pass:
+  - the trie now exposes a `PAIR_SCAN` streaming command so ordered byte slices can be pulled
+    without touching SQLite, and the Python adapter exposes it via
+    `HotPathAdapter.scan_namespace()/CheetahClient.pair_scan`;
+  - server-side reducers/stats refreshers are still pending so MKNS rebuilds can stay inside
+    cheetah;
+  - brute-force sweep helpers are still required so Level 2/3 jobs can shard across cheetah files.
   Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
-  `cheetah-db/README.md` for future agents.
+  `cheetah-db/README.md` for future agents, since the roadmap now aims to delete the SQLite and
+  MariaDB code paths once the reducers land.

@@ -7,7 +7,7 @@ import struct
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from ..settings import DBSLMSettings
 from .base import HotPathAdapter, NullHotPathAdapter
@@ -79,6 +79,16 @@ class CheetahClient:
     def pair_get(self, value: bytes) -> int | None:
         response = self._command(f"PAIR_GET x{value.hex()}")
         return self._parse_key_response(response)
+
+    def pair_scan(self, prefix: bytes = b"", limit: int = 0) -> list[tuple[bytes, int]] | None:
+        arg = "*" if not prefix else f"x{prefix.hex()}"
+        command = f"PAIR_SCAN {arg}"
+        if limit > 0:
+            command = f"{command} {limit}"
+        response = self._command(command)
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_pair_scan_response(response)
 
     # ------------------------------------------------------------------ #
     # Low-level protocol management
@@ -175,6 +185,27 @@ class CheetahClient:
                 except ValueError:
                     return None
         return None
+
+    @staticmethod
+    def _parse_pair_scan_response(response: str) -> list[tuple[bytes, int]]:
+        if not response.startswith("SUCCESS"):
+            return []
+        payload_start = response.find("items=")
+        if payload_start == -1:
+            return []
+        payload = response[payload_start + len("items=") :]
+        entries: list[tuple[bytes, int]] = []
+        for item in payload.split(";"):
+            if not item:
+                continue
+            try:
+                value_hex, key_text = item.rsplit(":", 1)
+                value = bytes.fromhex(value_hex)
+                key = int(key_text)
+            except (ValueError, TypeError):
+                continue
+            entries.append((value, key))
+        return entries
 
 
 @dataclass(frozen=True)
@@ -295,6 +326,28 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if not record or record.order != order:
             return None
         return record.ranked[:limit]
+
+    def scan_namespace(
+        self,
+        namespace: str,
+        *,
+        prefix: bytes = b"",
+        limit: int = 0,
+    ) -> Iterable[tuple[bytes, int]]:
+        if not self._enabled:
+            return []
+        namespace_bytes = namespace.encode("utf-8") + b":"
+        scoped_prefix = namespace_bytes + prefix
+        results = self._client.pair_scan(scoped_prefix, limit=limit)
+        if results is None:
+            self._disable(CheetahError("pair_scan failed"))
+            return []
+        trimmed: list[tuple[bytes, int]] = []
+        for raw_value, key in results:
+            if not raw_value.startswith(namespace_bytes):
+                continue
+            trimmed.append((raw_value[len(namespace_bytes) :], key))
+        return trimmed
 
     # ------------------------------------------------------------------ #
     # Internal helpers

@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/binary"
 	"hash/fnv"
+	"io"
 	"os"
 	"sync"
 )
@@ -242,6 +243,18 @@ func (t *PairTable) IsEmpty() (bool, error) {
 
 func (t *PairTable) Close() {
 	t.file.Close()
+}
+
+// Snapshot returns a full copy of the current table state so callers can scan without holding locks.
+func (t *PairTable) Snapshot() ([]byte, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	buf := make([]byte, PairTablePreallocatedSize)
+	if _, err := t.file.ReadAt(buf, 0); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // Analyze scansiona tutte le 256 entrate di un nodo per determinarne lo stato.

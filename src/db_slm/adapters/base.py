@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import Iterable, Protocol, Sequence, Tuple
 
 
 class HotPathAdapter(Protocol):
@@ -15,6 +15,15 @@ class HotPathAdapter(Protocol):
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         """Return cached ranked results or None when unavailable."""
 
+    def scan_namespace(
+        self,
+        namespace: str,
+        *,
+        prefix: bytes = b"",
+        limit: int = 0,
+    ) -> Iterable[Tuple[bytes, int]]:
+        """Iterate namespace-prefixed keys (e.g., contexts, cached slices) in byte order."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -27,6 +36,15 @@ class NullHotPathAdapter:
 
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         return None
+
+    def scan_namespace(
+        self,
+        namespace: str,
+        *,
+        prefix: bytes = b"",
+        limit: int = 0,
+    ) -> Iterable[Tuple[bytes, int]]:
+        return []
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

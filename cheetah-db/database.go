@@ -25,6 +25,16 @@ type Database struct {
 	nextPairIDPath  string // Path al file che memorizza il contatore
 }
 
+const (
+	pairScanDefaultLimit = 256
+	pairScanMaxLimit     = 4096
+)
+
+type PairScanResult struct {
+	Value []byte
+	Key   uint64
+}
+
 func NewDatabase(path string) (*Database, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
@@ -44,6 +54,7 @@ func NewDatabase(path string) (*Database, error) {
 		path:           path,
 		pairDir:        pairDir,
 		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
+		mainKeys:       mkt,
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -245,6 +256,34 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			return err.Error(), nil
 		}
 		return db.PairDel(value)
+	case command == "PAIR_SCAN":
+		if len(parts) < 2 {
+			return "ERROR,pair_scan_requires_prefix", nil
+		}
+		args := strings.Fields(parts[1])
+		if len(args) == 0 {
+			return "ERROR,pair_scan_requires_prefix", nil
+		}
+		var prefix []byte
+		var err error
+		if args[0] != "*" {
+			prefix, err = parseValue(args[0])
+			if err != nil {
+				return err.Error(), nil
+			}
+		}
+		limit := 0
+		if len(args) > 1 {
+			limit, err = strconv.Atoi(args[1])
+			if err != nil {
+				return "ERROR,invalid_limit", nil
+			}
+		}
+		results, err := db.PairScan(prefix, limit)
+		if err != nil {
+			return "", err
+		}
+		return formatPairScanResponse(results), nil
 	default:
 		return "ERROR,unknown_command", nil
 	}
@@ -261,4 +300,132 @@ func (db *Database) deletePairTable(tableID uint32) error {
 	// Costruisce il path e rimuove il file dal disco
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
 	return os.Remove(path)
+}
+
+func (db *Database) PairScan(prefix []byte, limit int) ([]PairScanResult, error) {
+	limit = normalizePairScanLimit(limit)
+	results := make([]PairScanResult, 0, limit)
+	if len(prefix) == 0 {
+		err := db.collectPairEntries(0, nil, limit, &results)
+		return results, err
+	}
+
+	currentTableID := uint32(0)
+	for i, branchByte := range prefix {
+		table, err := db.getPairTable(currentTableID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return results, nil
+			}
+			return nil, err
+		}
+		entry, err := table.ReadEntry(branchByte)
+		if err != nil {
+			return nil, err
+		}
+		length := entry[0]
+		data := entry[1:]
+		isLast := i == len(prefix)-1
+		if isLast {
+			if length > 0 {
+				results = append(results, PairScanResult{
+					Value: append([]byte{}, prefix...),
+					Key:   decodeAbsoluteKey(entry),
+				})
+				return results, nil
+			}
+			childID := binary.BigEndian.Uint32(data)
+			if childID == 0 {
+				return results, nil
+			}
+			err := db.collectPairEntries(childID, append([]byte{}, prefix...), limit, &results)
+			return results, err
+		}
+		if length > 0 {
+			return results, nil
+		}
+		childID := binary.BigEndian.Uint32(data)
+		if childID == 0 {
+			return results, nil
+		}
+		currentTableID = childID
+	}
+	return results, nil
+}
+
+func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int, acc *[]PairScanResult) error {
+	if limit > 0 && len(*acc) >= limit {
+		return nil
+	}
+	table, err := db.getPairTable(tableID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	snapshot, err := table.Snapshot()
+	if err != nil {
+		return err
+	}
+
+	for branch := 0; branch < 256; branch++ {
+		if limit > 0 && len(*acc) >= limit {
+			break
+		}
+		offset := branch * PairEntrySize
+		entry := snapshot[offset : offset+PairEntrySize]
+		length := entry[0]
+		if length == 0 {
+			childID := binary.BigEndian.Uint32(entry[1:])
+			if childID == 0 {
+				continue
+			}
+			nextPrefix := append(append([]byte{}, prefix...), byte(branch))
+			if err := db.collectPairEntries(childID, nextPrefix, limit, acc); err != nil {
+				return err
+			}
+		} else {
+			value := append(append([]byte{}, prefix...), byte(branch))
+			*acc = append(*acc, PairScanResult{
+				Value: value,
+				Key:   decodeAbsoluteKey(entry),
+			})
+		}
+	}
+	return nil
+}
+
+func normalizePairScanLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return pairScanDefaultLimit
+	case limit > pairScanMaxLimit:
+		return pairScanMaxLimit
+	default:
+		return limit
+	}
+}
+
+func decodeAbsoluteKey(entry []byte) uint64 {
+	data := entry[1:]
+	var buf [8]byte
+	copy(buf[8-len(data):], data[:len(data)])
+	return binary.BigEndian.Uint64(buf[:])
+}
+
+func formatPairScanResponse(results []PairScanResult) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("SUCCESS,count=%d", len(results)))
+	if len(results) == 0 {
+		return b.String()
+	}
+	b.WriteString(",items=")
+	for idx, res := range results {
+		if idx > 0 {
+			b.WriteString(";")
+		}
+		b.WriteString(fmt.Sprintf("%x:%d", res.Value, res.Key))
+	}
+	return b.String()
 }

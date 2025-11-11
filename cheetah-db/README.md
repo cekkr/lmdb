@@ -65,6 +65,10 @@ adapter status stays visible to future maintainers.
 - The decoder consults the cheetah mirror first when sampling candidates; if the Go service is
   offline or missing a context, it automatically falls back to SQLite. This gives us byte-faithful
   keying and immediate Top-K slices with no additional SQL load.
+- Ordered trie streaming is now available via the `PAIR_SCAN` command and the
+  `HotPathAdapter.scan_namespace()` helper, so DB-SLM can iterate over namespaces (contexts, cached
+  Top-K buckets, etc.) without touching SQLite. The next integration step is to route Level 1 reads
+  (context registry, Top-K coverage checks) through this iterator so SQLite/MariaDB can be removed.
 - Upcoming roadmap items (statistical reducers, ordered trie slices) should extend the same adapter
   so DB-SLM can eventually run entirely on the Go engine once Level 2/3 tables get equivalents.
 
@@ -84,10 +88,21 @@ Example CLI session:
 SUCCESS,key=1
 [cheetah_data/default]> READ 1
 SUCCESS,size=5,value=hello
+[cheetah_data/default]> PAIR_SCAN ctx: 5
+SUCCESS,count=1,items=6374783a:4
 ```
 
 Over TCP you can send the same commands (newline-terminated). Use `DATABASE <name>` to switch logical
 stores in either mode.
+
+### Streaming helpers
+
+- `PAIR_SCAN <prefix> [limit]` returns namespace-ordered slices without SQLite. Use `*` as the prefix
+  to stream the entire trie or `x<HEX>` to target binary prefixes. Responses include `items=...`
+  with `hex_value:abs_key` pairs so clients can fetch the referenced payloads via `READ`.
+- The Python adapter exposes this via `CheetahClient.pair_scan()` and
+  `HotPathAdapter.scan_namespace()`, which automatically expand namespace strings (e.g., `ctx:`) and
+  strip the prefix from the returned values.
 
 ## Directory map
 
@@ -102,9 +117,13 @@ stores in either mode.
 
 - Design the DB-SLM adapter boundary (likely a lightweight RPC with commands for context registry,
   Level 1 counts, Level 2 logs, and Level 3 concept tables).
+- Route Level 1 context lookups + Top-K cache refreshes through the new streaming iterator so SQLite
+  falls completely out of the decode path.
 - Port at least one hot path (e.g., `tbl_l1_context_registry`) to `cheetah-db` and validate that
-  rebuild times beat the SQLite baseline.
-- Extend the pair trie APIs so they can return ordered slices keyed by byte-range filters—this is the
-  prerequisite for “rapid key contextualization” described in `CONCEPTS.md`.
+  rebuild times beat the SQLite baseline, capturing before/after metrics in this README.
+- Implement reducer RPCs so MKNS rebuilds, counts-of-counts, and Low-Resource caches never have to
+  bounce through SQLite temporary tables.
 - Add regression tests once the adapter contract is defined; keep them focused on byte-ordering and
   deterministic offsets so refactors remain safe.
+- Delete the MariaDB flusher + environment knobs as soon as cheetah owns archival duties, documenting
+  the migration plan here so the Python stack can drop that dependency entirely.
