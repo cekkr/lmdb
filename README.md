@@ -105,7 +105,7 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
   so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
 - **Penalty overrides (per-probe sampling tweaks):**
   - `--decoder-presence-penalty <float>=0+`: add a one-time penalty whenever a token (or grouped span)
-    has already appeared in the current generation. Typical sweep range is `0.0–0.4`.
+    has already appeared in the current generation. Typical sweep range is `0.0-0.4`.
   - `--decoder-frequency-penalty <float>=0+`: scales with how many times the token/span has appeared.
     Values between `0.0` and `0.2` generally work best for conversational corpora.
 
