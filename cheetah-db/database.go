@@ -284,6 +284,35 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			return "", err
 		}
 		return formatPairScanResponse(results), nil
+	case command == "PAIR_REDUCE":
+		if len(parts) < 2 {
+			return "ERROR,pair_reduce_requires_args", nil
+		}
+		args := strings.Fields(parts[1])
+		if len(args) < 2 {
+			return "ERROR,pair_reduce_requires_mode_and_prefix", nil
+		}
+		mode := strings.ToLower(args[0])
+		var prefix []byte
+		var err error
+		if args[1] != "*" {
+			prefix, err = parseValue(args[1])
+			if err != nil {
+				return err.Error(), nil
+			}
+		}
+		limit := 0
+		if len(args) > 2 {
+			limit, err = strconv.Atoi(args[2])
+			if err != nil {
+				return "ERROR,invalid_limit", nil
+			}
+		}
+		results, err := db.PairScan(prefix, limit)
+		if err != nil {
+			return "", err
+		}
+		return formatPairReduceResponse(results, mode), nil
 	default:
 		return "ERROR,unknown_command", nil
 	}
@@ -398,7 +427,9 @@ func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int,
 
 func normalizePairScanLimit(limit int) int {
 	switch {
-	case limit <= 0:
+	case limit < 0:
+		return 0
+	case limit == 0:
 		return pairScanDefaultLimit
 	case limit > pairScanMaxLimit:
 		return pairScanMaxLimit
@@ -428,4 +459,12 @@ func formatPairScanResponse(results []PairScanResult) string {
 		b.WriteString(fmt.Sprintf("%x:%d", res.Value, res.Key))
 	}
 	return b.String()
+}
+
+func formatPairReduceResponse(results []PairScanResult, mode string) string {
+	response := formatPairScanResponse(results)
+	if strings.HasPrefix(response, "SUCCESS") {
+		return strings.Replace(response, "SUCCESS", fmt.Sprintf("SUCCESS,reducer=%s", mode), 1)
+	}
+	return response
 }

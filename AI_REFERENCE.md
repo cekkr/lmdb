@@ -24,8 +24,8 @@ change so the next agent inherits the latest context.
   verbalization, probability materialization, and conversation-scoped signals.
 - `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
   for the relational layout plus the KN materialization + decoding loops implemented in Python.
-- `requirements.txt` now installs `sentence-transformers` (for the external embedding baseline) and
-  `mysql-connector-python` (for automated cold-context flushing). Optional GPU acceleration is
+- `requirements.txt` now installs `sentence-transformers` (external embedding baseline) and
+  `language-tool-python` (grammar deltas for the quality gate). Optional GPU acceleration is
   auto-detected via PyTorch when present.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
@@ -39,9 +39,11 @@ change so the next agent inherits the latest context.
 - Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
   via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
   truncated generations.
-- `ColdStorageFlusher` (wired into `train.py`) monitors the SQLite file size and automatically
-  migrates low-frequency contexts into MariaDB once `DBSLM_SQLITE_FLUSH_THRESHOLD_MB` is hit,
-  removing the same rows locally to keep memory pressure in check.
+- cheetah-db now mirrors context metadata + Top-K slices directly during ingest. `DBSLM_BACKEND`
+  defaults to `cheetah-db`, the decoder reports its hit ratio via
+  `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
+  `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
+  `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
@@ -100,9 +102,8 @@ change so the next agent inherits the latest context.
   CPU-heavy quality scoring is gated behind the adaptive load monitor to avoid starving ingestion.
 - Both `train.py` and `run.py` now rely on `db_slm.inference_shared.issue_prompt()` so scripted probes
   and the REPL reuse the same conversation bootstrapper.
-- `scripts/migrate_sqlite_to_mariadb.py` converts the SQLite store into MariaDB-ready DDL + data and
-  can optionally apply it directly using credentials from `.env`. `--incremental` performs
-  `INSERT ... ON DUPLICATE KEY UPDATE` cycles so nightly refreshes no longer need to drop tables.
+- MariaDB migrations are gone. Reset SQLite tables in place (or swap DB paths) and let cheetah's
+  namespaces carry the hot/archive copies—no second store to reconcile or SQL bundle to ship.
 - `scripts/run_paraphraser_regression.py` consumes `studies/paraphraser_regression.jsonl` to ensure
   multi-turn corrective threads, structural tags, and ordinary prompts all trigger the expected
   paraphraser behavior.
@@ -143,35 +144,26 @@ change so the next agent inherits the latest context.
 - Use `--scenarios a,b` or `SMOKE_SCENARIOS=a,b` to run a subset, `--resume-from name` to skip ahead,
   and `--dry-run` to print the commands while still updating `benchmarks.json` for planning.
 
-### MariaDB Handoff
+### cheetah-only Archive
 
-- Generate a SQL artifact after major SQLite validations:
-  ```
-  python scripts/migrate_sqlite_to_mariadb.py \
-    --sqlite var/db_slm.sqlite3 \
-    --output var/mariadb-release.sql
-  ```
-- Use `--apply --incremental` to upsert rows in place for nightly refreshes that should avoid table
-  drops. Fall back to `--drop-existing` only when you explicitly need a clean rebuild.
-- Install `mysql-connector-python` locally before invoking `--apply`; it replays schema + data and
-  will drop the destination tables only when `--drop-existing` is explicitly set (announce that step
-  before touching prod).
-- `--dry-run` keeps the MariaDB session inside a rollback-only transaction so you can confirm
-  incremental upserts leave staging tables untouched before flipping cron jobs over to the real run.
-  Keep training on SQLite for locality; the `ColdStorageFlusher` and migration script keep MariaDB in
-  sync for archival queries and downstream inference.
+- Start `cheetah-db/cheetah-server` before running the Python CLI. `DBSLM_BACKEND` defaults to
+  `cheetah-db`, so Level 1 lookups hit the Go service automatically.
+- There is no SQL migration step or MariaDB destination anymore. Reset SQLite in place when you
+  need a clean rebuild; cheetah already mirrors every context/top-K slice as part of the ingest loop.
+- Watch `DBSLMEngine.cheetah_topk_ratio()` (or the training log line) to confirm cache coverage stays
+  ≥90% so Top-K reads rarely fall back to SQLite.
+- Use `engine.iter_hot_context_hashes()` for namespace sweeps and
+  `engine.context_relativism([...])` when you need probabilistic trie traversals with deterministic
+  ordering. Both use `PAIR_SCAN` under the hood so traversals never touch SQL.
 
 ### DB Adapters
 
 - `sqlite` remains the compatibility backend exposed through `DBSLMSettings.backend`, but it is now
   considered legacy. Keep it only for metadata bootstrapping while the Level 1 pipelines move over
-  to cheetah; new work should avoid adding tables or features that would be SQLite-only and instead
-  target the Go engine.
-- `mariadb` (MySQL) served as the cold-storage target for `ColdStorageFlusher`. With cheetah
-  streaming online the flusher is slated for removal, so treat the `DBSLM_MARIADB_*` knobs as
-  deprecated and plan to delete them once cheetah owns archival duties.
+  to cheetah; new work should avoid adding features that would be SQLite-only and instead target the
+  Go engine.
 - `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts and Top-K
-  slices. Setting `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and enabling
+  slices. Keeping `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and enabling
   `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS Top-K
   bucket into the Go service via its TCP commands; the decoder then queries cheetah first and falls
   back to SQLite when a key is missing. As of this pass:
@@ -182,5 +174,5 @@ change so the next agent inherits the latest context.
     cheetah;
   - brute-force sweep helpers are still required so Level 2/3 jobs can shard across cheetah files.
   Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
-  `cheetah-db/README.md` for future agents, since the roadmap now aims to delete the SQLite and
-  MariaDB code paths once the reducers land.
+  `cheetah-db/README.md` for future agents, since the roadmap now aims to delete the remaining
+  SQLite-only code paths once the reducers land.

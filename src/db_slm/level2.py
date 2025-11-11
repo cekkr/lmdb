@@ -4,7 +4,10 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .adapters.base import HotPathAdapter
 
 from .db import DatabaseEnvironment
 
@@ -189,16 +192,28 @@ class ConversationMemory:
 class SessionCache:
     """Pointer-sentinel style cache that adds recency bias per conversation."""
 
-    def __init__(self, db: DatabaseEnvironment, decay: float = 0.8) -> None:
+    def __init__(
+        self,
+        db: DatabaseEnvironment,
+        decay: float = 0.8,
+        hot_path: "HotPathAdapter | None" = None,
+    ) -> None:
         self.db = db
         self.decay = decay
+        self.hot_path = hot_path
         self._ensure_profile()
 
     def _ensure_profile(self) -> None:
-        if not self.db.query("SELECT 1 FROM tbl_decode_hparams WHERE profile='default' LIMIT 1"):
+        profile = self._read_profile_metadata("default")
+        if profile:
+            return
+        profile = self._fetch_profile_from_sqlite("default")
+        if profile is None:
+            profile = {"lambda_cache": 0.15, "temp": 1.0, "topk": 20, "topp": 0.9}
             self.db.execute(
                 "INSERT INTO tbl_decode_hparams(profile, lambda_cache, temp, topk, topp) VALUES ('default', 0.15, 1.0, 20, 0.9)"
             )
+        self._write_profile_metadata("default", profile)
 
     def update(self, conversation_id: str, token_ids: Sequence[int]) -> None:
         rows = self.db.query(
@@ -225,20 +240,58 @@ class SessionCache:
         return {row["token_id"]: row["recency_weight"] / total for row in rows}
 
     def mixture_lambda(self, profile: str = "default") -> float:
-        rows = self.db.query(
-            "SELECT lambda_cache FROM tbl_decode_hparams WHERE profile = ?",
-            (profile,),
-        )
-        return rows[0]["lambda_cache"] if rows else 0.15
+        params = self.decode_profile(profile)
+        return float(params.get("lambda_cache", 0.15))
 
     def decode_profile(self, profile: str = "default") -> Dict[str, float | int]:
+        cached = self._read_profile_metadata(profile)
+        if cached:
+            return cached
+        record = self._fetch_profile_from_sqlite(profile)
+        if record:
+            self._write_profile_metadata(profile, record)
+            return record
+        return {"lambda_cache": 0.15, "temp": 1.0, "topk": 20, "topp": 0.9}
+
+    def _fetch_profile_from_sqlite(self, profile: str) -> Dict[str, float | int] | None:
         rows = self.db.query(
             "SELECT lambda_cache, temp, topk, topp FROM tbl_decode_hparams WHERE profile = ?",
             (profile,),
         )
         if rows:
             return dict(rows[0])
-        return {"lambda_cache": 0.15, "temp": 1.0, "topk": 20, "topp": 0.9}
+        return None
+
+    def _profile_metadata_key(self, profile: str) -> str:
+        return f"decode:{profile}"
+
+    def _read_profile_metadata(self, profile: str) -> Dict[str, float | int] | None:
+        if not self.hot_path:
+            return None
+        reader = getattr(self.hot_path, "read_metadata", None)
+        if not reader:
+            return None
+        raw = reader(self._profile_metadata_key(profile))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data  # type: ignore[return-value]
+        except json.JSONDecodeError:
+            return None
+        return None
+
+    def _write_profile_metadata(self, profile: str, payload: Dict[str, float | int]) -> None:
+        if not self.hot_path:
+            return
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if not writer:
+            return
+        writer(
+            self._profile_metadata_key(profile),
+            json.dumps(payload, separators=(",", ":")),
+        )
 
 
 class BiasEngine:

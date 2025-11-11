@@ -9,6 +9,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from ..cheetah_types import RawContextProjection, RawCountsProjection
+from ..cheetah_vectors import AbsoluteVectorOrder
+from ..hashing import hash_tokens
+
 from ..settings import DBSLMSettings
 from .base import HotPathAdapter, NullHotPathAdapter
 
@@ -84,6 +88,16 @@ class CheetahClient:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_SCAN {arg}"
         if limit > 0:
+            command = f"{command} {limit}"
+        response = self._command(command)
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_pair_scan_response(response)
+
+    def pair_reduce(self, mode: str, prefix: bytes = b"", limit: int = 0) -> list[tuple[bytes, int]] | None:
+        arg = "*" if not prefix else f"x{prefix.hex()}"
+        command = f"PAIR_REDUCE {mode} {arg}"
+        if limit != 0:
             command = f"{command} {limit}"
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
@@ -214,11 +228,24 @@ class TopKPayload:
     ranked: list[tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class ContextPayload:
+    order_size: int
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CountsPayload:
+    order: int
+    followers: tuple[tuple[int, int], ...]
+
+
 class CheetahSerializer:
     """Binary codec for the cheetah hot-path payloads."""
 
     CONTEXT_VERSION = 1
     TOPK_VERSION = 1
+    COUNTS_VERSION = 1
     MAX_TOPK = 32
 
     def encode_context(self, order_size: int, token_ids: Sequence[int]) -> bytes:
@@ -233,6 +260,52 @@ class CheetahSerializer:
         for token_id in token_ids:
             buf.extend(struct.pack(">I", int(token_id)))
         return bytes(buf)
+
+    def decode_context(self, payload: bytes) -> ContextPayload | None:
+        if not payload or payload[0] != self.CONTEXT_VERSION or len(payload) < 3:
+            return None
+        order_size = payload[1]
+        count = payload[2]
+        expected = 3 + count * 4
+        if len(payload) < expected:
+            return None
+        token_ids: list[int] = []
+        offset = 3
+        for _ in range(count):
+            token_ids.append(struct.unpack(">I", payload[offset : offset + 4])[0])
+            offset += 4
+        return ContextPayload(order_size=order_size, token_ids=tuple(token_ids))
+
+    def encode_counts(self, order: int, followers: Sequence[tuple[int, int]]) -> bytes:
+        if order > 255:
+            raise CheetahError("order exceeds single-byte limit for counts payload")
+        follower_count = min(len(followers), 65535)
+        buf = bytearray()
+        buf.append(self.COUNTS_VERSION)
+        buf.append(order & 0xFF)
+        buf.extend(struct.pack(">H", follower_count))
+        for token_id, count in followers[:follower_count]:
+            buf.extend(struct.pack(">I", int(token_id)))
+            buf.extend(struct.pack(">I", max(int(count), 0)))
+        return bytes(buf)
+
+    def decode_counts(self, payload: bytes) -> CountsPayload | None:
+        if not payload or payload[0] != self.COUNTS_VERSION or len(payload) < 4:
+            return None
+        order = payload[1]
+        follower_count = struct.unpack(">H", payload[2:4])[0]
+        expected = 4 + follower_count * 8
+        if len(payload) < expected:
+            return None
+        followers: list[tuple[int, int]] = []
+        offset = 4
+        for _ in range(follower_count):
+            token_id = struct.unpack(">I", payload[offset : offset + 4])[0]
+            offset += 4
+            count = struct.unpack(">I", payload[offset : offset + 4])[0]
+            offset += 4
+            followers.append((token_id, count))
+        return CountsPayload(order=order, followers=tuple(followers))
 
     def encode_topk(self, order: int, ranked: Sequence[tuple[int, int]]) -> bytes:
         if order > 255:
@@ -278,9 +351,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
     ) -> None:
         self._client = client
         self._serializer = serializer or CheetahSerializer()
+        self._vector_order = AbsoluteVectorOrder()
         self._key_cache: "OrderedDict[tuple[str, str], int]" = OrderedDict()
         self._cache_size = max(cache_size, 1024)
         self._enabled = True
+        self._topk_total = 0
+        self._topk_hits = 0
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -289,11 +365,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if not self._enabled:
             return
         namespace = "ctx"
-        if self._lookup_key(namespace, context_hash) is not None:
+        if self._lookup_key(namespace, context_hash=context_hash) is not None:
             return
         payload = self._serializer.encode_context(order_size, token_ids)
         try:
-            self._insert(namespace, context_hash, payload)
+            key = self._insert(namespace, context_hash, payload)
+            self._register_vector_alias(key, token_ids)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -303,7 +380,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace = f"topk:{order}"
         payload = self._serializer.encode_topk(order, ranked)
         try:
-            key = self._lookup_key(namespace, context_hash)
+            key = self._lookup_key(namespace, context_hash=context_hash)
             if key is None:
                 self._insert(namespace, context_hash, payload)
             else:
@@ -312,11 +389,27 @@ class CheetahHotPathAdapter(HotPathAdapter):
         except CheetahError as exc:
             self._disable(exc)
 
+    def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
+        if not self._enabled or not followers:
+            return
+        namespace = f"cnt:{order}"
+        payload = self._serializer.encode_counts(order, followers)
+        try:
+            key = self._lookup_key(namespace, context_hash=context_hash)
+            if key is None:
+                self._insert(namespace, context_hash, payload)
+            else:
+                if not self._client.edit(key, payload):
+                    raise CheetahError("failed to edit cheetah counts payload")
+        except CheetahError as exc:
+            self._disable(exc)
+
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         if not self._enabled:
             return None
+        self._topk_total += 1
         namespace = f"topk:{order}"
-        key = self._lookup_key(namespace, context_hash)
+        key = self._lookup_key(namespace, context_hash=context_hash)
         if key is None:
             return None
         payload = self._client.read(key)
@@ -325,7 +418,55 @@ class CheetahHotPathAdapter(HotPathAdapter):
         record = self._serializer.decode_topk(payload)
         if not record or record.order != order:
             return None
+        self._topk_hits += 1
         return record.ranked[:limit]
+
+    def fetch_context_tokens(self, context_hash: str) -> Sequence[int] | None:
+        if not self._enabled:
+            return None
+        namespace = "ctx"
+        key = self._lookup_key(namespace, context_hash=context_hash)
+        if key is None:
+            return None
+        payload = self._client.read(key)
+        if not payload:
+            return None
+        record = self._serializer.decode_context(payload)
+        if not record:
+            return None
+        return list(record.token_ids)
+
+    def write_metadata(self, key: str, value: str) -> None:
+        if not self._enabled:
+            return
+        namespace = "meta"
+        raw_value = key.encode("utf-8")
+        payload = value.encode("utf-8")
+        try:
+            existing = self._lookup_key(namespace, raw_value=raw_value)
+            if existing is None:
+                new_key = self._client.insert(payload)
+                if new_key is None:
+                    raise CheetahError("failed to insert metadata payload")
+                self._register_pair(namespace, new_key, raw_value=raw_value)
+            else:
+                if not self._client.edit(existing, payload):
+                    raise CheetahError("failed to edit metadata payload")
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def read_metadata(self, key: str) -> str | None:
+        if not self._enabled:
+            return None
+        namespace = "meta"
+        raw_value = key.encode("utf-8")
+        entry_key = self._lookup_key(namespace, raw_value=raw_value)
+        if entry_key is None:
+            return None
+        payload = self._client.read(entry_key)
+        if not payload:
+            return None
+        return payload.decode("utf-8", "replace")
 
     def scan_namespace(
         self,
@@ -349,38 +490,181 @@ class CheetahHotPathAdapter(HotPathAdapter):
             trimmed.append((raw_value[len(namespace_bytes) :], key))
         return trimmed
 
+    def iter_counts(self, order: int) -> list[RawCountsProjection]:
+        if not self._enabled:
+            return []
+        namespace = f"cnt:{order}"
+        projections: list[RawCountsProjection] = []
+        namespace_bytes = namespace.encode("utf-8") + b":"
+        results = self._client.pair_reduce("counts", namespace_bytes, limit=-1)
+        if results is None:
+            self._disable(CheetahError("pair_reduce counts failed"))
+            return []
+        for raw_value, key in results:
+            if not raw_value.startswith(namespace_bytes):
+                continue
+            trimmed = raw_value[len(namespace_bytes) :]
+            payload = self._client.read(key)
+            if not payload:
+                continue
+            record = self._serializer.decode_counts(payload)
+            if not record or record.order != order:
+                continue
+            if trimmed == b"__root__":
+                context_hash = "__root__"
+            else:
+                context_hash = trimmed.hex()
+            totals = sum(count for _, count in record.followers)
+            projections.append(
+                RawCountsProjection(
+                    context_hash=context_hash,
+                    order=order,
+                    totals=totals,
+                    followers=record.followers,
+                )
+            )
+        return projections
+
+    def context_relativism(
+        self,
+        context_tree,
+        *,
+        limit: int = 32,
+        depth: int | None = None,
+    ) -> list[RawContextProjection]:
+        if not self._enabled:
+            return []
+        try:
+            vector_prefix = self._vector_order.encode_tree(context_tree, depth_limit=depth)
+        except (TypeError, ValueError) as exc:
+            logger.debug("failed to encode context tree for relativism query: %s", exc)
+            return []
+        matches = self.scan_namespace("ctxv", prefix=vector_prefix, limit=limit)
+        projections: list[RawContextProjection] = []
+        for vector_bytes, key in matches:
+            payload = self._client.read(key)
+            if not payload:
+                continue
+            context_record = self._serializer.decode_context(payload)
+            if not context_record:
+                continue
+            tokens = tuple(context_record.token_ids)
+            context_hash = hash_tokens(tokens)
+            ranked = self.fetch_topk(
+                context_record.order_size,
+                context_hash,
+                self._serializer.MAX_TOPK,
+            ) or []
+            projections.append(
+                RawContextProjection(
+                    context_hash=context_hash,
+                    order_size=context_record.order_size,
+                    token_ids=tokens,
+                    ranked=tuple(ranked),
+                    cheetah_key=key,
+                    vector_signature=bytes(vector_bytes),
+                )
+            )
+        return projections
+
+    def topk_hit_ratio(self) -> float:
+        if self._topk_total <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self._topk_hits / float(self._topk_total)))
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
-    def _insert(self, namespace: str, context_hash: str, payload: bytes) -> None:
+    def _insert(self, namespace: str, context_hash: str, payload: bytes) -> int:
         key = self._client.insert(payload)
         if key is None:
             raise CheetahError("failed to insert cheetah payload")
-        value = self._pair_value(namespace, context_hash)
+        self._register_pair(namespace, key, context_hash=context_hash)
+        return key
+
+    def _register_pair(
+        self,
+        namespace: str,
+        key: int,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> None:
+        value = self._pair_value(namespace, context_hash=context_hash, raw_value=raw_value)
         if not self._client.pair_set(value, key):
             raise CheetahError("failed to register cheetah pair mapping")
-        self._set_cache(namespace, context_hash, key)
+        self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
 
-    def _lookup_key(self, namespace: str, context_hash: str) -> int | None:
-        cache_key = (namespace, context_hash)
-        if cache_key in self._key_cache:
+    def _register_vector_alias(self, key: int, token_ids: Sequence[int]) -> None:
+        if not token_ids:
+            return
+        try:
+            vector_bytes = self._vector_order.encode_tokens(token_ids)
+        except (TypeError, ValueError) as exc:
+            logger.debug("skipping vector alias for context: %s", exc)
+            return
+        self._register_pair("ctxv", key, raw_value=vector_bytes)
+
+    def _lookup_key(
+        self,
+        namespace: str,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> int | None:
+        cache_key = self._cache_key(namespace, context_hash=context_hash, raw_value=raw_value)
+        if cache_key and cache_key in self._key_cache:
             key = self._key_cache[cache_key]
             self._key_cache.move_to_end(cache_key)
             return key
-        value = self._pair_value(namespace, context_hash)
+        value = self._pair_value(namespace, context_hash=context_hash, raw_value=raw_value)
+        if value is None:
+            return None
         key = self._client.pair_get(value)
         if key is not None:
-            self._set_cache(namespace, context_hash, key)
+            self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
         return key
 
-    def _set_cache(self, namespace: str, context_hash: str, key: int) -> None:
-        cache_key = (namespace, context_hash)
+    def _set_cache(
+        self,
+        namespace: str,
+        key: int,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> None:
+        cache_key = self._cache_key(namespace, context_hash=context_hash, raw_value=raw_value)
+        if cache_key is None:
+            return
         self._key_cache[cache_key] = key
         self._key_cache.move_to_end(cache_key)
         if len(self._key_cache) > self._cache_size:
             self._key_cache.popitem(last=False)
 
-    def _pair_value(self, namespace: str, context_hash: str) -> bytes:
+    def _cache_key(
+        self,
+        namespace: str,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> tuple[str, str] | None:
+        identifier = self._normalize_identifier(context_hash=context_hash, raw_value=raw_value)
+        if identifier is None:
+            return None
+        return (namespace, identifier)
+
+    def _pair_value(
+        self,
+        namespace: str,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> bytes | None:
+        namespace_bytes = namespace.encode("utf-8") + b":"
+        if raw_value is not None:
+            return namespace_bytes + raw_value
+        if context_hash is None:
+            return None
         if context_hash == "__root__":
             context_bytes = b"__root__"
         else:
@@ -388,7 +672,19 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 context_bytes = bytes.fromhex(context_hash)
             except ValueError:
                 context_bytes = context_hash.encode("utf-8")
-        return namespace.encode("utf-8") + b":" + context_bytes
+        return namespace_bytes + context_bytes
+
+    def _normalize_identifier(
+        self,
+        *,
+        context_hash: str | None = None,
+        raw_value: bytes | None = None,
+    ) -> str | None:
+        if raw_value is not None:
+            return f"bytes:{raw_value.hex()}"
+        if context_hash is not None:
+            return f"hash:{context_hash}"
+        return None
 
     def _disable(self, exc: Exception) -> None:
         if self._enabled:
@@ -422,6 +718,8 @@ __all__ = [
     "CheetahError",
     "CheetahHotPathAdapter",
     "CheetahSerializer",
+    "CountsPayload",
+    "ContextPayload",
     "TopKPayload",
     "build_cheetah_adapter",
 ]

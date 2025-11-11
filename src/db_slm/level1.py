@@ -316,6 +316,9 @@ class NGramStore:
     def fetch_context_tokens(self, context_hash: str) -> List[int]:
         if context_hash == "__root__":
             return []
+        hot_tokens = self.hot_path.fetch_context_tokens(context_hash)
+        if hot_tokens is not None:
+            return list(hot_tokens)
         rows = self.db.query(
             """
             SELECT token_ids
@@ -330,6 +333,21 @@ class NGramStore:
         if not token_blob:
             return []
         return [int(tok) for tok in token_blob.split(",") if tok]
+
+    def iter_hot_context_hashes(self, *, limit: int = 0):
+        """Yield context hashes mirrored inside cheetah via PAIR_SCAN."""
+        for raw_value, _key in self.hot_path.scan_namespace("ctx", limit=limit):
+            if raw_value == b"__root__":
+                yield "__root__"
+            else:
+                yield raw_value.hex()
+
+    def topk_hit_ratio(self) -> float:
+        """Expose the current cheetah Top-K cache hit ratio."""
+        try:
+            return float(self.hot_path.topk_hit_ratio())
+        except AttributeError:
+            return 0.0
 
     # ------------------------------------------------------------------ #
     # Materialization helpers
@@ -395,17 +413,12 @@ class MKNSmoother:
                 progress_callback(f"smooth_{order}", order, self.store.order)
 
     def rebuild_order(self, order: int) -> None:
-        rows = self.store.iter_counts(order)
-        if not rows:
+        contexts, sourced_from_sqlite = self._collect_context_followers(order)
+        if not contexts:
             return
-        contexts: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-        counts_of_counts: Dict[int, int] = defaultdict(int)
-        for row in rows:
-            context_hash = row["context_hash"]
-            count = row["count"]
-            contexts[context_hash].append((row["next_token_id"], count))
-            bucket = 4 if count >= 4 else count
-            counts_of_counts[bucket] += 1
+        counts_of_counts = self._counts_of_counts(contexts)
+        if sourced_from_sqlite:
+            self._mirror_counts(order, contexts)
         D1, D2, D3p = self._discounts(counts_of_counts)
         self._persist_counts_of_counts(order, counts_of_counts)
         self._persist_params(order, D1, D2, D3p, len(contexts))
@@ -441,6 +454,8 @@ class MKNSmoother:
         self.store.clear_probabilities(order)
         if prob_rows:
             self.store.store_probabilities(order, prob_rows, topk_rows)
+        if not sourced_from_sqlite:
+            self._mirror_counts(order, contexts)
 
     def _lower_lookup(self, order: int) -> Dict[Tuple[str, int], float]:
         if order == 1:
@@ -545,3 +560,39 @@ class MKNSmoother:
             "INSERT INTO tbl_l1_continuations(token_id, num_contexts) VALUES (?, ?)",
             payload,
         )
+
+    def _collect_context_followers(
+        self, order: int
+    ) -> tuple[Dict[str, List[Tuple[int, int]]], bool]:
+        contexts: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        hot_counts = getattr(self.store.hot_path, "iter_counts", None)
+        if hot_counts:
+            projections = list(self.store.hot_path.iter_counts(order))  # type: ignore[attr-defined]
+            if projections:
+                for projection in projections:
+                    contexts[projection.context_hash] = list(projection.followers)
+                return contexts, False
+        rows = self.store.iter_counts(order)
+        if not rows:
+            return {}, True
+        for row in rows:
+            context_hash = row["context_hash"]
+            count = row["count"]
+            contexts[context_hash].append((row["next_token_id"], count))
+        return contexts, True
+
+    @staticmethod
+    def _counts_of_counts(contexts: Dict[str, List[Tuple[int, int]]]) -> Dict[int, int]:
+        counts_of_counts: Dict[int, int] = defaultdict(int)
+        for followers in contexts.values():
+            for _, count in followers:
+                bucket = 4 if count >= 4 else count
+                counts_of_counts[bucket] += 1
+        return counts_of_counts
+
+    def _mirror_counts(self, order: int, contexts: Dict[str, List[Tuple[int, int]]]) -> None:
+        publisher = getattr(self.store.hot_path, "publish_counts", None)
+        if not publisher:
+            return
+        for context_hash, followers in contexts.items():
+            publisher(order, context_hash, followers)  # type: ignore[misc]

@@ -58,7 +58,9 @@ class Decoder:
             order = min(self.store.order, len(context_ids) + 1)
             candidates = self.store.get_topk(context_ids, order, profile["topk"])
             if not candidates:
-                break
+                candidates = self._relativistic_fallback(context_ids, order, profile["topk"])
+                if not candidates:
+                    break
             adjusted = self._adjust_candidates(
                 conversation_id,
                 candidates,
@@ -175,3 +177,28 @@ class Decoder:
     def _log_delta(self, q_bias: int) -> float:
         span = self.quantizer.Lmax - self.quantizer.Lmin
         return (q_bias / 255.0) * span
+
+    def _relativistic_fallback(self, context_ids: Sequence[int], order: int, k: int) -> List[TokenCandidate]:
+        if order <= 1:
+            return []
+        window = context_ids[-(order - 1) :]
+        if not window:
+            return []
+        structure = [[token_id] for token_id in window]
+        projections = self.store.hot_path.context_relativism(structure, limit=1, depth=None)
+        if not projections:
+            return []
+        ranked = projections[0].ranked[:k]
+        if not ranked:
+            return []
+        candidates: List[TokenCandidate] = []
+        for token_id, q in ranked:
+            candidates.append(
+                TokenCandidate(
+                    token_id=token_id,
+                    token_text=self.tokenizer.vocab.token_text(token_id),
+                    probability=self.quantizer.dequantize_prob(q),
+                    q_logprob=q,
+                )
+            )
+        return candidates

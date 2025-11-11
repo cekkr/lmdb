@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import sqlite3
 from pathlib import Path
 from typing import Any, Generator, Iterable, Sequence
+
+from .hashing import hash_tokens as _hash_tokens
 
 
 class DatabaseEnvironment:
@@ -325,8 +326,4 @@ class DatabaseEnvironment:
     # ------------------------------------------------------------------ #
     @staticmethod
     def hash_tokens(token_ids: Sequence[int]) -> str:
-        if not token_ids:
-            return "__root__"
-        raw = ",".join(str(tok) for tok in token_ids).encode("utf-8")
-        digest = hashlib.blake2b(raw, digest_size=8).hexdigest()
-        return digest
+        return _hash_tokens(token_ids)

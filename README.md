@@ -10,8 +10,8 @@ the spec end-to-end:
 
 - **Level 1 — Aria-style n-gram engine:** Byte-free (regex) tokenization backed by a relational
   vocabulary, hashed contexts, Modified Kneser–Ney smoothing, quantized log-prob tables, and a
-  Top-K materialization path for fast sampling. All stats live inside SQLite tables that mirror the
-  MariaDB layout.
+  Top-K materialization path for fast sampling. SQLite still persists the authoritative tables, but
+  every context/top-K slice is streamed into cheetah-db namespaces so hot reads bypass SQL entirely.
 - **Level 2 — Episodic memory + biasing:** Conversation logging, correction digests, logit-bias
   materialization, and pointer-sentinel session caches that feed the decoder without tensors.
 - **Level 3 — Concept model:** Concept dictionaries, templates, and probability tables that can
@@ -43,17 +43,18 @@ from the database.
   ```
 - The CLI utilities default to storing everything under `var/db_slm.sqlite3`. Feel free to point them
   at any other SQLite path or even `:memory:` when using the programmatic API.
-- Even though `.env` exposes MariaDB credentials, the reference CLI still targets SQLite until we run
-  the schema migration step. Seeing no MySQL tables during local training is therefore expected.
+- `.env` now defaults `DBSLM_BACKEND=cheetah-db`, so Level 1 lookups hit the Go service out of the
+  box. SQLite remains available for bulk ingest/experiments (`DBSLM_BACKEND=sqlite`), but there is no
+  longer a secondary MariaDB target to keep in sync.
 
 ### cheetah-db hot path (optional)
 
 - `cheetah-db/` hosts the Go service that now acts as a low-latency mirror for Level 1 contexts.
   Build it with `bash cheetah-db/build.sh` and launch `./cheetah-db/cheetah-server` before
   running the Python tools.
-- Set `DBSLM_BACKEND=cheetah-db` when you want the trainer/decoder to fetch Top-K slices from the
-  Go engine instead of SQLite. When you only need a sidecar cache (SQLite remains canonical), leave
-  the backend as `sqlite` and toggle `DBSLM_CHEETAH_MIRROR=1`.
+- Leave `DBSLM_BACKEND=cheetah-db` (the new default) when you want the trainer/decoder to fetch
+  Top-K slices from the Go engine. When you only need a sidecar cache (SQLite remains canonical),
+  switch the backend to `sqlite` and toggle `DBSLM_CHEETAH_MIRROR=1`.
 - The `DBSLM_CHEETAH_HOST/PORT/DATABASE` variables point the adapter at the right instance; the
   default matches the server exposed by `cheetah-db/main.go`.
 - During ingest the Python pipeline now streams new context metadata and Top-K probability slices
@@ -154,16 +155,16 @@ even while the underlying Level 1 tables remain purely relational. When the opti
 missing, the pipeline falls back to deterministic hashed vectors so tokenization still benefits from
 the dataset profiler.
 
-### Automatic MariaDB Flush for Cold Contexts
+### cheetah Streaming Archive
 
-Long-running SQLite sessions can now hand cold Level 1 contexts to MariaDB automatically. Set the
-threshold via `.env` (`DBSLM_SQLITE_FLUSH_THRESHOLD_MB`, defaults to 1024 MB). When the on-disk file
-exceeds that value, the new `ColdStorageFlusher` ships up to `DBSLM_SQLITE_FLUSH_BATCH` low-usage
-contexts—ranked by `hot_rank`, `total_count`, and `updated_at`—into the MariaDB tables (creating them
-if they do not already exist) and deletes the same rows from SQLite. This keeps local training runs
-from exhausting RAM while preserving a lossless copy of the rarely used statistics in the downstream
-database for later replay. Install `mysql-connector-python` (already included in
-`requirements.txt`) and provide valid MariaDB credentials in `.env` to activate the flush path.
+The cold-context flusher + MariaDB detour has been removed. Instead, the trainer streams every newly
+discovered context plus its Top-K probability slices into cheetah-db as part of the ingest loop.
+`DBSLM_BACKEND=cheetah-db` keeps the decoder entirely on the Go engine, so Level 1 lookups never
+round-trip through SQLite. The adapter now tracks cache coverage
+(`DBSLMEngine.cheetah_topk_ratio()`) and exposes namespace scanners plus the new
+`engine.context_relativism([...])` helper for probabilistic trie queries. SQLite still persists the
+authoritative rows for bulk rebuilds, but there is no secondary database to drain—cheetah already
+holds the hot/archived copies in one place.
 
 ### Training-Time Metrics
 
@@ -291,29 +292,13 @@ Key flags:
 
 Use `make clean-smoke` to delete the per-scenario SQLite files and the `var/smoke_train` artifacts.
 
-## SQLite vs. MariaDB Workflow
+## SQLite + cheetah Workflow
 
-SQLite stays in the loop for day-to-day training and interactive inference because it behaves well on
-laptops, WAL keeps ingest latency predictable, and the Level 1 counts fit comfortably inside a single
-file. Once the corpus grows, the `ColdStorageFlusher` starts streaming rarely accessed contexts into
-MariaDB so you get a lossless archival copy without ballooning local RSS. Downstream inference stacks
-(or analytics jobs) can attach directly to MariaDB, while SQLite keeps the hot contexts close to the
-trainer.
-
-When you're ready to sync the two stores, run:
-
-```bash
-# Generate a portable SQL script for QA/backup
-python scripts/migrate_sqlite_to_mariadb.py --sqlite var/db_slm.sqlite3 --output var/mariadb.sql
-
-# Dry-run the incremental upsert against the MariaDB DSN from .env
-python scripts/migrate_sqlite_to_mariadb.py --apply --incremental --dry-run
-
-# Apply the same bundle for real (no rollback) once the dry-run looks clean
-python scripts/migrate_sqlite_to_mariadb.py --apply --incremental
-```
-
-`--dry-run` wraps the entire MariaDB session inside a rollback-only transaction, so you can confirm
-that upserts leave staging tables untouched before flipping the nightly job over. Use
-`--drop-existing` only when you explicitly need a full rebuild; the default incremental mode mirrors
-the SQLite counts via `INSERT ... ON DUPLICATE KEY UPDATE` so both backends stay logically identical.
+SQLite still handles ingest/reset cycles because it is easy to ship, WAL keeps throughput high, and
+full rebuilds are a single file delete away. cheetah-db now mirrors every context and Top-K bucket,
+so once `DBSLM_BACKEND=cheetah-db` is active the decoder never touches SQLite. There is no migration
+step or MySQL target anymore—cheetah is both the hot path and the archival story. Run the Go server,
+point the env vars at it, and use helpers such as `engine.iter_hot_context_hashes()` or
+`engine.context_relativism(...)` when you need ordered scans or probabilistic tree walks over the
+stored contexts. When SQLite grows too large, simply reset or vacuum the file; cheetah already keeps
+the low-latency copy alive.

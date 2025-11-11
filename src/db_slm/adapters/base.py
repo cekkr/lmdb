@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable, Protocol, Sequence, Tuple
 
+from ..cheetah_types import RawContextProjection, RawCountsProjection
+
 
 class HotPathAdapter(Protocol):
     """Interface for optional low-latency mirrors such as cheetah-db."""
@@ -15,6 +17,18 @@ class HotPathAdapter(Protocol):
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         """Return cached ranked results or None when unavailable."""
 
+    def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
+        """Mirror raw follower counts for a context hash."""
+
+    def fetch_context_tokens(self, context_hash: str) -> Sequence[int] | None:
+        """Return the token ids representing the context, if mirrored."""
+
+    def write_metadata(self, key: str, value: str) -> None:
+        """Persist metadata (e.g., context dimensions, decode profiles) inside cheetah."""
+
+    def read_metadata(self, key: str) -> str | None:
+        """Fetch metadata stored inside cheetah namespaces."""
+
     def scan_namespace(
         self,
         namespace: str,
@@ -23,6 +37,21 @@ class HotPathAdapter(Protocol):
         limit: int = 0,
     ) -> Iterable[Tuple[bytes, int]]:
         """Iterate namespace-prefixed keys (e.g., contexts, cached slices) in byte order."""
+
+    def iter_counts(self, order: int) -> Iterable[RawCountsProjection]:
+        """Iterate mirrored follower counts for an order."""
+
+    def context_relativism(
+        self,
+        context_tree,
+        *,
+        limit: int = 32,
+        depth: int | None = None,
+    ) -> Iterable[RawContextProjection]:
+        """Return probabilistic projections for a nested context description."""
+
+    def topk_hit_ratio(self) -> float:
+        """Return the observed cheetah Top-K cache hit ratio (0-1)."""
 
 
 class NullHotPathAdapter:
@@ -37,6 +66,18 @@ class NullHotPathAdapter:
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         return None
 
+    def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
+        return None
+
+    def fetch_context_tokens(self, context_hash: str) -> Sequence[int] | None:
+        return None
+
+    def write_metadata(self, key: str, value: str) -> None:
+        return None
+
+    def read_metadata(self, key: str) -> str | None:
+        return None
+
     def scan_namespace(
         self,
         namespace: str,
@@ -45,6 +86,20 @@ class NullHotPathAdapter:
         limit: int = 0,
     ) -> Iterable[Tuple[bytes, int]]:
         return []
+
+    def iter_counts(self, order: int) -> Iterable[RawCountsProjection]:
+        return []
+    def context_relativism(
+        self,
+        context_tree,
+        *,
+        limit: int = 32,
+        depth: int | None = None,
+    ) -> Iterable[RawContextProjection]:
+        return []
+
+    def topk_hit_ratio(self) -> float:
+        return 0.0
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

@@ -668,7 +668,6 @@ procedure DecodeLevel1(engine, conversation_id, ctx_tokens):
 
 ## 14. Environment‑driven configuration
 
-* Copy `.env.example` → `.env` and fill the knobs: the active backend (`DBSLM_BACKEND`), `DBSLM_SQLITE_PATH`, the canonical emotional dataset (`DBSLM_DATASET_PATH`), and MariaDB credentials for staging/production.
+* Copy `.env.example` → `.env` and fill the knobs: the active backend (`DBSLM_BACKEND`), `DBSLM_SQLITE_PATH`, the canonical emotional dataset (`DBSLM_DATASET_PATH`), and the cheetah transport fields (`DBSLM_CHEETAH_*`).
 * `src/db_slm/settings.py::load_settings` is a zero‑dependency parser that reads `.env`, overlays real process env variables, and surfaces a `DBSLMSettings` dataclass. `train.py` / `run.py` already draw their default DB paths from `sqlite_dsn()`, so switching datasets or DB paths is a file edit rather than CLI surgery.
-* The same dataclass exposes `mariadb_dsn()` + raw credential fields so future ETL jobs (or SQLAlchemy migrations) can instantiate MariaDB connectors without touching the CLI entry points.
 * Keep `.env` out of version control; `.env.example` documents every knob while leaving secrets blank. This allows CI to inject passwords via env vars and local devs to pin paths that live on their workstation.

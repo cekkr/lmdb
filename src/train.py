@@ -32,7 +32,6 @@ from db_slm.evaluation import (
     run_inference_records,
 )
 from db_slm.settings import load_settings
-from db_slm.storage import ColdStorageFlusher
 
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
@@ -564,10 +563,6 @@ def main() -> None:
     if decoder_overrides:
         decoder_cfg_override = DecoderConfig(**decoder_overrides)
 
-    flusher: ColdStorageFlusher | None = None
-    if settings.backend == "sqlite":
-        flusher = ColdStorageFlusher(engine, settings)
-
     file_inputs = collect_files(args.inputs, args.recursive)
     corpora_iter: Iterable[CorpusChunk] = iter_corpora(
         file_inputs,
@@ -688,9 +683,6 @@ def main() -> None:
                     variants_per_prompt=eval_variants,
                 )
                 monitor.refresh_dataset(chunk.eval_records)
-            if flusher:
-                flusher.maybe_flush()
-
         if processed_corpora == 0:
             parser.error("No readable corpora found in the provided inputs")
 

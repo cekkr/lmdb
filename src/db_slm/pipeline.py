@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
@@ -15,11 +16,27 @@ from .context_dimensions import (
 from .db import DatabaseEnvironment
 from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
-from .level1 import LogProbQuantizer, MKNSmoother, NGramStore, Tokenizer, Vocabulary
+from .level1 import (
+    LogProbQuantizer,
+    MKNSmoother,
+    NGramStore,
+    TokenCandidate,
+    Tokenizer,
+    Vocabulary,
+)
 from .level2 import BiasEngine, ConversationMemory, SessionCache
 from .level3 import ConceptDefinition, ConceptEngine, ConceptExecution
 from .sentence_parts import SentencePartEmbeddingPipeline
 from .settings import DBSLMSettings, load_settings
+
+
+@dataclass(frozen=True)
+class ContextRelativismResult:
+    context_hash: str
+    order_size: int
+    token_ids: Tuple[int, ...]
+    probability: float
+    ranked: Tuple[TokenCandidate, ...]
 
 
 class DBSLMEngine:
@@ -34,8 +51,8 @@ class DBSLMEngine:
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
-        self.context_dimensions = self._init_context_dimensions(context_dimensions)
         self.hot_path = build_cheetah_adapter(self.settings)
+        self.context_dimensions = self._init_context_dimensions(context_dimensions)
         self.vocab = Vocabulary(self.db)
         self.tokenizer = Tokenizer(self.vocab)
         self.quantizer = LogProbQuantizer(self.db)
@@ -48,7 +65,7 @@ class DBSLMEngine:
         )
         self.smoother = MKNSmoother(self.db, self.store, self.quantizer)
         self.memory = ConversationMemory(self.db)
-        self.cache = SessionCache(self.db)
+        self.cache = SessionCache(self.db, hot_path=self.hot_path)
         self.bias = BiasEngine(self.db)
         self.decoder = Decoder(
             self.db,
@@ -71,7 +88,12 @@ class DBSLMEngine:
         self, requested: Sequence[ContextDimension] | None
     ) -> list[ContextDimension]:
         if requested is None:
-            stored = self.db.get_metadata("context_dimensions")
+            stored = None
+            reader = getattr(self.hot_path, "read_metadata", None)
+            if reader:
+                stored = reader("context_dimensions")
+            if stored is None:
+                stored = self.db.get_metadata("context_dimensions")
             if stored:
                 try:
                     resolved = deserialize_context_dimensions(stored)
@@ -81,7 +103,11 @@ class DBSLMEngine:
                 resolved = list(DEFAULT_CONTEXT_DIMENSIONS)
         else:
             resolved = list(requested)
-        self.db.set_metadata("context_dimensions", serialize_context_dimensions(resolved))
+        payload = serialize_context_dimensions(resolved)
+        self.db.set_metadata("context_dimensions", payload)
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if writer:
+            writer("context_dimensions", payload)
         return resolved
 
     # ------------------------------------------------------------------ #
@@ -158,6 +184,45 @@ class DBSLMEngine:
         response = self._tag_formatter.wrap(user_message, response)
         self.memory.log_message(conversation_id, "assistant", response)
         return response
+
+    # ------------------------------------------------------------------ #
+    # Cheetah helpers
+    # ------------------------------------------------------------------ #
+    def cheetah_topk_ratio(self) -> float:
+        """Return the observed Top-K cache hit ratio served by cheetah."""
+        return self.store.topk_hit_ratio()
+
+    def context_relativism(
+        self,
+        context_tree,
+        *,
+        limit: int = 32,
+        depth: int | None = None,
+    ) -> List[ContextRelativismResult]:
+        """Compute probabilistic projections for a nested context description."""
+        raw_results = self.hot_path.context_relativism(context_tree, limit=limit, depth=depth)
+        results: List[ContextRelativismResult] = []
+        for projection in raw_results:
+            ranked_candidates = tuple(
+                TokenCandidate(
+                    token_id,
+                    self.vocab.token_text(token_id),
+                    self.quantizer.dequantize_prob(q),
+                    q,
+                )
+                for token_id, q in projection.ranked
+            )
+            probability = ranked_candidates[0].probability if ranked_candidates else 0.0
+            results.append(
+                ContextRelativismResult(
+                    context_hash=projection.context_hash,
+                    order_size=projection.order_size,
+                    token_ids=projection.token_ids,
+                    probability=probability,
+                    ranked=ranked_candidates,
+                )
+            )
+        return results
 
     def _run_concept_layer(
         self, conversation_id: str, context_tokens: List[int]
