@@ -9,6 +9,8 @@ from db_slm.context_dimensions import format_context_dimensions, parse_context_d
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 
+from log_helpers import log
+
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -84,12 +86,12 @@ def ensure_conversation(engine: DBSLMEngine, args: argparse.Namespace) -> str:
 
 def respond_once(engine: DBSLMEngine, conversation_id: str, prompt: str) -> None:
     _, response = issue_prompt(engine, prompt, conversation_id)
-    print(f"user> {prompt}")
-    print(f"assistant> {response}")
+    log(f"user> {prompt}")
+    log(f"assistant> {response}")
 
 
 def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int | None) -> None:
-    print("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
+    log("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
     turns = 0
     while max_turns is None or turns < max_turns:
         try:
@@ -98,7 +100,8 @@ def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int |
             print()
             break
         except KeyboardInterrupt:
-            print("\n[run] Interrupted. Exiting.")
+            log("[run] Interrupted. Exiting.")
+            print()
             break
         if not user_input:
             continue
@@ -106,14 +109,14 @@ def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int |
             break
         if user_input == ":history":
             history = engine.memory.context_window(conversation_id)
-            print("--- conversation context ---")
-            print(history or "(empty)")
-            print("----------------------------")
+            log("--- conversation context ---")
+            log(history or "(empty)")
+            log("----------------------------")
             continue
         conversation_id, response = issue_prompt(engine, user_input, conversation_id)
-        print(f"assistant> {response}")
+        log(f"assistant> {response}")
         turns += 1
-    print(f"[run] Conversation {conversation_id} closed after {turns} turn(s).")
+    log(f"[run] Conversation {conversation_id} closed after {turns} turn(s).")
 
 
 def main() -> None:
@@ -136,7 +139,7 @@ def main() -> None:
         )
         conversation_id = ensure_conversation(engine, args)
         dims_label = format_context_dimensions(engine.context_dimensions)
-        print(f"[run] Using conversation: {conversation_id} (context dims: {dims_label})")
+        log(f"[run] Using conversation: {conversation_id} (context dims: {dims_label})")
 
         if args.prompt:
             respond_once(engine, conversation_id, args.prompt)

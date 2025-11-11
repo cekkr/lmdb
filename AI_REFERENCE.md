@@ -33,6 +33,7 @@ change so the next agent inherits the latest context.
 - Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
   large JSON chunks no longer look frozen; the logs include approximate line counts to show where
   the trainer is spending time.
+- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; the smoke-train harness also mirrors cheetah latency/queue stats, tracks lingering subprocesses, and enforces 30-minute budgets before logging the same bundle to `var/cheetah_smoke_ingest.log`.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
   real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`, or force hashed-only,

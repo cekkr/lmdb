@@ -11,6 +11,8 @@ from typing import Iterable, List, Sequence
 from .metrics import keyword_summary
 from .settings import DBSLMSettings
 
+from log_helpers import log
+
 _DEFAULT_SPLITS = [".", "!", "?", ";", ":", ",", "\n"]
 _EMOTION_RE = re.compile(r"emotion\s*:\s*([A-Za-z0-9 _-]+)", re.IGNORECASE)
 _EMOTION_WORDS = {
@@ -156,7 +158,7 @@ class ExternalEmbedder:
 
     def _announce_offline(self, reason: str) -> None:
         if not self._warned:
-            print(f"[embedding] External embedder disabled ({reason}); using hashed vectors.")
+            log(f"[embedding] External embedder disabled ({reason}); using hashed vectors.")
             self._warned = True
 
     def _load_model(self) -> None:
@@ -165,7 +167,7 @@ class ExternalEmbedder:
                 from sentence_transformers import SentenceTransformer  # type: ignore
             except ImportError:
                 if not self._warned:
-                    print(
+                    log(
                         "[embedding] sentence-transformers not installed; "
                         "install it to enable external embedding guidance."
                     )
@@ -174,13 +176,13 @@ class ExternalEmbedder:
             try:
                 self._device = self._select_device()
                 self._model = SentenceTransformer(self.model_name, device=self._device)
-                print(
+                log(
                     f"[embedding] Loaded {self.model_name} on {self._device} "
                     "for sentence segmentation guidance."
                 )
             except Exception as exc:  # pragma: no cover - optional dependency
                 if not self._warned:
-                    print(f"[embedding] Failed to load {self.model_name}: {exc}")
+                    log(f"[embedding] Failed to load {self.model_name}: {exc}")
                     self._warned = True
                 self._model = None
 
@@ -211,7 +213,7 @@ class ExternalEmbedder:
             return [vector.tolist() for vector in vectors]
         except Exception as exc:  # pragma: no cover - runtime guard
             if not self._warned:
-                print(f"[embedding] Encoding failed ({exc}); falling back to hashed vectors.")
+                log(f"[embedding] Encoding failed ({exc}); falling back to hashed vectors.")
                 self._warned = True
             self._model = None
             return [self._hashed_vector(text) for text in segments]
@@ -281,7 +283,7 @@ class SentencePartEmbeddingPipeline:
 
         snapshot = self.profiler.snapshot()
         if snapshot:
-            print(
+            log(
                 "[tokenizer] realtime splits={splits} target_len={target} chars={chars}".format(
                     splits=",".join(snapshot["top_splits"]),
                     target=snapshot["target_segment_len"],

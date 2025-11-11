@@ -9,10 +9,26 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import resource  # type: ignore
+except ImportError:  # pragma: no cover - Windows compatibility
+    resource = None  # type: ignore
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = SCRIPT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from db_slm.adapters.cheetah import CheetahClient
+from db_slm.settings import DBSLMSettings, load_settings
+from log_helpers import log
 
 
 DEFAULT_SCENARIOS: list[dict[str, Any]] = [
@@ -91,6 +107,165 @@ DEFAULT_SCENARIOS: list[dict[str, Any]] = [
     },
 ]
 
+
+SMOKE_TRACKER_PATH = Path("var/smoke_train/active_runs.json")
+
+
+class RunTracker:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._entries: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return
+        for key, value in payload.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                pid = int(key)
+            except ValueError:
+                continue
+            self._entries[pid] = value
+
+    def _write(self) -> None:
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps({str(pid): entry for pid, entry in self._entries.items()}, indent=2), encoding="utf-8")
+        tmp_path.replace(self.path)
+
+    def register(self, pid: int, label: str) -> None:
+        with self._lock:
+            self._entries[pid] = {"label": label, "started_at": time.time()}
+            self._write()
+
+    def deregister(self, pid: int) -> None:
+        with self._lock:
+            if pid in self._entries:
+                self._entries.pop(pid, None)
+                self._write()
+
+    def cleanup_orphans(self) -> None:
+        touched = False
+        for pid, info in list(self._entries.items()):
+            if pid == os.getpid():
+                touched = True
+                self._entries.pop(pid, None)
+                continue
+            if not self._is_running(pid):
+                touched = True
+                self._entries.pop(pid, None)
+                continue
+            label = info.get("label", "unknown")
+            log(f"[smoke-train] Terminating lingering process {pid} ({label}).")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            touched = True
+            self._entries.pop(pid, None)
+        if touched:
+            self._write()
+
+    @staticmethod
+    def _is_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+
+class TelemetryMonitor(threading.Thread):
+    def __init__(self, settings: DBSLMSettings, interval: float = 15.0) -> None:
+        super().__init__(daemon=True)
+        self.settings = settings
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._client = CheetahClient(
+            settings.cheetah_host,
+            settings.cheetah_port,
+            database=settings.cheetah_database,
+            timeout=settings.cheetah_timeout_seconds,
+        )
+        self._queue_path = Path(settings.quality_queue_path)
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            snapshot = self._snapshot()
+            self._log(snapshot)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._client.close()
+        self.join(timeout=0.5)
+
+    def _snapshot(self) -> dict[str, Any]:
+        latency, healthy = self._probe_latency()
+        queue_depth = self._queue_depth()
+        cpu_seconds, rss_mb = self._process_stats()
+        return {
+            "latency_ms": latency,
+            "healthy": healthy,
+            "queue_depth": queue_depth,
+            "cpu_seconds": cpu_seconds,
+            "rss_mb": rss_mb,
+        }
+
+    def _probe_latency(self) -> tuple[float | None, bool]:
+        start = time.monotonic()
+        try:
+            result = self._client.pair_scan(limit=1)
+        except Exception:
+            return None, False
+        elapsed = (time.monotonic() - start) * 1000.0
+        return elapsed, result is not None
+
+    def _queue_depth(self) -> int:
+        if not self._queue_path.exists():
+            return 0
+        try:
+            with self._queue_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                return sum(1 for _ in handle)
+        except OSError:
+            return 0
+
+    def _process_stats(self) -> tuple[float | None, float | None]:
+        if resource is None:
+            return None, None
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_seconds = usage.ru_utime + usage.ru_stime
+        rss = usage.ru_maxrss
+        if sys.platform == "darwin":
+            rss_mb = rss / (1024 * 1024)
+        else:
+            rss_mb = rss / 1024
+        return cpu_seconds, rss_mb
+
+    def _log(self, snapshot: dict[str, Any]) -> None:
+        latency = snapshot["latency_ms"]
+        healthy = snapshot["healthy"]
+        queue_depth = snapshot["queue_depth"]
+        cpu_seconds = snapshot["cpu_seconds"]
+        rss_mb = snapshot["rss_mb"]
+        log(
+            "[telemetry]",
+            f"cheetah_latency_ms={latency:.1f}" if latency is not None else "cheetah_latency_ms=unavailable",
+            f"cheetah_healthy={int(healthy)}",
+            f"queue_depth={queue_depth}",
+            f"cpu_seconds={cpu_seconds:.2f}" if cpu_seconds is not None else "cpu_seconds=unknown",
+            f"rss_mb={rss_mb:.1f}" if rss_mb is not None else "rss_mb=unknown",
+        )
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -324,6 +499,8 @@ def run_subprocess(
     scenario: Scenario,
     recorder: BenchmarkRecorder,
     status_label: str,
+    deadline: float | None = None,
+    tracker: "RunTracker" | None = None,
 ) -> int:
     recorder.update(scenario.name, status=status_label)
     process = subprocess.Popen(
@@ -334,20 +511,40 @@ def run_subprocess(
         bufsize=1,
         env=env,
     )
+    if tracker:
+        tracker.register(process.pid, f"{scenario.name}:{status_label}")
     assert process.stdout is not None
+    timed_out = False
     try:
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
             recorder.capture_log(scenario.name, line.rstrip())
+            if deadline and time.monotonic() > deadline:
+                log(
+                    f"[smoke-train] {scenario.name} {status_label} exceeded wall time limit; terminating."
+                )
+                process.send_signal(signal.SIGTERM)
+                timed_out = True
+                break
     except KeyboardInterrupt:
-        sys.stdout.write("\n[smoke-train] Interrupt received, terminating current command...\n")
+        log("[smoke-train] Interrupt received, terminating current command...")
         process.send_signal(signal.SIGINT)
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             process.kill()
         return 130
+    finally:
+        if tracker:
+            tracker.deregister(process.pid)
+    if timed_out:
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return 124
     return process.wait()
 
 
@@ -412,6 +609,18 @@ def parse_args() -> argparse.Namespace:
         help="Path to the aggregated benchmark JSON.",
     )
     parser.add_argument(
+        "--wall-time-limit",
+        type=int,
+        default=1800,
+        help="Wall-clock limit per command in seconds (default 1800s).",
+    )
+    parser.add_argument(
+        "--telemetry-interval",
+        type=float,
+        default=15.0,
+        help="Seconds between cheetah telemetry snapshots (default %(default)s).",
+    )
+    parser.add_argument(
         "--matrix",
         type=Path,
         help="Optional JSON file describing the smoke-train scenario matrix.",
@@ -438,11 +647,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    settings = load_settings()
     args = parse_args()
     metrics_dir = Path(args.metrics_dir)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     benchmark_path = Path(args.benchmarks)
     recorder = BenchmarkRecorder(benchmark_path)
+    tracker = RunTracker(SMOKE_TRACKER_PATH)
+    tracker.cleanup_orphans()
     scenarios = load_scenarios(
         dataset_default=args.dataset,
         metrics_dir=metrics_dir,
@@ -451,64 +663,86 @@ def main() -> int:
     requested = set(args.scenarios.split(",")) if args.scenarios else None
     queue = select_scenarios(scenarios, only=requested, resume_from=args.resume_from)
     if not queue:
-        print("[smoke-train] No scenarios selected.")
+        log("[smoke-train] No scenarios selected.")
         return 0
+    monitor: TelemetryMonitor | None = None
+    if not args.dry_run:
+        monitor = TelemetryMonitor(settings, interval=max(1.0, args.telemetry_interval))
+        monitor.start()
     result_code = 0
-    for scenario in queue:
-        recorder.ensure_entry(scenario)
-        mapping = scenario_mapping(scenario)
-        train_args = ensure_metrics_arg(render_args(scenario.train_args, mapping), scenario.metrics_path)
-        run_args = render_args(scenario.run_args, mapping)
-        train_cmd = build_command(args.python, "src/train.py", train_args)
-        run_cmd = build_command(args.python, "src/run.py", run_args)
-        env = os.environ.copy()
-        env["DBSLM_SQLITE_PATH"] = scenario.db_path
-        env["DBSLM_CHEETAH_DATABASE"] = scenario.cheetah_database
-        print(f"[smoke-train] Scenario {scenario.name}: {scenario.description}")
-        print(f"[smoke-train] Train command: {command_to_text(train_cmd)}")
-        print(f"[smoke-train] Run command:   {command_to_text(run_cmd)}")
-        if args.dry_run:
+    try:
+        for scenario in queue:
+            recorder.ensure_entry(scenario)
+            mapping = scenario_mapping(scenario)
+            train_args = ensure_metrics_arg(render_args(scenario.train_args, mapping), scenario.metrics_path)
+            run_args = render_args(scenario.run_args, mapping)
+            train_cmd = build_command(args.python, "src/train.py", train_args)
+            run_cmd = build_command(args.python, "src/run.py", run_args)
+            env = os.environ.copy()
+            env["DBSLM_SQLITE_PATH"] = scenario.db_path
+            env["DBSLM_CHEETAH_DATABASE"] = scenario.cheetah_database
+            log(f"[smoke-train] Scenario {scenario.name}: {scenario.description}")
+            log(f"[smoke-train] Train command: {command_to_text(train_cmd)}")
+            log(f"[smoke-train] Run command:   {command_to_text(run_cmd)}")
+            if args.dry_run:
+                recorder.update(
+                    scenario.name,
+                    status="dry-run",
+                    train_command=command_to_text(train_cmd),
+                    run_command=command_to_text(run_cmd),
+                )
+                continue
+            start_ts = timestamp()
             recorder.update(
                 scenario.name,
-                status="dry-run",
+                status="running:train",
                 train_command=command_to_text(train_cmd),
                 run_command=command_to_text(run_cmd),
+                started_at=start_ts,
             )
-            continue
-        start_ts = timestamp()
-        recorder.update(
-            scenario.name,
-            status="running:train",
-            train_command=command_to_text(train_cmd),
-            run_command=command_to_text(run_cmd),
-            started_at=start_ts,
-        )
-        code = run_subprocess(
-            train_cmd, env=env, scenario=scenario, recorder=recorder, status_label="running:train"
-        )
-        if code != 0:
-            recorder.update(scenario.name, status="failed:train", train_exit=code)
-            result_code = code
-            if args.fail_fast:
-                break
-            continue
-        recorder.finalize_metrics(scenario.name, scenario.metrics_path)
-        recorder.update(scenario.name, status="running:run")
-        code = run_subprocess(
-            run_cmd, env=env, scenario=scenario, recorder=recorder, status_label="running:run"
-        )
-        if code != 0:
-            recorder.update(scenario.name, status="failed:run", run_exit=code)
-            result_code = code
-            if args.fail_fast:
-                break
-            continue
-        recorder.update(
-            scenario.name,
-            status="completed",
-            completed_at=timestamp(),
-        )
-        recorder.finalize_metrics(scenario.name, scenario.metrics_path)
+            train_deadline = time.monotonic() + args.wall_time_limit
+            code = run_subprocess(
+                train_cmd,
+                env=env,
+                scenario=scenario,
+                recorder=recorder,
+                status_label="running:train",
+                deadline=train_deadline,
+                tracker=tracker,
+            )
+            if code != 0:
+                recorder.update(scenario.name, status="failed:train", train_exit=code)
+                result_code = code
+                if args.fail_fast:
+                    break
+                continue
+            recorder.finalize_metrics(scenario.name, scenario.metrics_path)
+            recorder.update(scenario.name, status="running:run")
+            run_deadline = time.monotonic() + args.wall_time_limit
+            code = run_subprocess(
+                run_cmd,
+                env=env,
+                scenario=scenario,
+                recorder=recorder,
+                status_label="running:run",
+                deadline=run_deadline,
+                tracker=tracker,
+            )
+            if code != 0:
+                recorder.update(scenario.name, status="failed:run", run_exit=code)
+                result_code = code
+                if args.fail_fast:
+                    break
+                continue
+            recorder.update(
+                scenario.name,
+                status="completed",
+                completed_at=timestamp(),
+            )
+            recorder.finalize_metrics(scenario.name, scenario.metrics_path)
+    finally:
+        if monitor:
+            monitor.stop()
     recorder.flush()
     return result_code
 

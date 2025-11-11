@@ -19,6 +19,8 @@ from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
 from .quality import SentenceQualityScorer
 
+from log_helpers import log
+
 
 @dataclass(frozen=True)
 class EvaluationRecord:
@@ -279,7 +281,7 @@ def run_inference_records(
         return []
     variant_runs = max(1, variants_per_prompt)
     total_runs = len(records) * variant_runs
-    print(
+    log(
         f"[eval] Running {total_runs} inference probe(s) from {label} to gauge training quality."
     )
     results: list[EvaluationSampleResult] = []
@@ -289,7 +291,7 @@ def run_inference_records(
             record_key = f"{_record_signature(record)}@{variant}"
             tag = f"#{idx}.{variant}" if variant_runs > 1 else f"#{idx}"
             if _consume_future_retry_budget(record_key):
-                print(
+                log(
                     f"[eval] {tag}: skipping flagged sample; retry budget exhausted "
                     f"(prompt='{preview(record.prompt, 120)}')."
                 )
@@ -332,10 +334,10 @@ def run_inference_records(
             flagged, flag_reasons = quality_gate.process(record, generated, metrics)
             if flagged:
                 joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-                print(f"[eval] {tag}: flagged for retraining ({joined}).")
+                log(f"[eval] {tag}: flagged for retraining ({joined}).")
         if flagged and attempts < _MAX_BATCH_ATTEMPTS:
             joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-            print(
+            log(
                 f"[eval] {tag}: re-queueing flagged sample "
                 f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
             )
@@ -346,7 +348,7 @@ def run_inference_records(
             _schedule_future_retries(record_key)
         else:
             _clear_future_retries(record_key)
-        print(
+        log(
             "[eval] {tag}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
             "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "
             "prompt='{prompt}' response='{response}'".format(
@@ -397,7 +399,7 @@ def run_inference_records(
             parts.append(f"{label_name}={fmt.format(value=value)}")
         if parts:
             joined = ", ".join(parts)
-            print(f"[eval] {label} averages -> {joined}")
+            log(f"[eval] {label} averages -> {joined}")
     if logger:
         logger.log_eval_batch(label, results, summary)
     return results

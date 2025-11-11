@@ -9,6 +9,8 @@ from .metrics import lexical_overlap
 from .sentence_parts import ExternalEmbedder
 from .system import AdaptiveLoadController
 
+from log_helpers import log
+
 __all__ = ["SentenceQualityScorer"]
 
 
@@ -52,10 +54,10 @@ class _LanguageToolProxy:
                 import language_tool_python  # type: ignore
 
                 self._tool = language_tool_python.LanguageTool(self.language)
-                print(f"[quality] Loaded language_tool_python for grammar checks ({self.language}).")
+                log(f"[quality] Loaded language_tool_python for grammar checks ({self.language}).")
             except Exception as exc:  # pragma: no cover - optional dependency
                 if not self._warned:
-                    print(f"[quality] Grammar checks unavailable ({exc}).")
+                    log(f"[quality] Grammar checks unavailable ({exc}).")
                     self._warned = True
                 self._tool = None
         return self._tool
@@ -68,7 +70,7 @@ class _LanguageToolProxy:
             return tool.check(text)
         except Exception as exc:  # pragma: no cover - runtime guard
             if not self._warned:
-                print(f"[quality] Grammar check failed ({exc}). Disabling tool.")
+                log(f"[quality] Grammar check failed ({exc}). Disabling tool.")
                 self._warned = True
             self._tool = None
             return []
@@ -96,10 +98,10 @@ class _CoLAClassifier:
 
                 self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-                print(f"[quality] Loaded CoLA classifier ({self.model_name}).")
+                log(f"[quality] Loaded CoLA classifier ({self.model_name}).")
             except Exception as exc:  # pragma: no cover - optional dependency
                 if not self._warned:
-                    print(f"[quality] Semantic acceptability model unavailable ({exc}).")
+                    log(f"[quality] Semantic acceptability model unavailable ({exc}).")
                     self._warned = True
                 self._model = None
                 self._tokenizer = None
@@ -122,7 +124,7 @@ class _CoLAClassifier:
             return acceptable
         except Exception as exc:  # pragma: no cover - runtime guard
             if not self._warned:
-                print(f"[quality] Semantic acceptability scoring failed ({exc}).")
+                log(f"[quality] Semantic acceptability scoring failed ({exc}).")
                 self._warned = True
             self._model = None
             self._tokenizer = None

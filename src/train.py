@@ -33,6 +33,8 @@ from db_slm.evaluation import (
 )
 from db_slm.settings import load_settings
 
+from log_helpers import log
+
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -224,7 +226,7 @@ class TrainingProgressPrinter:
         pct = (completed / total) * 100.0
         approx_row = min(self.train_rows, max(1, int(round(self.train_rows * (completed / total)))))
         stage_label = self._format_stage(stage)
-        print(
+        log(
             f"[train] {self.label}: {stage_label} {pct:5.1f}% "
             f"({completed}/{total}) ~line {approx_row}/{self.train_rows}"
         )
@@ -283,7 +285,7 @@ def iter_json_chunks(
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
-                print(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
+                log(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
                 continue
             prompt = payload.get("prompt", "")
             response = payload.get("response", "")
@@ -302,7 +304,7 @@ def iter_json_chunks(
             )
             record = EvaluationRecord(prompt=prompt or "", response=response, emotion=emotion)
 
-            print(f"[train] Staged line #{line_no} (Prompt: {prompt})")
+            log(f"[train] Staged line #{line_no} (Prompt: {prompt})")
 
             entries.append((segment, record))
             consumed += 1
@@ -316,7 +318,7 @@ def iter_json_chunks(
         chunk_index += 1
         yield _build_chunk(f"{path}#chunk{chunk_index}", entries, holdout_fraction)
     suffix = f" (capped at {limit} line(s))" if limit and consumed >= limit else ""
-    print(f"[train] Prepared {chunk_index} chunk(s) from {path} using chunk size {chunk_size}{suffix}.")
+    log(f"[train] Prepared {chunk_index} chunk(s) from {path} using chunk size {chunk_size}{suffix}.")
 
 
 def _build_chunk(
@@ -359,7 +361,7 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
-                print(f"[eval] Skipping line {line_no}: {exc}")
+                log(f"[eval] Skipping line {line_no}: {exc}")
                 continue
             prompt = payload.get("prompt")
             response = payload.get("response")
@@ -476,7 +478,7 @@ class IngestProfiler:
         if rss_after is not None:
             delta_str = f"{rss_delta:+.1f}MB" if rss_delta is not None else "n/a"
             suffix = f" rss={rss_after:.1f}MB (Δ{delta_str})"
-        print(f"[profile] {label}: {tokens} tokens in {duration:.2f}s{suffix}")
+        log(f"[profile] {label}: {tokens} tokens in {duration:.2f}s{suffix}")
         if self.logger:
             self.logger.log_profile(
                 label,
@@ -539,7 +541,7 @@ def main() -> None:
             "metrics_file": str(metrics_path),
         }
         metrics_writer = EvalLogWriter(metrics_path, run_metadata)
-        print(f"[metrics] Exporting evaluation timeline to {metrics_writer.path}")
+        log(f"[metrics] Exporting evaluation timeline to {metrics_writer.path}")
     quality_gate: QualityGate | None = None
     if getattr(settings, "quality_queue_path", None):
         quality_gate = QualityGate(settings.quality_queue_path)
@@ -550,7 +552,7 @@ def main() -> None:
         settings=settings,
     )
     dims_label = format_context_dimensions(engine.context_dimensions)
-    print(f"[train] Context dimensions: {dims_label}")
+    log(f"[train] Context dimensions: {dims_label}")
     if run_metadata is not None:
         run_metadata["context_dimensions"] = dims_label
     eval_variants = 2 if engine.context_dimensions else 1
@@ -614,9 +616,9 @@ def main() -> None:
                 decoder_cfg=decoder_cfg_override,
                 variants_per_prompt=eval_variants,
             )
-            print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
+            log(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
-            print(f"[eval] Warning: {exc}. Disabling evaluation probes.")
+            log(f"[eval] Warning: {exc}. Disabling evaluation probes.")
             monitor = InferenceMonitor(
                 engine,
                 [],
@@ -636,12 +638,12 @@ def main() -> None:
     processed_corpora = 0
     success = False
     try:
-        print(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
+        log(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
         for chunk in corpora_iter:
             label = chunk.label
             corpus = chunk.train_text
             processed_corpora += 1
-            print(
+            log(
                 f"[train] Processing {label} ({len(corpus)} bytes, "
                 f"{chunk.train_rows}/{chunk.total_rows} training rows)..."
             )
@@ -651,12 +653,12 @@ def main() -> None:
                 lambda text=corpus, rep=reporter: engine.train_from_text(text, progress_callback=rep),
             )
             if token_count == 0:
-                print(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
+                log(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
                 continue
             window = max(0, token_count - engine.store.order + 1)
             total_tokens += token_count
             total_windows += window
-            print(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
+            log(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
             monitor.maybe_run(total_tokens)
             if chunk.eval_records:
                 eval_batch = list(chunk.eval_records)
@@ -692,7 +694,7 @@ def main() -> None:
             )
 
         location = db_path if db_path is not None else db_path_str
-        print(
+        log(
             f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
         )
         success = True
