@@ -1,4 +1,4 @@
-- Run a ≤10 minute cheetah-only smoke ingest (`DBSLM_BACKEND=cheetah-db python3.14 src/train.py datasets/emotion_data.json --ngram-order 3 --eval-interval 2000`) and record decoder latency, Top-K hit rates, and command transcripts in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
+- Run a ≤30 minute (but with at least a training batch completed) cheetah-only smoke ingest (`DBSLM_BACKEND=cheetah-db python3.14 src/train.py datasets/emotion_data.json --ngram-order 3 --eval-interval 2000 --json-chunk-size 250`) and record decoder latency, Top-K hit rates, and command transcripts in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
 - Extend `PAIR_REDUCE` beyond counts (probabilities/backoff alphas, continuation metadata) so MKNS and future reducers can stay on the Go side without touching SQLite.
 - Mirror the remaining Level 2/3 metadata (conversation stats, correction digests, bias presets) into cheetah namespaces so new processes cold-start without extra SQLite reads.
 - Integrate `scripts/drain_queue.py` into the retrain workflow: wire it to the CI/smoke harness, cap the queue at 200 entries, and append throughput snapshots to `studies/BENCHMARKS.md`.
