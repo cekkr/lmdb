@@ -137,3 +137,25 @@ change so the next agent inherits the latest context.
   incremental upserts leave staging tables untouched before flipping cron jobs over to the real run.
   Keep training on SQLite for locality; the `ColdStorageFlusher` and migration script keep MariaDB in
   sync for archival queries and downstream inference.
+
+### DB Adapters
+
+- `sqlite` remains the default adapter surfaced through `DBSLMSettings.backend`. The Python stack
+  depends on its WAL tuning plus the Level 1–3 schema bootstrapped by `DatabaseEnvironment`, so keep
+  it authoritative for migrations and spec changes.
+- `mariadb` is the current cold-storage / replication target. The migration script + flusher expect a
+  1:1 column layout with SQLite tables, so any schema edits must land in both backends before new
+  ingests run.
+- `cheetah-mldb` (see `cheetah-mldb/`) is now tracked as the ultra-rapid adapter meant to replace
+  SQLite once its fork from the standalone “cheetah” engine is re-implemented for LMDB. The Go
+  service must expose:
+  - rapid statistical aggregation primitives so probability buckets can be recomputed without the
+    Python side materializing large intermediate sets;
+  - byte-oriented key contextualization and deterministic auto-sorting of dynamic sets so context
+    expansion / vector-matrix ordering mirrors the DB-SLM expectations without custom retraining;
+  - brute-force relationship sweeps across multi-file storage so matrix ordering stays single-source
+    while still letting us shard hot data across disks for higher throughput.
+  Until those behaviors exist, keep `cheetah-mldb` flagged as **in-progress** in `NEXT_STEPS.md`,
+  wire it into the adapter registry, and document any interoperability assumptions inside
+  `cheetah-mldb/README.md` so future agents can continue the porting effort without rediscovering the
+  base requirements.
