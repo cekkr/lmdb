@@ -2,6 +2,7 @@
    - Deliverables: every trainer/decoder log line prefixes a `+[seconds_since_start]` timestamp so throughput stalls are immediately visible.
    - Mirror cheetah-db server telemetry (latency, queue depth, process stats) into the same log bundle instead of relying on ad-hoc screen sessions.
    - Update the smoke-train harness to track/kill lingering parallel runs and enforce a wall-clock budget so aborted prompts do not leave extra processes skewing metrics.
+   - Keep attention to test and smoke-train to infinity loops: they've to deliver a result after a maximum of 30 minutes
 
 
 - Run a ≤30 minute (but with at least a training batch completed) cheetah-only smoke ingest (`DBSLM_BACKEND=cheetah-db python3.14 src/train.py datasets/emotion_data.json --ngram-order 3 --eval-interval 2000 --json-chunk-size 250 --max-json-lines 1000`) and record decoder latency, Top-K hit rates, and command transcripts in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
