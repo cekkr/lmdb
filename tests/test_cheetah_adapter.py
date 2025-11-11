@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from db_slm.adapters.cheetah import CheetahHotPathAdapter, CheetahSerializer
+from db_slm.adapters.cheetah import CheetahClient, CheetahHotPathAdapter, CheetahSerializer
 
 
 class FakeCheetahClient:
@@ -52,6 +52,23 @@ class CheetahSerializerTests(unittest.TestCase):
         self.assertEqual(record.order, 2)
         self.assertEqual(record.ranked, ranked)
 
+    def test_probability_payload_round_trip(self) -> None:
+        entries = [(7, 255, None), (8, 120, 400)]
+        payload = self.serializer.encode_probabilities(3, entries)
+        record = self.serializer.decode_probabilities(payload)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.order, 3)
+        self.assertEqual(record.entries, tuple(entries))
+
+    def test_continuation_payload_round_trip(self) -> None:
+        payload = self.serializer.encode_continuation(42, 1024)
+        record = self.serializer.decode_continuation(payload)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.token_id, 42)
+        self.assertEqual(record.num_contexts, 1024)
+
 
 class CheetahHotPathAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -72,6 +89,17 @@ class CheetahHotPathAdapterTests(unittest.TestCase):
         self.adapter.publish_topk(3, context_hash, ranked)
         cached = self.adapter.fetch_topk(3, context_hash, 2)
         self.assertEqual(cached, ranked[:2])
+
+
+class CheetahClientParsingTests(unittest.TestCase):
+    def test_parse_pair_reduce_response_with_payload(self) -> None:
+        response = "SUCCESS,reducer=counts,count=1,items=636e743a:42:SGVsbG8="
+        parsed = CheetahClient._parse_pair_reduce_response(response)
+        self.assertEqual(len(parsed), 1)
+        value, key, payload = parsed[0]
+        self.assertEqual(value, bytes.fromhex("636e743a"))
+        self.assertEqual(key, 42)
+        self.assertEqual(payload, b"Hello")
 
 
 if __name__ == "__main__":

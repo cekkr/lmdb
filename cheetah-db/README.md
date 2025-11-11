@@ -76,6 +76,9 @@ adapter status stays visible to future maintainers.
 - `PAIR_REDUCE counts` aggregates follower counts in-place so MKNS rebuilds can pull entire context
   registries through TCP. The Python smoother mirrors those projections back into `cnt:<order>`
   namespaces after every rebuild, keeping Go + SQLite in sync without extra SQL.
+- Quantized probability/backoff rows (`prob:<order>`) and continuation metadata (`cont:`) are now
+  mirrored alongside counts, so reducers can fetch everything needed for MKNS without touching
+  SQLite.
 - Metadata (context dimensions, decode profiles, cache lambdas) is persisted under the `meta:`
   namespace so new Python processes can cold-start without re-reading SQLite tables.
 - Upcoming roadmap items (statistical reducers, ordered trie slices) should extend the same adapter
@@ -115,11 +118,14 @@ stores in either mode.
 
 ### Reducer hooks
 
-- `PAIR_REDUCE <mode> <prefix> [limit]` piggybacks on the pair iterator but applies lightweight
-  reducers server-side before returning results. The first implemented mode (`PAIR_REDUCE counts
-  cnt:<order>`) streams raw follower counts for all contexts mirrored in `cnt:` namespaces so Python
-  can rebuild MKNS statistics without hitting SQLite.
-- Future reducers (`PAIR_REDUCE probs`, `PAIR_REDUCE queue-drain`, etc.) should follow the same
+- `PAIR_REDUCE <mode> <prefix> [limit]` piggybacks on the pair iterator but now streams inline
+  payloads (`items=<key_hex>:<abs_key>:<base64_payload>`). Clients no longer have to issue a follow-up
+  `READ` per entry—the reducer returns the binary blob directly.
+- Implemented modes:
+  - `PAIR_REDUCE counts cnt:<order>` → follower counts serialized via `CheetahSerializer.encode_counts`.
+  - `PAIR_REDUCE probabilities prob:<order>` → quantized log-probabilities + backoff alphas.
+  - `PAIR_REDUCE continuations cont:` → token-level continuation metadata (`num_contexts`).
+- Future reducers (`PAIR_REDUCE queue-drain`, session-cache snapshots, etc.) should follow the same
   union-by-mode pattern. Update `cheetah-db/CONCEPTS.md` when adding new modes so the RPC contract
   remains easy to discover from the Go side.
 
@@ -134,11 +140,11 @@ stores in either mode.
 
 ## Next steps
 
-- Expand `PAIR_REDUCE` beyond counts (probabilities/backoff slices) so MKNS can stream quantized
-  rows directly from Go.
-- Plumb ordered sweeps for Level 2/3 namespaces so cache/bias/concept jobs never have to query
-  SQLite once the metadata tables are fully mirrored.
+- Mirror Level 2/3 metadata (conversation stats, bias presets, correction digests) into cheetah
+  namespaces so cold starts avoid SQLite entirely.
+- Integrate `scripts/drain_queue.py` into the smoke/CI harness and record queue throughput snapshots
+  under `studies/BENCHMARKS.md`.
 - Capture decoder latency + Top-K hit-rate snapshots in this README after each cheetah-only smoke
   train so we can watch coverage trend toward 100%.
-- Add regression tests around absolute-vector ordering and reducer semantics to guard the binary
-  layouts before we start inlining cheetah inside the Python repo.
+- Add regression tests around absolute-vector ordering, reducer semantics, and new namespaces to
+  guard the binary layouts before we start inlining cheetah inside the Python repo.

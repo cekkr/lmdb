@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import socket
 import struct
@@ -9,7 +10,12 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-from ..cheetah_types import RawContextProjection, RawCountsProjection
+from ..cheetah_types import (
+    RawContinuationProjection,
+    RawContextProjection,
+    RawCountsProjection,
+    RawProbabilityProjection,
+)
 from ..cheetah_vectors import AbsoluteVectorOrder
 from ..hashing import hash_tokens
 
@@ -94,7 +100,9 @@ class CheetahClient:
             return None
         return self._parse_pair_scan_response(response)
 
-    def pair_reduce(self, mode: str, prefix: bytes = b"", limit: int = 0) -> list[tuple[bytes, int]] | None:
+    def pair_reduce(
+        self, mode: str, prefix: bytes = b"", limit: int = 0
+    ) -> list[tuple[bytes, int, bytes | None]] | None:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_REDUCE {mode} {arg}"
         if limit != 0:
@@ -102,7 +110,7 @@ class CheetahClient:
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
-        return self._parse_pair_scan_response(response)
+        return self._parse_pair_reduce_response(response)
 
     # ------------------------------------------------------------------ #
     # Low-level protocol management
@@ -221,6 +229,37 @@ class CheetahClient:
             entries.append((value, key))
         return entries
 
+    @staticmethod
+    def _parse_pair_reduce_response(response: str) -> list[tuple[bytes, int, bytes | None]]:
+        if not response.startswith("SUCCESS"):
+            return []
+        payload_start = response.find("items=")
+        if payload_start == -1:
+            return []
+        payload = response[payload_start + len("items=") :]
+        entries: list[tuple[bytes, int, bytes | None]] = []
+        for item in payload.split(";"):
+            if not item:
+                continue
+            parts = item.split(":")
+            if len(parts) < 2:
+                continue
+            value_hex = parts[0]
+            key_text = parts[1]
+            blob: bytes | None = None
+            if len(parts) > 2:
+                try:
+                    blob = base64.b64decode(parts[2].encode("ascii"))
+                except (ValueError, binascii.Error):
+                    blob = None
+            try:
+                value = bytes.fromhex(value_hex)
+                key = int(key_text)
+            except (ValueError, TypeError):
+                continue
+            entries.append((value, key, blob))
+        return entries
+
 
 @dataclass(frozen=True)
 class TopKPayload:
@@ -240,12 +279,26 @@ class CountsPayload:
     followers: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class ProbabilityPayload:
+    order: int
+    entries: tuple[tuple[int, int, int | None], ...]
+
+
+@dataclass(frozen=True)
+class ContinuationPayload:
+    token_id: int
+    num_contexts: int
+
+
 class CheetahSerializer:
     """Binary codec for the cheetah hot-path payloads."""
 
     CONTEXT_VERSION = 1
     TOPK_VERSION = 1
     COUNTS_VERSION = 1
+    PROBABILITY_VERSION = 1
+    CONTINUATION_VERSION = 1
     MAX_TOPK = 32
 
     def encode_context(self, order_size: int, token_ids: Sequence[int]) -> bytes:
@@ -338,6 +391,62 @@ class CheetahSerializer:
             ranked.append((token_id, q))
         return TopKPayload(order=order, ranked=ranked)
 
+    def encode_probabilities(
+        self,
+        order: int,
+        entries: Sequence[tuple[int, int, int | None]],
+    ) -> bytes:
+        if order > 255:
+            raise CheetahError("order exceeds single-byte limit for probability payload")
+        buf = bytearray()
+        buf.append(self.PROBABILITY_VERSION)
+        buf.append(order & 0xFF)
+        count = min(len(entries), 65535)
+        buf.extend(struct.pack(">H", count))
+        for token_id, q_logprob, backoff in entries[:count]:
+            buf.extend(struct.pack(">I", int(token_id)))
+            buf.append(int(q_logprob) & 0xFF)
+            if backoff is None:
+                buf.extend(struct.pack(">H", 0xFFFF))
+            else:
+                buf.extend(struct.pack(">H", max(0, min(int(backoff), 0xFFFF))))
+        return bytes(buf)
+
+    def decode_probabilities(self, payload: bytes) -> ProbabilityPayload | None:
+        if not payload or payload[0] != self.PROBABILITY_VERSION or len(payload) < 4:
+            return None
+        order = payload[1]
+        count = struct.unpack(">H", payload[2:4])[0]
+        expected = 4 + count * 7
+        if len(payload) < expected:
+            return None
+        entries: list[tuple[int, int, int | None]] = []
+        offset = 4
+        for _ in range(count):
+            token_id = struct.unpack(">I", payload[offset : offset + 4])[0]
+            offset += 4
+            q_logprob = payload[offset]
+            offset += 1
+            alpha_raw = struct.unpack(">H", payload[offset : offset + 2])[0]
+            offset += 2
+            backoff = None if alpha_raw == 0xFFFF else alpha_raw
+            entries.append((token_id, q_logprob, backoff))
+        return ProbabilityPayload(order=order, entries=tuple(entries))
+
+    def encode_continuation(self, token_id: int, num_contexts: int) -> bytes:
+        buf = bytearray()
+        buf.append(self.CONTINUATION_VERSION)
+        buf.extend(struct.pack(">I", int(token_id)))
+        buf.extend(struct.pack(">I", max(int(num_contexts), 0)))
+        return bytes(buf)
+
+    def decode_continuation(self, payload: bytes) -> ContinuationPayload | None:
+        if not payload or payload[0] != self.CONTINUATION_VERSION or len(payload) != 9:
+            return None
+        token_id = struct.unpack(">I", payload[1:5])[0]
+        num_contexts = struct.unpack(">I", payload[5:9])[0]
+        return ContinuationPayload(token_id=token_id, num_contexts=num_contexts)
+
 
 class CheetahHotPathAdapter(HotPathAdapter):
     """Mirrors context metadata + Top-K slices into cheetah-db for low-latency reads."""
@@ -403,6 +512,44 @@ class CheetahHotPathAdapter(HotPathAdapter):
                     raise CheetahError("failed to edit cheetah counts payload")
         except CheetahError as exc:
             self._disable(exc)
+
+    def publish_probabilities(
+        self,
+        order: int,
+        context_hash: str,
+        entries: Sequence[tuple[int, int, int | None]],
+    ) -> None:
+        if not self._enabled or not entries:
+            return
+        namespace = f"prob:{order}"
+        payload = self._serializer.encode_probabilities(order, entries)
+        try:
+            key = self._lookup_key(namespace, context_hash=context_hash)
+            if key is None:
+                self._insert(namespace, context_hash, payload)
+            else:
+                if not self._client.edit(key, payload):
+                    raise CheetahError("failed to edit cheetah probability payload")
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
+        if not self._enabled or not entries:
+            return
+        namespace = "cont"
+        for token_id, num_contexts in entries:
+            identifier = f"{int(token_id) & 0xFFFFFFFF:08x}"
+            payload = self._serializer.encode_continuation(token_id, num_contexts)
+            try:
+                key = self._lookup_key(namespace, context_hash=identifier)
+                if key is None:
+                    self._insert(namespace, identifier, payload)
+                else:
+                    if not self._client.edit(key, payload):
+                        raise CheetahError("failed to edit continuation payload")
+            except CheetahError as exc:
+                self._disable(exc)
+                return
 
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         if not self._enabled:
@@ -500,14 +647,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if results is None:
             self._disable(CheetahError("pair_reduce counts failed"))
             return []
-        for raw_value, key in results:
+        for raw_value, key, payload in results:
             if not raw_value.startswith(namespace_bytes):
                 continue
             trimmed = raw_value[len(namespace_bytes) :]
-            payload = self._client.read(key)
-            if not payload:
+            blob = payload
+            if blob is None:
+                blob = self._client.read(key)
+            if not blob:
                 continue
-            record = self._serializer.decode_counts(payload)
+            record = self._serializer.decode_counts(blob)
             if not record or record.order != order:
                 continue
             if trimmed == b"__root__":
@@ -521,6 +670,70 @@ class CheetahHotPathAdapter(HotPathAdapter):
                     order=order,
                     totals=totals,
                     followers=record.followers,
+                )
+            )
+        return projections
+
+    def iter_probabilities(self, order: int) -> list[RawProbabilityProjection]:
+        if not self._enabled:
+            return []
+        namespace = f"prob:{order}"
+        namespace_bytes = namespace.encode("utf-8") + b":"
+        results = self._client.pair_reduce("probabilities", namespace_bytes, limit=-1)
+        if results is None:
+            self._disable(CheetahError("pair_reduce probabilities failed"))
+            return []
+        projections: list[RawProbabilityProjection] = []
+        for raw_value, key, payload in results:
+            if not raw_value.startswith(namespace_bytes):
+                continue
+            trimmed = raw_value[len(namespace_bytes) :]
+            blob = payload
+            if blob is None:
+                blob = self._client.read(key)
+            if not blob:
+                continue
+            record = self._serializer.decode_probabilities(blob)
+            if not record or record.order != order:
+                continue
+            if trimmed == b"__root__":
+                context_hash = "__root__"
+            else:
+                context_hash = trimmed.hex()
+            projections.append(
+                RawProbabilityProjection(
+                    context_hash=context_hash,
+                    order=order,
+                    followers=record.entries,
+                )
+            )
+        return projections
+
+    def iter_continuations(self) -> list[RawContinuationProjection]:
+        if not self._enabled:
+            return []
+        namespace = "cont"
+        namespace_bytes = namespace.encode("utf-8") + b":"
+        results = self._client.pair_reduce("continuations", namespace_bytes, limit=-1)
+        if results is None:
+            self._disable(CheetahError("pair_reduce continuations failed"))
+            return []
+        projections: list[RawContinuationProjection] = []
+        for raw_value, key, payload in results:
+            if not raw_value.startswith(namespace_bytes):
+                continue
+            blob = payload
+            if blob is None:
+                blob = self._client.read(key)
+            if not blob:
+                continue
+            record = self._serializer.decode_continuation(blob)
+            if not record:
+                continue
+            projections.append(
+                RawContinuationProjection(
+                    token_id=record.token_id,
+                    num_contexts=record.num_contexts,
                 )
             )
         return projections
@@ -720,6 +933,8 @@ __all__ = [
     "CheetahSerializer",
     "CountsPayload",
     "ContextPayload",
+    "ContinuationPayload",
+    "ProbabilityPayload",
     "TopKPayload",
     "build_cheetah_adapter",
 ]

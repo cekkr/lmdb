@@ -20,12 +20,17 @@ For the "lmdb" version to be implemented, it must be adapted as best as possible
 
 ### Reducer RPCs
 
-- `PAIR_REDUCE counts cnt:<order>` walks the `cnt:` namespace and returns `(context_bytes, key)`
-  pairs in byte order, just like `PAIR_SCAN`, but each entry now represents a compressed list of
-  `(token_id, count)` followers. The Python smoother calls this before rebuilding MKNS tables,
-  pushing the exact same follower list back into cheetah at the end of the pass to keep Go + SQLite
-  aligned.
-- Upcoming reducers (`PAIR_REDUCE probs`, `PAIR_REDUCE cache`) should follow the same pattern:
-  operate on an existing namespace (`prob:<order>`, `cache:<profile>`, etc.), emit stable binary
-  payloads, and keep the command grammar (`PAIR_REDUCE <mode> <prefix> [limit]`) backwards
-  compatible so the CLI and TCP server behave the same way.
+- Reducer responses now inline their payloads:
+  `SUCCESS,reducer=<mode>,count=N,items=<hex_key>:<abs_key>:<base64_payload>`. Clients never need to
+  issue a follow-up `READ`.
+- `PAIR_REDUCE counts cnt:<order>` walks the `cnt:` namespace and returns the serialized follower
+  list encoded by `CheetahSerializer.encode_counts` (version byte, order, follower count, followed by
+  `(token_id, count)` tuples in big-endian form).
+- `PAIR_REDUCE probabilities prob:<order>` streams quantized log-probabilities and backoff alphas.
+  Each payload includes `version (1 byte)`, `order (1 byte)`, `entry_count (uint16)`, then per-entry
+  `(token_id uint32, q_logprob uint8, backoff_alpha uint16 | 0xFFFF for None)`.
+- `PAIR_REDUCE continuations cont:` exposes Level 1 continuation metadata. Payload layout:
+  `version (1 byte)`, `token_id (uint32)`, `num_contexts (uint32)`.
+- Upcoming reducers (`PAIR_REDUCE cache`, Level 2 bias presets, queue-drain snapshots) should follow
+  the same command grammar (`PAIR_REDUCE <mode> <prefix> [limit]`) and document their payload
+  layouts here so both the CLI and TCP clients can decode them safely.

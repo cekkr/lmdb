@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -33,6 +34,12 @@ const (
 type PairScanResult struct {
 	Value []byte
 	Key   uint64
+}
+
+type PairReduceResult struct {
+	Value   []byte
+	Key     uint64
+	Payload []byte
 }
 
 func NewDatabase(path string) (*Database, error) {
@@ -308,11 +315,11 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 				return "ERROR,invalid_limit", nil
 			}
 		}
-		results, err := db.PairScan(prefix, limit)
+		response, err := db.handlePairReduce(mode, prefix, limit)
 		if err != nil {
 			return "", err
 		}
-		return formatPairReduceResponse(results, mode), nil
+		return response, nil
 	default:
 		return "ERROR,unknown_command", nil
 	}
@@ -393,36 +400,92 @@ func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int,
 		}
 		return err
 	}
-	snapshot, err := table.Snapshot()
-	if err != nil {
-		return err
-	}
-
 	for branch := 0; branch < 256; branch++ {
-		if limit > 0 && len(*acc) >= limit {
-			break
+		entry, err := table.ReadEntry(byte(branch))
+		if err != nil {
+			return err
 		}
-		offset := branch * PairEntrySize
-		entry := snapshot[offset : offset+PairEntrySize]
 		length := entry[0]
-		if length == 0 {
-			childID := binary.BigEndian.Uint32(entry[1:])
-			if childID == 0 {
-				continue
-			}
-			nextPrefix := append(append([]byte{}, prefix...), byte(branch))
-			if err := db.collectPairEntries(childID, nextPrefix, limit, acc); err != nil {
-				return err
-			}
-		} else {
-			value := append(append([]byte{}, prefix...), byte(branch))
+		data := entry[1:]
+		if length > 0 {
+			newValue := append(prefix, byte(branch))
 			*acc = append(*acc, PairScanResult{
-				Value: value,
+				Value: newValue,
 				Key:   decodeAbsoluteKey(entry),
 			})
+			if limit > 0 && len(*acc) >= limit {
+				return nil
+			}
+			continue
+		}
+		childID := binary.BigEndian.Uint32(data)
+		if childID == 0 {
+			continue
+		}
+		err = db.collectPairEntries(childID, append(prefix, byte(branch)), limit, acc)
+		if err != nil {
+			return err
+		}
+		if limit > 0 && len(*acc) >= limit {
+			return nil
 		}
 	}
 	return nil
+}
+
+func (db *Database) handlePairReduce(mode string, prefix []byte, limit int) (string, error) {
+	switch mode {
+	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
+		results, err := db.reduceWithPayload(prefix, limit)
+		if err != nil {
+			return "", err
+		}
+		return formatPairReduceResponse(results, mode), nil
+	default:
+		return "ERROR,unknown_reducer_mode", nil
+	}
+}
+
+func (db *Database) reduceWithPayload(prefix []byte, limit int) ([]PairReduceResult, error) {
+	scanResults, err := db.PairScan(prefix, limit)
+	if err != nil {
+		return nil, err
+	}
+	reduced := make([]PairReduceResult, 0, len(scanResults))
+	for _, res := range scanResults {
+		payload, err := db.readValuePayload(res.Key)
+		if err != nil {
+			return nil, err
+		}
+		reduced = append(reduced, PairReduceResult{
+			Value:   res.Value,
+			Key:     res.Key,
+			Payload: payload,
+		})
+	}
+	return reduced, nil
+}
+
+func (db *Database) readValuePayload(key uint64) ([]byte, error) {
+	entry, err := db.mainKeys.ReadEntry(key)
+	if err != nil {
+		return nil, err
+	}
+	valueSize := uint8(entry[0])
+	if valueSize == 0 {
+		return nil, fmt.Errorf("key %d has no payload", key)
+	}
+	location := DecodeValueLocationIndex(entry[1:])
+	table, err := db.getValuesTable(valueSize, location.TableID)
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]byte, valueSize)
+	offset := int64(location.EntryID) * int64(valueSize)
+	if _, err := table.ReadAt(payload, offset); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func normalizePairScanLimit(limit int) int {
@@ -461,10 +524,19 @@ func formatPairScanResponse(results []PairScanResult) string {
 	return b.String()
 }
 
-func formatPairReduceResponse(results []PairScanResult, mode string) string {
-	response := formatPairScanResponse(results)
-	if strings.HasPrefix(response, "SUCCESS") {
-		return strings.Replace(response, "SUCCESS", fmt.Sprintf("SUCCESS,reducer=%s", mode), 1)
+func formatPairReduceResponse(results []PairReduceResult, mode string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("SUCCESS,reducer=%s,count=%d", mode, len(results)))
+	if len(results) == 0 {
+		return b.String()
 	}
-	return response
+	b.WriteString(",items=")
+	for idx, res := range results {
+		if idx > 0 {
+			b.WriteString(";")
+		}
+		encoded := base64.StdEncoding.EncodeToString(res.Payload)
+		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
+	}
+	return b.String()
 }

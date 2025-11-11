@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Iterable, Protocol, Sequence, Tuple
 
-from ..cheetah_types import RawContextProjection, RawCountsProjection
+from ..cheetah_types import (
+    RawContinuationProjection,
+    RawContextProjection,
+    RawCountsProjection,
+    RawProbabilityProjection,
+)
 
 
 class HotPathAdapter(Protocol):
@@ -19,6 +24,17 @@ class HotPathAdapter(Protocol):
 
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
         """Mirror raw follower counts for a context hash."""
+
+    def publish_probabilities(
+        self,
+        order: int,
+        context_hash: str,
+        entries: Sequence[tuple[int, int, int | None]],
+    ) -> None:
+        """Mirror quantized probability rows per context."""
+
+    def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
+        """Mirror continuation metadata (token id -> num contexts)."""
 
     def fetch_context_tokens(self, context_hash: str) -> Sequence[int] | None:
         """Return the token ids representing the context, if mirrored."""
@@ -40,6 +56,12 @@ class HotPathAdapter(Protocol):
 
     def iter_counts(self, order: int) -> Iterable[RawCountsProjection]:
         """Iterate mirrored follower counts for an order."""
+
+    def iter_probabilities(self, order: int) -> Iterable[RawProbabilityProjection]:
+        """Iterate mirrored probability/backoff entries for an order."""
+
+    def iter_continuations(self) -> Iterable[RawContinuationProjection]:
+        """Iterate mirrored continuation metadata."""
 
     def context_relativism(
         self,
@@ -69,6 +91,17 @@ class NullHotPathAdapter:
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
         return None
 
+    def publish_probabilities(
+        self,
+        order: int,
+        context_hash: str,
+        entries: Sequence[tuple[int, int, int | None]],
+    ) -> None:
+        return None
+
+    def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
+        return None
+
     def fetch_context_tokens(self, context_hash: str) -> Sequence[int] | None:
         return None
 
@@ -89,6 +122,13 @@ class NullHotPathAdapter:
 
     def iter_counts(self, order: int) -> Iterable[RawCountsProjection]:
         return []
+
+    def iter_probabilities(self, order: int) -> Iterable[RawProbabilityProjection]:
+        return []
+
+    def iter_continuations(self) -> Iterable[RawContinuationProjection]:
+        return []
+
     def context_relativism(
         self,
         context_tree,

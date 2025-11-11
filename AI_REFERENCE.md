@@ -43,6 +43,9 @@ change so the next agent inherits the latest context.
 - `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
   MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
   exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
+- Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
+  cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,
+  `probabilities`, and `continuations`, eliminating the extra `READ` hop per entry.
 - Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
   via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
   truncated generations.

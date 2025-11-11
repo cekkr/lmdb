@@ -382,6 +382,7 @@ class NGramStore:
             topk_rows,
         )
         self._sync_topk(order, topk_rows)
+        self._sync_probabilities(order, rows)
 
     def _sync_topk(self, order: int, topk_rows: List[Tuple[str, int, int, int]]) -> None:
         if not topk_rows:
@@ -391,6 +392,26 @@ class NGramStore:
             grouped[context_hash].append((token_id, q))
         for context_hash, ranked in grouped.items():
             self.hot_path.publish_topk(order, context_hash, ranked)
+
+    def _sync_probabilities(self, order: int, rows: List[Tuple[str, int, int, int | None]]) -> None:
+        if not rows:
+            return
+        publisher = getattr(self.hot_path, "publish_probabilities", None)
+        if not publisher:
+            return
+        grouped: Dict[str, List[Tuple[int, int, int | None]]] = defaultdict(list)
+        for context_hash, token_id, q_logprob, backoff_alpha in rows:
+            grouped[context_hash].append((token_id, q_logprob, backoff_alpha))
+        for context_hash, entries in grouped.items():
+            publisher(order, context_hash, entries)  # type: ignore[misc]
+
+    def mirror_continuations(self, entries: List[Tuple[int, int]]) -> None:
+        if not entries:
+            return
+        publisher = getattr(self.hot_path, "publish_continuations", None)
+        if not publisher:
+            return
+        publisher(entries)  # type: ignore[misc]
 
 
 class MKNSmoother:
@@ -560,6 +581,7 @@ class MKNSmoother:
             "INSERT INTO tbl_l1_continuations(token_id, num_contexts) VALUES (?, ?)",
             payload,
         )
+        self.store.mirror_continuations(payload)
 
     def _collect_context_followers(
         self, order: int

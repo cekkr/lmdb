@@ -26,4 +26,26 @@ class RawCountsProjection:
     followers: Tuple[tuple[int, int], ...]
 
 
-__all__ = ["RawContextProjection", "RawCountsProjection"]
+@dataclass(frozen=True)
+class RawProbabilityProjection:
+    """Quantized probability rows mirrored from MKNS."""
+
+    context_hash: str
+    order: int
+    followers: Tuple[tuple[int, int, int | None], ...]
+
+
+@dataclass(frozen=True)
+class RawContinuationProjection:
+    """Continuation metadata mirrored into cheetah."""
+
+    token_id: int
+    num_contexts: int
+
+
+__all__ = [
+    "RawContextProjection",
+    "RawCountsProjection",
+    "RawProbabilityProjection",
+    "RawContinuationProjection",
+]
