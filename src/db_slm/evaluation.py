@@ -37,6 +37,7 @@ class EvaluationSampleResult:
     emotion: str
     metrics: dict[str, float | int | None]
     flagged: bool = False
+    variant: int = 1
 
 
 _MAX_BATCH_ATTEMPTS = 2
@@ -272,37 +273,45 @@ def run_inference_records(
     logger: EvalLogWriter | None = None,
     quality_gate: "QualityGate | None" = None,
     decoder_cfg: DecoderConfig | None = None,
+    variants_per_prompt: int = 1,
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
+    variant_runs = max(1, variants_per_prompt)
+    total_runs = len(records) * variant_runs
     print(
-        f"[eval] Running {len(records)} inference probe(s) from {label} to gauge training quality."
+        f"[eval] Running {total_runs} inference probe(s) from {label} to gauge training quality."
     )
     results: list[EvaluationSampleResult] = []
     pending: list[dict[str, Any]] = []
     for idx, record in enumerate(records, start=1):
-        record_key = _record_signature(record)
-        if _consume_future_retry_budget(record_key):
-            print(
-                f"[eval] #{idx}: skipping flagged sample; retry budget exhausted "
-                f"(prompt='{preview(record.prompt, 120)}')."
+        for variant in range(1, variant_runs + 1):
+            record_key = f"{_record_signature(record)}@{variant}"
+            tag = f"#{idx}.{variant}" if variant_runs > 1 else f"#{idx}"
+            if _consume_future_retry_budget(record_key):
+                print(
+                    f"[eval] {tag}: skipping flagged sample; retry budget exhausted "
+                    f"(prompt='{preview(record.prompt, 120)}')."
+                )
+                continue
+            pending.append(
+                {
+                    "index": idx,
+                    "record": record,
+                    "record_key": record_key,
+                    "attempts": 0,
+                    "variant": variant,
+                }
             )
-            continue
-        pending.append(
-            {
-                "index": idx,
-                "record": record,
-                "record_key": record_key,
-                "attempts": 0,
-            }
-        )
     while pending:
         entry = pending.pop(0)
         record = entry["record"]
         idx = entry["index"]
+        variant = entry.get("variant", 1)
         record_key = entry["record_key"]
         entry["attempts"] += 1
         attempts = entry["attempts"]
+        tag = f"#{idx}.{variant}" if variant_runs > 1 else f"#{idx}"
         generated = ""
         metrics: dict[str, float | int | None] = {}
         ref_words = max(1, len(record.response.split()))
@@ -323,11 +332,11 @@ def run_inference_records(
             flagged, flag_reasons = quality_gate.process(record, generated, metrics)
             if flagged:
                 joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
-                print(f"[eval] #{idx}: flagged for retraining ({joined}).")
+                print(f"[eval] {tag}: flagged for retraining ({joined}).")
         if flagged and attempts < _MAX_BATCH_ATTEMPTS:
             joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
             print(
-                f"[eval] #{idx}: re-queueing flagged sample "
+                f"[eval] {tag}: re-queueing flagged sample "
                 f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
             )
             insert_at = random.randint(0, len(pending))
@@ -338,10 +347,10 @@ def run_inference_records(
         else:
             _clear_future_retries(record_key)
         print(
-            "[eval] #{idx}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
+            "[eval] {tag}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
             "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "
             "prompt='{prompt}' response='{response}'".format(
-                idx=idx,
+                tag=tag,
                 emotion=record.emotion,
                 lex=metrics["lexical"],
                 rouge=metrics["rougeL"],
@@ -363,6 +372,7 @@ def run_inference_records(
                 emotion=record.emotion,
                 metrics=metrics,
                 flagged=flagged,
+                variant=variant,
             )
         )
     summary = summarize_samples(results)
@@ -422,6 +432,7 @@ class EvalLogWriter:
             "samples": [
                 {
                     "index": sample.index,
+                    "variant": sample.variant,
                     "emotion": sample.emotion,
                     "prompt": preview(sample.prompt, width=240),
                     "reference": preview(sample.reference, width=240),

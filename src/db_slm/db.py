@@ -303,6 +303,23 @@ class DatabaseEnvironment:
             self._conn.rollback()
             raise
 
+    def set_metadata(self, key: str, value: str) -> None:
+        self.execute(
+            """
+            INSERT INTO tbl_metadata(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    def get_metadata(self, key: str, default: str | None = None) -> str | None:
+        rows = self.query("SELECT value FROM tbl_metadata WHERE key = ? LIMIT 1", (key,))
+        if not rows:
+            return default
+        value = rows[0]["value"]
+        return value if value is not None else default
+
     # ------------------------------------------------------------------ #
     # Hash helpers
     # ------------------------------------------------------------------ #

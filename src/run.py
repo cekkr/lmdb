@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from db_slm import DBSLMEngine
+from db_slm.context_dimensions import format_context_dimensions, parse_context_dimensions_arg
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 
@@ -23,6 +24,13 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="N-gram order used when the database was created (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--context-dimensions",
+        help=(
+            "Override the stored context-dimension penalties with a string like '1-2,3-5'. "
+            "Use 'off' to disable; omit to reuse metadata from the database."
+        ),
     )
     parser.add_argument(
         "--user",
@@ -112,13 +120,23 @@ def main() -> None:
     settings = load_settings()
     parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
+    try:
+        context_dimensions = parse_context_dimensions_arg(args.context_dimensions, default=None)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     engine: DBSLMEngine | None = None
     try:
         db_path = resolve_db_path(args.db)
-        engine = DBSLMEngine(db_path, ngram_order=args.ngram_order, settings=settings)
+        engine = DBSLMEngine(
+            db_path,
+            ngram_order=args.ngram_order,
+            context_dimensions=context_dimensions,
+            settings=settings,
+        )
         conversation_id = ensure_conversation(engine, args)
-        print(f"[run] Using conversation: {conversation_id}")
+        dims_label = format_context_dimensions(engine.context_dimensions)
+        print(f"[run] Using conversation: {conversation_id} (context dims: {dims_label})")
 
         if args.prompt:
             respond_once(engine, conversation_id, args.prompt)

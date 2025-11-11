@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Sequence, Tuple
 
 try:  # resource is Unix-only but gives precise RSS readings when available.
     import resource  # type: ignore
@@ -18,6 +18,11 @@ except ImportError:  # pragma: no cover - Windows fallback
     resource = None  # type: ignore
 
 from db_slm import DBSLMEngine
+from db_slm.context_dimensions import (
+    DEFAULT_CONTEXT_DIMENSIONS,
+    format_context_dimensions,
+    parse_context_dimensions_arg,
+)
 from db_slm.decoder import DecoderConfig
 from db_slm.evaluation import (
     EvalLogWriter,
@@ -49,6 +54,13 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="N-gram order to enforce while training (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--context-dimensions",
+        help=(
+            "Comma-separated token span ranges (e.g. '1-2,3-5') used to group context penalties. "
+            "Use 'off' to disable the additional grouping penalties."
+        ),
     )
     parser.add_argument(
         "--encoding",
@@ -382,6 +394,7 @@ class InferenceMonitor:
         quality_gate: QualityGate | None = None,
         max_dataset_size: int | None = None,
         decoder_cfg: DecoderConfig | None = None,
+        variants_per_prompt: int = 1,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -394,6 +407,7 @@ class InferenceMonitor:
         self.quality_gate = quality_gate
         self.max_dataset_size = max_dataset_size if max_dataset_size and max_dataset_size > 0 else None
         self.decoder_cfg = decoder_cfg
+        self.variants_per_prompt = max(1, variants_per_prompt)
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -409,16 +423,17 @@ class InferenceMonitor:
         sample_size = min(len(self.dataset), self.samples)
         selections = random.sample(self.dataset, sample_size)
         run_inference_records(
-                self.engine,
-                self.evaluator,
-                selections,
-                label=f"{threshold} ingested tokens",
-                user_id="trainer",
-                agent_name="db-slm",
-                logger=self.logger,
-                quality_gate=self.quality_gate,
-                decoder_cfg=self.decoder_cfg,
-            )
+            self.engine,
+            self.evaluator,
+            selections,
+            label=f"{threshold} ingested tokens",
+            user_id="trainer",
+            agent_name="db-slm",
+            logger=self.logger,
+            quality_gate=self.quality_gate,
+            decoder_cfg=self.decoder_cfg,
+            variants_per_prompt=self.variants_per_prompt,
+        )
 
     def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
         if not new_records:
@@ -504,9 +519,18 @@ def main() -> None:
     if not args.inputs and not args.stdin:
         parser.error("Provide at least one input path or enable --stdin")
 
+    try:
+        context_dimensions = parse_context_dimensions_arg(
+            args.context_dimensions,
+            default=DEFAULT_CONTEXT_DIMENSIONS,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
     metrics_path = resolve_metrics_export_path(args.metrics_export)
     metrics_writer: EvalLogWriter | None = None
+    run_metadata: dict[str, Any] | None = None
     if metrics_path is not None:
         arg_snapshot = vars(args).copy()
         run_metadata = {
@@ -520,7 +544,17 @@ def main() -> None:
     quality_gate: QualityGate | None = None
     if getattr(settings, "quality_queue_path", None):
         quality_gate = QualityGate(settings.quality_queue_path)
-    engine = DBSLMEngine(db_path_str, ngram_order=args.ngram_order, settings=settings)
+    engine = DBSLMEngine(
+        db_path_str,
+        ngram_order=args.ngram_order,
+        context_dimensions=context_dimensions,
+        settings=settings,
+    )
+    dims_label = format_context_dimensions(engine.context_dimensions)
+    print(f"[train] Context dimensions: {dims_label}")
+    if run_metadata is not None:
+        run_metadata["context_dimensions"] = dims_label
+    eval_variants = 2 if engine.context_dimensions else 1
     decoder_cfg_override: DecoderConfig | None = None
     decoder_overrides: dict[str, float] = {}
     if args.decoder_presence_penalty is not None:
@@ -567,6 +601,7 @@ def main() -> None:
         quality_gate=quality_gate,
         max_dataset_size=args.eval_pool_size,
         decoder_cfg=decoder_cfg_override,
+        variants_per_prompt=eval_variants,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -582,6 +617,7 @@ def main() -> None:
                 quality_gate=quality_gate,
                 max_dataset_size=args.eval_pool_size,
                 decoder_cfg=decoder_cfg_override,
+                variants_per_prompt=eval_variants,
             )
             print(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
         except FileNotFoundError as exc:
@@ -596,6 +632,7 @@ def main() -> None:
                 quality_gate=quality_gate,
                 max_dataset_size=args.eval_pool_size,
                 decoder_cfg=decoder_cfg_override,
+                variants_per_prompt=eval_variants,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -648,6 +685,7 @@ def main() -> None:
                     logger=metrics_writer,
                     quality_gate=quality_gate,
                     decoder_cfg=decoder_cfg_override,
+                    variants_per_prompt=eval_variants,
                 )
                 monitor.refresh_dataset(chunk.eval_records)
             if flusher:

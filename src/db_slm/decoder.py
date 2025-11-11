@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 from .db import DatabaseEnvironment
+from .context_dimensions import ContextDimension, ContextDimensionTracker
 from .level1 import LogProbQuantizer, NGramStore, TokenCandidate, Tokenizer
 from .level2 import BiasEngine, SessionCache
 
@@ -28,6 +29,8 @@ class Decoder:
         quantizer: LogProbQuantizer,
         cache: SessionCache,
         bias: BiasEngine,
+        *,
+        context_dimensions: Sequence[ContextDimension] | None = None,
     ) -> None:
         self.db = db
         self.store = store
@@ -35,6 +38,7 @@ class Decoder:
         self.quantizer = quantizer
         self.cache = cache
         self.bias = bias
+        self.context_dimensions = list(context_dimensions or [])
 
     def decode(
         self,
@@ -47,6 +51,9 @@ class Decoder:
         generated: List[int] = []
         profile = self.cache.decode_profile(config.profile)
         banned = self._load_bans(config.profile)
+        dimension_tracker: ContextDimensionTracker | None = None
+        if self.context_dimensions:
+            dimension_tracker = ContextDimensionTracker(self.context_dimensions, list(context_ids))
         for _ in range(config.max_tokens):
             order = min(self.store.order, len(context_ids) + 1)
             candidates = self.store.get_topk(context_ids, order, profile["topk"])
@@ -60,6 +67,7 @@ class Decoder:
                 banned,
                 config,
                 context_snippet,
+                dimension_tracker,
             )
             if not adjusted:
                 break
@@ -69,6 +77,8 @@ class Decoder:
             generated.append(next_token)
             context_ids.append(next_token)
             context_ids[:] = context_ids[-(self.store.order - 1) :]
+            if dimension_tracker:
+                dimension_tracker.record(next_token)
             if self.tokenizer.vocab.token_text(next_token) == "<EOS>":
                 break
         self.cache.update(conversation_id, generated)
@@ -83,6 +93,7 @@ class Decoder:
         banned: set[int],
         config: DecoderConfig,
         context_snippet: str,
+        dimension_tracker: ContextDimensionTracker | None,
     ) -> Dict[int, float]:
         base: Dict[int, float] = {}
         bias_map = self.bias.lookup(conversation_id, context_snippet)
@@ -107,6 +118,12 @@ class Decoder:
             if token_id in penalties:
                 penalty += config.presence_penalty
                 penalty += penalties[token_id] * config.frequency_penalty
+            if dimension_tracker:
+                penalty += dimension_tracker.penalty_for(
+                    token_id,
+                    config.presence_penalty,
+                    config.frequency_penalty,
+                )
             if penalty:
                 log10_val -= penalty
             prob = 10 ** log10_val

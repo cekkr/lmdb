@@ -48,6 +48,10 @@ change so the next agent inherits the latest context.
 - `src/train.py` now accepts `--decoder-presence-penalty` and `--decoder-frequency-penalty` so repeat
   penalty grids can run directly from the CLI; overrides propagate to periodic + hold-out probes and
   are recorded inside the metrics metadata for downstream comparisons.
+- `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of token span
+  ranges (default `1-2,3-5`) that extend presence/frequency penalties to grouped tokens. The selected
+  spans are persisted inside `tbl_metadata`, automatically loaded by `DBSLMEngine`, and the decoder
+  now down-weights candidates that would recreate overused word- or sentence-length sequences.
 - `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
   `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
   inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
@@ -64,6 +68,9 @@ change so the next agent inherits the latest context.
 - Evaluation summaries are written both to stdout and to structured JSON under
   `var/eval_logs/train-*.json`. Set `--metrics-export <path>` (or `-` to disable) to control the feed,
   which captures probe averages plus optional ingest profiling samples.
+- Context-dimension runs automatically score every held-out prompt twice per probe, logging variants
+  `#idx.1`/`#idx.2` separately so the grouped frequency penalty can adapt in real time and surface
+  duplicate structures that still leak through.
 - Sentence quality checks now combine LanguageTool grammar deltas, the CoLA acceptability head, and
   embedder-based semantic similarity/novelty. Metrics land next to lexical/ROUGE/perplexity in the
   eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`

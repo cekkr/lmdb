@@ -3,8 +3,14 @@ from __future__ import annotations
 import random
 import re
 from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Sequence, Set, Tuple
 
+from .context_dimensions import (
+    ContextDimension,
+    DEFAULT_CONTEXT_DIMENSIONS,
+    deserialize_context_dimensions,
+    serialize_context_dimensions,
+)
 from .db import DatabaseEnvironment
 from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
@@ -22,10 +28,12 @@ class DBSLMEngine:
         self,
         db_path: str | Path = ":memory:",
         ngram_order: int = 3,
+        context_dimensions: Sequence[ContextDimension] | None = None,
         settings: DBSLMSettings | None = None,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
+        self.context_dimensions = self._init_context_dimensions(context_dimensions)
         self.vocab = Vocabulary(self.db)
         self.tokenizer = Tokenizer(self.vocab)
         self.quantizer = LogProbQuantizer(self.db)
@@ -34,7 +42,15 @@ class DBSLMEngine:
         self.memory = ConversationMemory(self.db)
         self.cache = SessionCache(self.db)
         self.bias = BiasEngine(self.db)
-        self.decoder = Decoder(self.db, self.store, self.tokenizer, self.quantizer, self.cache, self.bias)
+        self.decoder = Decoder(
+            self.db,
+            self.store,
+            self.tokenizer,
+            self.quantizer,
+            self.cache,
+            self.bias,
+            context_dimensions=self.context_dimensions,
+        )
         self.concepts = ConceptEngine(self.db, self.memory, self.quantizer)
         self.level1 = self.store  # backwards compatibility for callers expecting this attr
         self.segment_embedder = SentencePartEmbeddingPipeline(self.settings)
@@ -42,6 +58,23 @@ class DBSLMEngine:
         self._low_resource_helper = LowResourceHelper(self)
         self._response_backstop = ResponseBackstop()
         self._tag_formatter = TaggedResponseFormatter()
+
+    def _init_context_dimensions(
+        self, requested: Sequence[ContextDimension] | None
+    ) -> list[ContextDimension]:
+        if requested is None:
+            stored = self.db.get_metadata("context_dimensions")
+            if stored:
+                try:
+                    resolved = deserialize_context_dimensions(stored)
+                except ValueError:
+                    resolved = list(DEFAULT_CONTEXT_DIMENSIONS)
+            else:
+                resolved = list(DEFAULT_CONTEXT_DIMENSIONS)
+        else:
+            resolved = list(requested)
+        self.db.set_metadata("context_dimensions", serialize_context_dimensions(resolved))
+        return resolved
 
     # ------------------------------------------------------------------ #
     # Training utilities
