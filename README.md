@@ -69,6 +69,10 @@ Key options:
 - `--db`: Destination SQLite file. The parent directory is created automatically. Use `--reset` when
   you want to erase the previous database before ingesting.
 - `--ngram-order`: Controls the window length. Increase for more context, decrease for tiny corpora.
+- `--context-dimensions "<ranges>"`: Extends the repeat penalty across grouped token spans. Accepts
+  comma-separated ranges such as `1-2,3-5` (the default) to cover word- and sentence-length windows,
+  a single integer (e.g., `4`), or `off`/`none` to disable the extra grouping penalty. The selection
+  is persisted inside `tbl_metadata` so later CLI invocations inherit the same spans.
 - `--stdin`: Stream additional ad-hoc text directly from `STDIN`, e.g. `cat notes.txt | python src/train.py --stdin`.
 - `--encoding`: Override the default UTF-8 reader if your corpus uses a different encoding.
 
@@ -81,12 +85,17 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--json-chunk-size`: stream JSON/NDJSON rows in fixed-size batches so the process never loads the
   full file into memory.
 - `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
-- `--eval-interval`, `--eval-samples`, `--eval-dataset`, `--eval-pool-size`: enable periodic
-  inference probes during training to log qualitative progress without leaving the script.
-- `--chunk-eval-percent`: when ingesting JSON/NDJSON corpora, reserve this percentage of every chunk
-  as hold-out prompts/responses. Those samples skip training entirely, immediately run through the
-  inference path, and are injected into the rolling evaluation pool so every batch swaps a random
-  slice of the validation set with the freshest rows.
+- **Evaluation controls (all optional, 0 disables the feature):**
+  - `--eval-interval <tokens>`: trigger periodic probes every N ingested tokens (default `0`, meaning
+    disabled). Context-dimension runs automatically emit two generations per prompt to compare span
+    penalties in real time.
+  - `--eval-samples <count>`: number of held-out prompts per probe (minimum 2, default `3`).
+  - `--eval-dataset <path>`: NDJSON file with `prompt`/`response` pairs; defaults to
+    `DBSLM_DATASET_PATH` from `.env`.
+  - `--eval-pool-size <count>`: cap (or unset for unlimited) on how many records remain in the rolling
+    evaluation buffer.
+  - `--chunk-eval-percent <0-100>`: reserve this percent of every JSON chunk as an immediate
+    hold-out set; they run through the inference stack before the chunk trains and refresh the pool.
 - `--profile-ingest`: print per-corpus latency and resident-set-size metrics so you can keep raising
   `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
   of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
@@ -94,11 +103,11 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--metrics-export <path>`: write the rolling ROUGE/perplexity timeline plus profiling samples to a
   JSON artifact. When omitted, `train.py` automatically drops `var/eval_logs/train-<timestamp>.json`
   so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
-- `--decoder-presence-penalty` / `--decoder-frequency-penalty`: override the decoder repeat-penalty
-  pair used during evaluation probes and chunk hold-outs. When unset, the default sampling profile
-  applies; supplying these flags lets you sweep repeat penalties (e.g., `--decoder-presence-penalty 0.22 --decoder-frequency-penalty 0.08`)
-  without editing code, and the chosen values are recorded inside the metrics export for later
-  comparisons.
+- **Penalty overrides (per-probe sampling tweaks):**
+  - `--decoder-presence-penalty <float>=0+`: add a one-time penalty whenever a token (or grouped span)
+    has already appeared in the current generation. Typical sweep range is `0.0–0.4`.
+  - `--decoder-frequency-penalty <float>=0+`: scales with how many times the token/span has appeared.
+    Values between `0.0` and `0.2` generally work best for conversational corpora.
 
 Large batches can take a while to finish a single call to `train_from_text()`, so the trainer now
 prints progress lines for the vocabulary pass, every n-gram order, and the KN rebuilds. The logs
