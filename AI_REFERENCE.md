@@ -83,11 +83,14 @@ change so the next agent inherits the latest context.
   samples (topped up from the rolling pool when needed). `SentenceQualityScorer` now scales
   `quality_score` down whenever `token_group_share` exceeds 0.30 so repetition spikes show up in the
   aggregate means.
-- Latest smoke-train (2025-11-10, python3.11, `datasets/emotion_data.json` capped at 400 rows) logged
-  882k tokens with avg quality 0.599 and structure_variety 0.317 (details in `studies/BENCHMARKS.md`);
-  keep an eye on the 64% flagged rate--pool diversity or penalty tuning may be needed before next run.
-  `QualityGate.common_token_ceiling` now defaults to 0.55 to drive the flagged rate below 45% once the
-  token-group repetition penalty feeds into `quality_score`.
+- Latest smoke-train matrix (2025-11-10, python3.11) now runs
+  `baseline_profiled` (400-row ingest, profiling enabled) followed by
+  `penalty_sweep_holdout` (240-row ingest with chunk hold-outs + penalty overrides) via
+  `scripts/smoke_train.py`. Combined they logged ~882k tokens with avg quality 0.599 and
+  structure_variety 0.317 (`studies/BENCHMARKS.md`). Real-time stats stream into
+  `var/smoke_train/benchmarks.json`, while full evaluation payloads land in
+  `var/smoke_train/metrics/<scenario>.json`. Monitor the 64% flagged rate—pool diversity or penalty
+  tuning is still needed to push it below the new 0.55 `common_token_ceiling`.
 - Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
   re-queued into a random spot of the current probe before being eligible for up to three additional
   appearances in later random batches so probes cannot loop forever when the generator keeps
@@ -103,8 +106,9 @@ change so the next agent inherits the latest context.
 - `scripts/run_paraphraser_regression.py` consumes `studies/paraphraser_regression.jsonl` to ensure
   multi-turn corrective threads, structural tags, and ordinary prompts all trigger the expected
   paraphraser behavior.
-- `Makefile` now includes `smoke-train`, a capped ingest + inference probe suitable for CI health
-  checks.
+- `Makefile` now shells into `scripts/smoke_train.py`, which can iterate arbitrary scenario matrices,
+  stream live metrics, and hand each scenario a dedicated SQLite + `DBSLM_CHEETAH_DATABASE`
+  namespace so cheetah sessions can be paused and restarted independently.
 
 ## Operational Notes
 
@@ -117,8 +121,27 @@ change so the next agent inherits the latest context.
   with quantitative gains instead of relying on overlap logs only.
 - `datasets.md` now tracks basic stats for `emotion_data.json` (avg response 347 words, max 1,251) so
   chunk sizes, eval thresholds, and paraphraser guard rails stay grounded in the actual corpora.
-- Prefer `make smoke-train` for regressions since it wires the capped ingest + inference probe into
-  a single command and exercises the paraphraser path automatically.
+- Prefer `make smoke-train` for regressions: it now iterates both baseline + penalty scenarios,
+  writes live stats to `var/smoke_train/benchmarks.json`, and exposes switches (see `SMOKE_*` vars in
+  the `Makefile`) so you can resume or subset the matrix without editing the script.
+
+### Smoke-Train Matrix
+
+- `scripts/smoke_train.py` orchestrates sequential scenarios. Default entries (`baseline_profiled`
+  and `penalty_sweep_holdout`) can be overridden via `--matrix path/to/matrix.json` where the JSON
+  contains either `{"scenarios": [...]}` or a plain list.
+- The orchestrator tails trainer stdout and writes progress/last-log snapshots plus the most recent
+  metrics summaries into `var/smoke_train/benchmarks.json`. Agents looking for real-time signals
+  should watch this file instead of parsing console output.
+- Each scenario automatically exports `--metrics-export` data to
+  `var/smoke_train/metrics/<scenario>.json`, so downstream analysis can pull structured summaries as
+  soon as a scenario finishes. The benchmark file records those paths per scenario.
+- Per-scenario environment overrides (`DBSLM_SQLITE_PATH`, `DBSLM_CHEETAH_DATABASE`) keep SQLite and
+  cheetah namespaces isolated, allowing the smoke train to stop one DB session and spin up another
+  without restarting the Go service. Override the cheetah namespace manually by setting
+  `DBSLM_CHEETAH_DATABASE` before launching any CLI if you need ad-hoc names outside the matrix.
+- Use `--scenarios a,b` or `SMOKE_SCENARIOS=a,b` to run a subset, `--resume-from name` to skip ahead,
+  and `--dry-run` to print the commands while still updating `benchmarks.json` for planning.
 
 ### MariaDB Handoff
 

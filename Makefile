@@ -1,23 +1,20 @@
 PYTHON ?= python3
-SMOKE_DB ?= var/smoke-train.sqlite3
+SMOKE_SCENARIOS ?=
+SMOKE_DATASET ?=
+SMOKE_MATRIX ?=
+SMOKE_BENCH ?=
 
 .PHONY: smoke-train clean-smoke
 
+SMOKE_ARGS :=
+SMOKE_ARGS += $(if $(SMOKE_SCENARIOS),--scenarios $(SMOKE_SCENARIOS),)
+SMOKE_ARGS += $(if $(SMOKE_DATASET),--dataset $(SMOKE_DATASET),)
+SMOKE_ARGS += $(if $(SMOKE_MATRIX),--matrix $(SMOKE_MATRIX),)
+SMOKE_ARGS += $(if $(SMOKE_BENCH),--benchmarks $(SMOKE_BENCH),)
+
 smoke-train:
-	$(PYTHON) src/train.py datasets/emotion_data.json \
-		--db $(SMOKE_DB) \
-		--reset \
-		--json-chunk-size 120 \
-		--max-json-lines 400 \
-		--eval-interval 1500 \
-		--eval-samples 2 \
-		--eval-pool-size 40 \
-		--profile-ingest
-	$(PYTHON) src/run.py \
-		--db $(SMOKE_DB) \
-		--prompt "Summarize how the DB-SLM handles short validation runs." \
-		--user smoke-test \
-		--agent db-slm
+	$(PYTHON) scripts/smoke_train.py $(SMOKE_ARGS)
 
 clean-smoke:
-	rm -f $(SMOKE_DB)
+	rm -f var/smoke-train-baseline.sqlite3 var/smoke-train-penalty.sqlite3
+	rm -rf var/smoke_train

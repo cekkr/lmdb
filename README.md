@@ -265,15 +265,31 @@ sentences referencing the prompt keywords so ROUGE/perplexity measurements never
 
 ## Smoke Testing
 
-A minimal regression path is wired to `make smoke-train`. It performs a capped ingest (400 NDJSON
-lines), runs the periodic evaluation probes with the new metrics, and issues a single REPL-style
-prompt so CI or local developers can confirm the full pipeline still works:
+`make smoke-train` now shells into `scripts/smoke_train.py`, which executes a configurable matrix of
+scenarios in series while streaming their progress into `var/smoke_train/benchmarks.json`. The
+default suite contains two complementary runs:
 
-```bash
-make smoke-train
-```
+- `baseline_profiled` reproduces the original capped ingest (400 NDJSON rows, profiling enabled) and
+  keeps the existing probe cadence.
+- `penalty_sweep_holdout` trims ingest to 240 rows, enables chunk hold-outs, and overrides the
+  decoder penalties/context-dimension spans to stress the repetition guards.
 
-Use `make clean-smoke` to remove the temporary database when you're done.
+Each scenario receives its own SQLite file plus a dedicated `DBSLM_CHEETAH_DATABASE` namespace, so
+the Go service can be pointed at different logical stores without restarting. The script tails the
+trainer stdout, updates the benchmark JSON with progress percentages, token counts, and the latest
+log lines, and drops the full evaluation payload for every run under
+`var/smoke_train/metrics/<scenario>.json`. External agents (or another terminal) can watch the
+benchmark file to decide when to halt, resume, or reprioritize scenarios in real time.
+
+Key flags:
+
+- Limit the matrix: `make smoke-train SMOKE_SCENARIOS=baseline_profiled` (comma-separated names) or
+  `scripts/smoke_train.py --scenarios baseline_profiled,penalty_sweep_holdout`.
+- Feed a custom JSON matrix: `make smoke-train SMOKE_MATRIX=studies/my_smoke_matrix.json`.
+- Preview without running anything: `scripts/smoke_train.py --dry-run`.
+- Override the benchmark location: `make smoke-train SMOKE_BENCH=var/smoke_train/custom.json`.
+
+Use `make clean-smoke` to delete the per-scenario SQLite files and the `var/smoke_train` artifacts.
 
 ## SQLite vs. MariaDB Workflow
 
