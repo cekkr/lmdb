@@ -174,6 +174,11 @@ change so the next agent inherits the latest context.
 
 - Start `cheetah-db/cheetah-server` before running the Python CLI. `DBSLM_BACKEND` defaults to
   `cheetah-db`, so Level 1 lookups hit the Go service automatically.
+- The trainer now refuses to silently fall back to SQLite when `DBSLM_BACKEND=cheetah-db`. If the
+  Go server is down or you forgot to launch `cheetah-db/cheetah-server`, `src/train.py` exits with
+  an error unless you explicitly pass `--backonsqlite` (intended only for emergency smoke reruns).
+  Keep the compiled server running in parallel with every ingest/smoke session to avoid wasting
+  runs on the wrong backend.
 - There is no SQL migration step or MariaDB destination anymore. Reset SQLite in place when you
   need a clean rebuild; cheetah already mirrors every context/top-K slice as part of the ingest loop.
 - Watch `DBSLMEngine.cheetah_topk_ratio()` (or the training log line) to confirm cache coverage stays

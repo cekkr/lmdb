@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     resource = None  # type: ignore
 
 from db_slm import DBSLMEngine
+from db_slm.adapters.base import NullHotPathAdapter
 from db_slm.context_dimensions import (
     DEFAULT_CONTEXT_DIMENSIONS,
     format_context_dimensions,
@@ -151,6 +152,14 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help=(
             "Override DecoderConfig.frequency_penalty during evaluation probes/hold-outs "
             "(default: decoder profile value)."
+        ),
+    )
+    parser.add_argument(
+        "--backonsqlite",
+        action="store_true",
+        help=(
+            "Permit a SQLite-only fallback when DBSLM_BACKEND=cheetah-db but the cheetah server is unavailable. "
+            "Default behavior aborts instead of silently downgrading."
         ),
     )
     return parser
@@ -551,6 +560,15 @@ def main() -> None:
         context_dimensions=context_dimensions,
         settings=settings,
     )
+    cheetah_primary = settings.backend == "cheetah-db" and not settings.cheetah_mirror
+    if cheetah_primary and isinstance(engine.hot_path, NullHotPathAdapter):
+        if not args.backonsqlite:
+            engine.db.close()
+            parser.error(
+                "cheetah-db backend unreachable. Start cheetah-db/cheetah-server or rerun with --backonsqlite "
+                "to allow the SQLite fallback."
+            )
+        log("[train] Warning: cheetah-db backend unreachable; proceeding on SQLite because --backonsqlite was set.")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
     if run_metadata is not None:
