@@ -42,6 +42,9 @@ python3.11 src/train.py var/eval_logs/quality_retrain_queue.jsonl \
 
 - Disable streaming probes so all wall clock goes to ingesting the remediation samples.
 - Keep `--json-chunk-size` around 200 because the queue entries are short; larger batches make it easier to correlate improvements once reintroduced in the main corpus.
+- `scripts/drain_queue.py` wraps this preset: it watches `DBSLM_QUALITY_QUEUE_PATH`, fires the above
+  command when the queue exceeds `--threshold` (defaults to 150), and prints the metrics path +
+  throughput so you can log the drain in `studies/BENCHMARKS.md`.
 
 ## Baseline Throughput Probe
 

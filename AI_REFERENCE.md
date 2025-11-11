@@ -36,6 +36,13 @@ change so the next agent inherits the latest context.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
   real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`.
+- Context relativism is now first-class: `AbsoluteVectorOrder` deterministically sorts nested token
+  structures and mirrors them into the `ctxv:` namespace, `DBSLMEngine.context_relativism()` streams
+  probabilistic projections directly from cheetah, and `Decoder` falls back to those slices whenever
+  a Top-K entry is missing.
+- `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
+  MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
+  exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
 - Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
   via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
   truncated generations.
@@ -126,11 +133,25 @@ change so the next agent inherits the latest context.
   writes live stats to `var/smoke_train/benchmarks.json`, and exposes switches (see `SMOKE_*` vars in
   the `Makefile`) so you can resume or subset the matrix without editing the script.
 
+### Queue-Drain Runs
+
+- `scripts/drain_queue.py` automates the `Queue-Drain Retrain` preset from `studies/best_commands.md`.
+  It inspects `DBSLM_QUALITY_QUEUE_PATH`, skips execution until the line count exceeds the provided
+  `--threshold` (default 150), then shells out to `python3.14 src/train.py ...` with the documented
+  flags. The helper always exports metrics to `var/eval_logs/train-queue-drain-*.json` and prints the
+  resulting throughput so you can append the run to `studies/BENCHMARKS.md`.
+- Pass `--dry-run` to preview the exact command, or `--queue /path/to/file`/`--python` when running
+  against alternate datasets or virtual environments.
+
 ### Smoke-Train Matrix
 
 - `scripts/smoke_train.py` orchestrates sequential scenarios. Default entries (`baseline_profiled`
   and `penalty_sweep_holdout`) can be overridden via `--matrix path/to/matrix.json` where the JSON
   contains either `{"scenarios": [...]}` or a plain list.
+- `scripts/drain_queue.py` automates the queue-drain preset: it checks line counts inside
+  `DBSLM_QUALITY_QUEUE_PATH`, shells into the documented `python3.14 src/train.py ...` command when
+  the threshold is crossed, and reports throughput so the run can be logged in
+  `studies/BENCHMARKS.md`.
 - The orchestrator tails trainer stdout and writes progress/last-log snapshots plus the most recent
   metrics summaries into `var/smoke_train/benchmarks.json`. Agents looking for real-time signals
   should watch this file instead of parsing console output.
@@ -162,17 +183,17 @@ change so the next agent inherits the latest context.
   considered legacy. Keep it only for metadata bootstrapping while the Level 1 pipelines move over
   to cheetah; new work should avoid adding features that would be SQLite-only and instead target the
   Go engine.
-- `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts and Top-K
-  slices. Keeping `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and enabling
-  `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS Top-K
-  bucket into the Go service via its TCP commands; the decoder then queries cheetah first and falls
-  back to SQLite when a key is missing. As of this pass:
-  - the trie now exposes a `PAIR_SCAN` streaming command so ordered byte slices can be pulled
-    without touching SQLite, and the Python adapter exposes it via
-    `HotPathAdapter.scan_namespace()/CheetahClient.pair_scan`;
-  - server-side reducers/stats refreshers are still pending so MKNS rebuilds can stay inside
-    cheetah;
-  - brute-force sweep helpers are still required so Level 2/3 jobs can shard across cheetah files.
+- `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts, Top-K slices, and
+  raw follower counts. Keeping `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and
+  enabling `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS
+  Top-K bucket into the Go service via its TCP commands; the decoder then queries cheetah first and
+  falls back to SQLite only when a key is missing. As of this pass:
+  - the trie exposes `PAIR_SCAN` plus `PAIR_REDUCE counts`, so MKNS rebuilds and cache coverage
+    metrics stream directly from Go without materializing temporary tables in SQLite;
+  - the absolute vector ordering codec (`ctxv:` namespace) allows byte-identical context relativism,
+    enabling nested queries + decoder fallbacks via `engine.context_relativism()`; and
+  - metadata (context dimensions, decode presets, etc.) now lives in cheetah namespaces so new
+    processes can cold-start with zero SQLite reads beyond the base schema.
   Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
   `cheetah-db/README.md` for future agents, since the roadmap now aims to delete the remaining
   SQLite-only code paths once the reducers land.

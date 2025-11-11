@@ -162,9 +162,14 @@ discovered context plus its Top-K probability slices into cheetah-db as part of 
 `DBSLM_BACKEND=cheetah-db` keeps the decoder entirely on the Go engine, so Level 1 lookups never
 round-trip through SQLite. The adapter now tracks cache coverage
 (`DBSLMEngine.cheetah_topk_ratio()`) and exposes namespace scanners plus the new
-`engine.context_relativism([...])` helper for probabilistic trie queries. SQLite still persists the
-authoritative rows for bulk rebuilds, but there is no secondary database to drain—cheetah already
-holds the hot/archived copies in one place.
+`engine.context_relativism([...])` helper for probabilistic trie queries. Every context mirrored into
+cheetah also gets an Absolute Vector Order signature (`ctxv:` namespace) so nested context requests
+([[token arrays], ...]) are deterministically sorted and can be re-hydrated via `PAIR_SCAN` alone.
+`Decoder` now falls back to those relativistic slices whenever cheetah misses a direct Top-K entry.
+MKNS rebuilds mirror raw follower counts through the new `PAIR_REDUCE counts` RPC, so server-side
+reducers stream the context registry straight from Go and delete the last SQLite-only temporary
+tables. SQLite still persists the authoritative rows for bulk rebuilds, but there is no secondary
+database to drain—cheetah already holds the hot/archived copies in one place.
 
 ### Training-Time Metrics
 
@@ -208,6 +213,14 @@ drop the file back into `train.py` as an evaluation dataset and the weakest samp
 attention during the next ingest. Heavy grammar/semantic scoring only runs when the adaptive CPU
 guard detects spare headroom, so long streaming ingests do not pay a latency penalty on saturated
 laptops.
+
+### Queue-Drain Automation
+
+Use `scripts/drain_queue.py` when the retrain queue approaches 150 entries. The helper inspects
+`DBSLM_QUALITY_QUEUE_PATH`, runs the documented queue-drain preset via `python3.14 src/train.py ...`,
+and writes the resulting metrics JSON path + throughput back to stdout so you can log the cleanup
+inside `studies/BENCHMARKS.md`. Pass `--threshold <value>` to tune when the drain should fire or
+`--dry-run` to print the command without launching a run.
 
 ## Inference CLI (`src/run.py`)
 

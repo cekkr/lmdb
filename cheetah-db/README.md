@@ -69,6 +69,15 @@ adapter status stays visible to future maintainers.
   `HotPathAdapter.scan_namespace()` helper, so DB-SLM can iterate over namespaces (contexts, cached
   Top-K buckets, etc.) without touching SQLite. The next integration step is to route Level 1 reads
   (context registry, Top-K coverage checks) through this iterator so SQLite/MariaDB can be removed.
+- Absolute vector ordering is live: each context now gets a deterministic `ctxv:` alias derived from
+  the nested token structure. `engine.context_relativism()` streams the corresponding contexts +
+  ranked continuations directly from `PAIR_SCAN ctxv:`, and the decoder uses those slices whenever
+  a Top-K entry is missing.
+- `PAIR_REDUCE counts` aggregates follower counts in-place so MKNS rebuilds can pull entire context
+  registries through TCP. The Python smoother mirrors those projections back into `cnt:<order>`
+  namespaces after every rebuild, keeping Go + SQLite in sync without extra SQL.
+- Metadata (context dimensions, decode profiles, cache lambdas) is persisted under the `meta:`
+  namespace so new Python processes can cold-start without re-reading SQLite tables.
 - Upcoming roadmap items (statistical reducers, ordered trie slices) should extend the same adapter
   so DB-SLM can eventually run entirely on the Go engine once Level 2/3 tables get equivalents.
 
@@ -104,6 +113,16 @@ stores in either mode.
   `HotPathAdapter.scan_namespace()`, which automatically expand namespace strings (e.g., `ctx:`) and
   strip the prefix from the returned values.
 
+### Reducer hooks
+
+- `PAIR_REDUCE <mode> <prefix> [limit]` piggybacks on the pair iterator but applies lightweight
+  reducers server-side before returning results. The first implemented mode (`PAIR_REDUCE counts
+  cnt:<order>`) streams raw follower counts for all contexts mirrored in `cnt:` namespaces so Python
+  can rebuild MKNS statistics without hitting SQLite.
+- Future reducers (`PAIR_REDUCE probs`, `PAIR_REDUCE queue-drain`, etc.) should follow the same
+  union-by-mode pattern. Update `cheetah-db/CONCEPTS.md` when adding new modes so the RPC contract
+  remains easy to discover from the Go side.
+
 ## Directory map
 
 - `commands.go` – user-facing operations (INSERT/READ/EDIT/DELETE/PAIRSET/PAIRGET/etc.).
@@ -115,15 +134,11 @@ stores in either mode.
 
 ## Next steps
 
-- Design the DB-SLM adapter boundary (likely a lightweight RPC with commands for context registry,
-  Level 1 counts, Level 2 logs, and Level 3 concept tables).
-- Route Level 1 context lookups + Top-K cache refreshes through the new streaming iterator so SQLite
-  falls completely out of the decode path.
-- Port at least one hot path (e.g., `tbl_l1_context_registry`) to `cheetah-db` and validate that
-  rebuild times beat the SQLite baseline, capturing before/after metrics in this README.
-- Implement reducer RPCs so MKNS rebuilds, counts-of-counts, and Low-Resource caches never have to
-  bounce through SQLite temporary tables.
-- Add regression tests once the adapter contract is defined; keep them focused on byte-ordering and
-  deterministic offsets so refactors remain safe.
-- Delete the MariaDB flusher + environment knobs as soon as cheetah owns archival duties, documenting
-  the migration plan here so the Python stack can drop that dependency entirely.
+- Expand `PAIR_REDUCE` beyond counts (probabilities/backoff slices) so MKNS can stream quantized
+  rows directly from Go.
+- Plumb ordered sweeps for Level 2/3 namespaces so cache/bias/concept jobs never have to query
+  SQLite once the metadata tables are fully mirrored.
+- Capture decoder latency + Top-K hit-rate snapshots in this README after each cheetah-only smoke
+  train so we can watch coverage trend toward 100%.
+- Add regression tests around absolute-vector ordering and reducer semantics to guard the binary
+  layouts before we start inlining cheetah inside the Python repo.
