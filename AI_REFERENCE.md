@@ -146,16 +146,15 @@ change so the next agent inherits the latest context.
 - `mariadb` is the current cold-storage / replication target. The migration script + flusher expect a
   1:1 column layout with SQLite tables, so any schema edits must land in both backends before new
   ingests run.
-- `cheetah-mldb` (see `cheetah-mldb/`) is now tracked as the ultra-rapid adapter meant to replace
-  SQLite once its fork from the standalone “cheetah” engine is re-implemented for LMDB. The Go
-  service must expose:
-  - rapid statistical aggregation primitives so probability buckets can be recomputed without the
-    Python side materializing large intermediate sets;
-  - byte-oriented key contextualization and deterministic auto-sorting of dynamic sets so context
-    expansion / vector-matrix ordering mirrors the DB-SLM expectations without custom retraining;
-  - brute-force relationship sweeps across multi-file storage so matrix ordering stays single-source
-    while still letting us shard hot data across disks for higher throughput.
-  Until those behaviors exist, keep `cheetah-mldb` flagged as **in-progress** in `NEXT_STEPS.md`,
-  wire it into the adapter registry, and document any interoperability assumptions inside
-  `cheetah-mldb/README.md` so future agents can continue the porting effort without rediscovering the
-  base requirements.
+- `cheetah-mldb` (see `cheetah-mldb/`) now doubles as the hot-path mirror for contexts and Top-K
+  slices. Setting `DBSLM_BACKEND=cheetah-mldb` (or leaving the backend as `sqlite` and enabling
+  `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS Top-K
+  bucket into the Go service via its TCP commands; the decoder then queries cheetah first and falls
+  back to SQLite when a key is missing. This satisfies the “adapter boundary” item on the roadmap
+  and gives us byte-faithful keying plus deterministic Top-K ordering without paying extra SQL
+  round-trips. The remaining roadmap items still stand:
+  - expose server-side reducers so Level 1 statistics can be recomputed in place;
+  - extend the pair trie RPCs to stream ordered slices by byte range;
+  - add brute-force sweep helpers so Level 2/3 jobs can shard across cheetah files.
+  Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
+  `cheetah-mldb/README.md` for future agents.

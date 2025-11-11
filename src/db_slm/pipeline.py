@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
+from .adapters.cheetah import build_cheetah_adapter
 from .context_dimensions import (
     ContextDimension,
     DEFAULT_CONTEXT_DIMENSIONS,
@@ -34,10 +35,17 @@ class DBSLMEngine:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
         self.context_dimensions = self._init_context_dimensions(context_dimensions)
+        self.hot_path = build_cheetah_adapter(self.settings)
         self.vocab = Vocabulary(self.db)
         self.tokenizer = Tokenizer(self.vocab)
         self.quantizer = LogProbQuantizer(self.db)
-        self.store = NGramStore(self.db, self.vocab, ngram_order, self.quantizer)
+        self.store = NGramStore(
+            self.db,
+            self.vocab,
+            ngram_order,
+            self.quantizer,
+            hot_path=self.hot_path,
+        )
         self.smoother = MKNSmoother(self.db, self.store, self.quantizer)
         self.memory = ConversationMemory(self.db)
         self.cache = SessionCache(self.db)

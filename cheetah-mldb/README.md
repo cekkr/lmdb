@@ -54,6 +54,20 @@ the engine must grow the following behaviors:
 Document every milestone in `AI_REFERENCE.md` and flag missing capabilities in `NEXT_STEPS.md` so the
 adapter status stays visible to future maintainers.
 
+## Python bridge status
+
+- `src/db_slm` now includes a `cheetah-mldb` hot-path adapter. Set `DBSLM_BACKEND=cheetah-mldb` (or
+  `DBSLM_CHEETAH_MIRROR=1` to mirror without switching the primary backend) and start the Go server
+  before running `src/train.py`/`src/run.py`.
+- The trainer publishes every newly discovered context plus the Top-K quantized probabilities
+  produced by the MKNS smoother through the TCP API (`INSERT`, `PAIR_SET`, etc.), so low-latency
+  reads land in cheetah while SQLite remains authoritative for schema-wide updates.
+- The decoder consults the cheetah mirror first when sampling candidates; if the Go service is
+  offline or missing a context, it automatically falls back to SQLite. This gives us byte-faithful
+  keying and immediate Top-K slices with no additional SQL load.
+- Upcoming roadmap items (statistical reducers, ordered trie slices) should extend the same adapter
+  so DB-SLM can eventually run entirely on the Go engine once Level 2/3 tables get equivalents.
+
 ## Build & run
 
 ```bash

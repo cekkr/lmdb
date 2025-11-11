@@ -6,6 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
+from .adapters.base import HotPathAdapter, NullHotPathAdapter
+
 from .db import DatabaseEnvironment
 
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
@@ -139,11 +141,20 @@ class LogProbQuantizer:
 class NGramStore:
     """Handles ingestion and retrieval of Level 1 statistics."""
 
-    def __init__(self, db: DatabaseEnvironment, vocab: Vocabulary, order: int, quantizer: LogProbQuantizer) -> None:
+    def __init__(
+        self,
+        db: DatabaseEnvironment,
+        vocab: Vocabulary,
+        order: int,
+        quantizer: LogProbQuantizer,
+        *,
+        hot_path: HotPathAdapter | None = None,
+    ) -> None:
         self.db = db
         self.vocab = vocab
-        self.order = order
+        self.order = max(2, order)
         self.quantizer = quantizer
+        self.hot_path = hot_path or NullHotPathAdapter()
 
     # ------------------------------------------------------------------ #
     # Ingestion
@@ -225,12 +236,24 @@ class NGramStore:
             """,
             (context_hash, len(token_ids), token_blob, parent),
         )
+        self.hot_path.publish_context(context_hash, len(token_ids), token_ids)
 
     # ------------------------------------------------------------------ #
     # Retrieval
     # ------------------------------------------------------------------ #
     def get_topk(self, context_ids: Sequence[int], order: int, k: int) -> List[TokenCandidate]:
         context_hash = self._hash(context_ids[-(order - 1) :]) if order > 1 else "__root__"
+        cached = self.hot_path.fetch_topk(order, context_hash, k)
+        if cached:
+            return [
+                TokenCandidate(
+                    token_id,
+                    self.vocab.token_text(token_id),
+                    self.quantizer.dequantize_prob(q),
+                    q,
+                )
+                for token_id, q in cached[:k]
+            ]
         table = self._topk_table(order)
         rows = self.db.query(
             f"""
@@ -340,6 +363,16 @@ class NGramStore:
             f"INSERT OR REPLACE INTO {topk_table}(context_hash, k_rank, next_token_id, q_logprob) VALUES (?, ?, ?, ?)",
             topk_rows,
         )
+        self._sync_topk(order, topk_rows)
+
+    def _sync_topk(self, order: int, topk_rows: List[Tuple[str, int, int, int]]) -> None:
+        if not topk_rows:
+            return
+        grouped: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        for context_hash, _rank, token_id, q in topk_rows:
+            grouped[context_hash].append((token_id, q))
+        for context_hash, ranked in grouped.items():
+            self.hot_path.publish_topk(order, context_hash, ranked)
 
 
 class MKNSmoother:

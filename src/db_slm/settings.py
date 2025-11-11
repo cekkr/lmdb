@@ -38,6 +38,11 @@ class DBSLMSettings:
     sqlite_flush_threshold_mb: int
     sqlite_flush_batch_size: int
     sqlite_flush_cold_threshold: int
+    cheetah_host: str
+    cheetah_port: int
+    cheetah_database: str
+    cheetah_timeout_seconds: float
+    cheetah_mirror: bool
 
     def sqlite_dsn(self) -> str:
         """Return the SQLite DSN currently used by the CLI utilities."""
@@ -75,6 +80,12 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     flush_threshold = int(read("DBSLM_SQLITE_FLUSH_THRESHOLD_MB", "1024"))
     flush_batch = int(read("DBSLM_SQLITE_FLUSH_BATCH", "500"))
     flush_cold_threshold = int(read("DBSLM_SQLITE_FLUSH_COLD_THRESHOLD", "2"))
+    cheetah_host = read("DBSLM_CHEETAH_HOST", "127.0.0.1")
+    cheetah_port = int(read("DBSLM_CHEETAH_PORT", "4455"))
+    cheetah_database = read("DBSLM_CHEETAH_DATABASE", "default")
+    cheetah_timeout_seconds = float(read("DBSLM_CHEETAH_TIMEOUT_SECONDS", "1.0"))
+    mirror_flag = read("DBSLM_CHEETAH_MIRROR", "0").lower()
+    cheetah_mirror = mirror_flag in {"1", "true", "yes", "on"}
 
     env_file_used = env_file if env_file.exists() else None
     return DBSLMSettings(
@@ -92,4 +103,9 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         sqlite_flush_threshold_mb=flush_threshold,
         sqlite_flush_batch_size=flush_batch,
         sqlite_flush_cold_threshold=flush_cold_threshold,
+        cheetah_host=cheetah_host,
+        cheetah_port=cheetah_port,
+        cheetah_database=cheetah_database,
+        cheetah_timeout_seconds=cheetah_timeout_seconds,
+        cheetah_mirror=cheetah_mirror,
     )
