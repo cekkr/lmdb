@@ -153,7 +153,9 @@ via `DBSLM_EMBEDDER_MODEL`). Each segment is annotated with a compact embedding 
 tokenizer, ensuring the vocabulary learns explicit emotional cues and higher quality boundary splits
 even while the underlying Level 1 tables remain purely relational. When the optional dependency is
 missing, the pipeline falls back to deterministic hashed vectors so tokenization still benefits from
-the dataset profiler.
+the dataset profiler. To avoid Hugging Face downloads entirely (e.g., in CI or air-gapped labs), set
+`DBSLM_EMBEDDER_OFFLINE=1` or choose `DBSLM_EMBEDDER_MODEL=hashed` and the hashed guidance path is
+used from the start.
 
 ### cheetah Streaming Archive
 

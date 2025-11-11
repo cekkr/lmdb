@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import statistics
 import threading
 from collections import Counter
@@ -115,7 +116,48 @@ class ExternalEmbedder:
         self._device = "cpu"
         self._warned = False
         self._load_lock = threading.Lock()
+        self._probe_host = os.environ.get("DBSLM_EMBEDDER_PROBE_HOST", "huggingface.co")
+        self._offline_forced = self._offline_mode_requested()
+        self._local_override = self._looks_like_local_model()
+        if self._offline_forced:
+            self._announce_offline("offline mode requested")
+            return
+        if not self._local_override and not self._can_reach_probe_host():
+            self._announce_offline(f"{self._probe_host} unreachable")
+            return
         self._load_model()
+
+    def _offline_mode_requested(self) -> bool:
+        flag = os.environ.get("DBSLM_EMBEDDER_OFFLINE")
+        if flag and flag.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        normalized = (self.model_name or "").strip().lower()
+        return normalized in {"hashed", "hash", "offline", "disabled", "none"}
+
+    def _looks_like_local_model(self) -> bool:
+        if not self.model_name:
+            return False
+        candidate = self.model_name.strip()
+        if candidate.startswith(("/", "./", "../")):
+            return True
+        if os.path.sep in candidate or candidate.endswith(".pt") or candidate.endswith(".bin"):
+            return True
+        return os.path.exists(candidate)
+
+    def _can_reach_probe_host(self) -> bool:
+        host = self._probe_host.strip()
+        if not host:
+            return False
+        try:
+            socket.getaddrinfo(host, None)
+            return True
+        except OSError:
+            return False
+
+    def _announce_offline(self, reason: str) -> None:
+        if not self._warned:
+            print(f"[embedding] External embedder disabled ({reason}); using hashed vectors.")
+            self._warned = True
 
     def _load_model(self) -> None:
         with self._load_lock:
@@ -273,4 +315,3 @@ class SentencePartEmbeddingPipeline:
         else:
             limit = 3
         return candidates[:limit]
-

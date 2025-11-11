@@ -35,7 +35,8 @@ change so the next agent inherits the latest context.
   the trainer is spending time.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
-  real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`.
+  real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`, or force hashed-only,
+  offline guidance (no Hugging Face downloads) via `DBSLM_EMBEDDER_OFFLINE=1`.
 - Context relativism is now first-class: `AbsoluteVectorOrder` deterministically sorts nested token
   structures and mirrors them into the `ctxv:` namespace, `DBSLMEngine.context_relativism()` streams
   probabilistic projections directly from cheetah, and `Decoder` falls back to those slices whenever
