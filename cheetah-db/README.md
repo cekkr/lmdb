@@ -1,15 +1,15 @@
-# cheetah-mldb
+# cheetah-db
 
 Ultra-rapid key/value database engine being refit to serve as the low-latency adapter for the LMDB
 Python project (`src/db_slm`). The original “cheetah” fork already implements a byte-oriented storage
 engine in Go; this directory tracks the work needed to evolve it into a drop-in backend (`backend =
-cheetah-mldb`) for the DB-SLM stack.
+cheetah-db`) for the DB-SLM stack.
 
 ## Why it exists
 
 - **Bridge for extreme-latency workloads.** SQLite remains the reference implementation, but it tops
   out when Level 1 counts, caches, and Level 2 conversation traces all compete for the same file.
-  `cheetah-mldb` is meant to absorb those hot paths with a persistent, mmap-friendly layout and a
+  `cheetah-db` is meant to absorb those hot paths with a persistent, mmap-friendly layout and a
   purpose-built TCP/CLI front end.
 - **Byte-faithful keying.** Each entry is cataloged by byte length and stored inside homogenous
   tables (`values_<size>_<tableID>.table`), keeping lookups O(1) with deterministic offsets.
@@ -37,11 +37,11 @@ cheetah-mldb`) for the DB-SLM stack.
 
 ## Adapter goals for DB-SLM
 
-To register `cheetah-mldb` as a DB adapter alongside SQLite and MariaDB (`DBSLMSettings.backend`),
+To register `cheetah-db` as a DB adapter alongside SQLite and MariaDB (`DBSLMSettings.backend`),
 the engine must grow the following behaviors:
 
 1. **Rapid statistical computation + caching.** Level 1 relies on large fan-out aggregations (counts,
-   continuation tables, quantized probabilities, Top-K ranks). `cheetah-mldb` must expose batched
+   continuation tables, quantized probabilities, Top-K ranks). `cheetah-db` must expose batched
    reducers or server-side stored procedures so the Python side can trigger recomputation without
    copying data back to SQLite first.
 2. **Byte-based contextualization.** DB-SLM contexts are byte-tokenized hashes. The pair tables need
@@ -56,7 +56,7 @@ adapter status stays visible to future maintainers.
 
 ## Python bridge status
 
-- `src/db_slm` now includes a `cheetah-mldb` hot-path adapter. Set `DBSLM_BACKEND=cheetah-mldb` (or
+- `src/db_slm` now includes a `cheetah-db` hot-path adapter. Set `DBSLM_BACKEND=cheetah-db` (or
   `DBSLM_CHEETAH_MIRROR=1` to mirror without switching the primary backend) and start the Go server
   before running `src/train.py`/`src/run.py`.
 - The trainer publishes every newly discovered context plus the Top-K quantized probabilities
@@ -71,7 +71,7 @@ adapter status stays visible to future maintainers.
 ## Build & run
 
 ```bash
-cd cheetah-mldb
+cd cheetah-db
 go test ./...        # once tests exist
 bash build.sh        # produces ./cheetah-server
 ./cheetah-server     # starts TCP server + interactive CLI
@@ -102,7 +102,7 @@ stores in either mode.
 
 - Design the DB-SLM adapter boundary (likely a lightweight RPC with commands for context registry,
   Level 1 counts, Level 2 logs, and Level 3 concept tables).
-- Port at least one hot path (e.g., `tbl_l1_context_registry`) to `cheetah-mldb` and validate that
+- Port at least one hot path (e.g., `tbl_l1_context_registry`) to `cheetah-db` and validate that
   rebuild times beat the SQLite baseline.
 - Extend the pair trie APIs so they can return ordered slices keyed by byte-range filters—this is the
   prerequisite for “rapid key contextualization” described in `CONCEPTS.md`.

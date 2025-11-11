@@ -146,8 +146,8 @@ change so the next agent inherits the latest context.
 - `mariadb` is the current cold-storage / replication target. The migration script + flusher expect a
   1:1 column layout with SQLite tables, so any schema edits must land in both backends before new
   ingests run.
-- `cheetah-mldb` (see `cheetah-mldb/`) now doubles as the hot-path mirror for contexts and Top-K
-  slices. Setting `DBSLM_BACKEND=cheetah-mldb` (or leaving the backend as `sqlite` and enabling
+- `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts and Top-K
+  slices. Setting `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and enabling
   `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS Top-K
   bucket into the Go service via its TCP commands; the decoder then queries cheetah first and falls
   back to SQLite when a key is missing. This satisfies the “adapter boundary” item on the roadmap
@@ -157,4 +157,4 @@ change so the next agent inherits the latest context.
   - extend the pair trie RPCs to stream ordered slices by byte range;
   - add brute-force sweep helpers so Level 2/3 jobs can shard across cheetah files.
   Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
-  `cheetah-mldb/README.md` for future agents.
+  `cheetah-db/README.md` for future agents.

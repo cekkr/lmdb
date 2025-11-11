@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 class CheetahError(RuntimeError):
-    """Raised when the cheetah-mldb bridge encounters a fatal error."""
+    """Raised when the cheetah-db bridge encounters a fatal error."""
 
 
 class CheetahClient:
-    """Minimal TCP client for cheetah-mldb's newline-delimited protocol."""
+    """Minimal TCP client for cheetah-db's newline-delimited protocol."""
 
     def __init__(
         self,
@@ -114,7 +114,7 @@ class CheetahClient:
             sock.settimeout(self.timeout)
             self._sock = sock
         except OSError as exc:
-            logger.debug("Unable to reach cheetah-mldb at %s:%s (%s)", self.host, self.port, exc)
+            logger.debug("Unable to reach cheetah-db at %s:%s (%s)", self.host, self.port, exc)
             self._sock = None
             return False
         if self.database and self.database != "default":
@@ -236,7 +236,7 @@ class CheetahSerializer:
 
 
 class CheetahHotPathAdapter(HotPathAdapter):
-    """Mirrors context metadata + Top-K slices into cheetah-mldb for low-latency reads."""
+    """Mirrors context metadata + Top-K slices into cheetah-db for low-latency reads."""
 
     def __init__(
         self,
@@ -348,7 +348,7 @@ def build_cheetah_adapter(
     *,
     client: CheetahClient | None = None,
 ) -> HotPathAdapter:
-    backend_active = settings.backend == "cheetah-mldb" or settings.cheetah_mirror
+    backend_active = settings.backend == "cheetah-db" or settings.cheetah_mirror
     if not backend_active:
         return NullHotPathAdapter()
     client = client or CheetahClient(

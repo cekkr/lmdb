@@ -4,7 +4,7 @@ from typing import Protocol, Sequence
 
 
 class HotPathAdapter(Protocol):
-    """Interface for optional low-latency mirrors such as cheetah-mldb."""
+    """Interface for optional low-latency mirrors such as cheetah-db."""
 
     def publish_context(self, context_hash: str, order_size: int, token_ids: Sequence[int]) -> None:
         """Persist context metadata so trie-style traversals avoid SQL lookups."""

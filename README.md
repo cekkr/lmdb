@@ -46,19 +46,19 @@ from the database.
 - Even though `.env` exposes MariaDB credentials, the reference CLI still targets SQLite until we run
   the schema migration step. Seeing no MySQL tables during local training is therefore expected.
 
-### cheetah-mldb hot path (optional)
+### cheetah-db hot path (optional)
 
-- `cheetah-mldb/` hosts the Go service that now acts as a low-latency mirror for Level 1 contexts.
-  Build it with `bash cheetah-mldb/build.sh` and launch `./cheetah-mldb/cheetah-server` before
+- `cheetah-db/` hosts the Go service that now acts as a low-latency mirror for Level 1 contexts.
+  Build it with `bash cheetah-db/build.sh` and launch `./cheetah-db/cheetah-server` before
   running the Python tools.
-- Set `DBSLM_BACKEND=cheetah-mldb` when you want the trainer/decoder to fetch Top-K slices from the
+- Set `DBSLM_BACKEND=cheetah-db` when you want the trainer/decoder to fetch Top-K slices from the
   Go engine instead of SQLite. When you only need a sidecar cache (SQLite remains canonical), leave
   the backend as `sqlite` and toggle `DBSLM_CHEETAH_MIRROR=1`.
 - The `DBSLM_CHEETAH_HOST/PORT/DATABASE` variables point the adapter at the right instance; the
-  default matches the server exposed by `cheetah-mldb/main.go`.
+  default matches the server exposed by `cheetah-db/main.go`.
 - During ingest the Python pipeline now streams new context metadata and Top-K probability slices
   into cheetah so the decoder can read them without re-querying SQLite, satisfying the first step of
-  the adapter roadmap outlined in `cheetah-mldb/README.md`.
+  the adapter roadmap outlined in `cheetah-db/README.md`.
 
 ## Training CLI (`src/train.py`)
 
