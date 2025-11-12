@@ -10,6 +10,7 @@ change so the next agent inherits the latest context.
   investigations.
 - Work incrementally, document breaking changes, and run the available build/test commands before
   yielding control.
+- Always launch long-running services and workloads (e.g., `cheetah-server`, smoke-train/benchmark runs, CI smoke tests) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent.
 
 ### Next Steps
 
