@@ -24,6 +24,8 @@ from .base import HotPathAdapter, NullHotPathAdapter
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_REDUCE_PAGE_SIZE = 1024
+
 
 class CheetahError(RuntimeError):
     """Raised when the cheetah-db bridge encounters a fatal error."""
@@ -90,23 +92,40 @@ class CheetahClient:
         response = self._command(f"PAIR_GET x{value.hex()}")
         return self._parse_key_response(response)
 
-    def pair_scan(self, prefix: bytes = b"", limit: int = 0) -> list[tuple[bytes, int]] | None:
+    def pair_scan(
+        self,
+        prefix: bytes = b"",
+        limit: int = 0,
+        cursor: bytes | None = None,
+    ) -> tuple[list[tuple[bytes, int]], bytes | None] | None:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_SCAN {arg}"
         if limit > 0:
             command = f"{command} {limit}"
+        if cursor:
+            if limit <= 0:
+                command = f"{command} 0"
+            command = f"{command} x{cursor.hex()}"
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
         return self._parse_pair_scan_response(response)
 
     def pair_reduce(
-        self, mode: str, prefix: bytes = b"", limit: int = 0
-    ) -> list[tuple[bytes, int, bytes | None]] | None:
+        self,
+        mode: str,
+        prefix: bytes = b"",
+        limit: int = 0,
+        cursor: bytes | None = None,
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_REDUCE {mode} {arg}"
         if limit != 0:
             command = f"{command} {limit}"
+        if cursor:
+            if limit == 0:
+                command = f"{command} 0"
+            command = f"{command} x{cursor.hex()}"
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
@@ -209,56 +228,78 @@ class CheetahClient:
         return None
 
     @staticmethod
-    def _parse_pair_scan_response(response: str) -> list[tuple[bytes, int]]:
+    def _parse_pair_scan_response(response: str) -> tuple[list[tuple[bytes, int]], bytes | None]:
         if not response.startswith("SUCCESS"):
-            return []
-        payload_start = response.find("items=")
-        if payload_start == -1:
-            return []
-        payload = response[payload_start + len("items=") :]
+            return [], None
+        header, payload = CheetahClient._split_response_sections(response)
+        next_cursor = CheetahClient._extract_cursor(header)
         entries: list[tuple[bytes, int]] = []
-        for item in payload.split(";"):
-            if not item:
-                continue
-            try:
-                value_hex, key_text = item.rsplit(":", 1)
-                value = bytes.fromhex(value_hex)
-                key = int(key_text)
-            except (ValueError, TypeError):
-                continue
-            entries.append((value, key))
-        return entries
+        if payload:
+            for item in payload.split(";"):
+                if not item:
+                    continue
+                try:
+                    value_hex, key_text = item.rsplit(":", 1)
+                    value = bytes.fromhex(value_hex)
+                    key = int(key_text)
+                except (ValueError, TypeError):
+                    continue
+                entries.append((value, key))
+        return entries, next_cursor
 
     @staticmethod
-    def _parse_pair_reduce_response(response: str) -> list[tuple[bytes, int, bytes | None]]:
+    def _parse_pair_reduce_response(
+        response: str,
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None]:
         if not response.startswith("SUCCESS"):
-            return []
-        payload_start = response.find("items=")
-        if payload_start == -1:
-            return []
-        payload = response[payload_start + len("items=") :]
+            return [], None
+        header, payload = CheetahClient._split_response_sections(response)
+        next_cursor = CheetahClient._extract_cursor(header)
         entries: list[tuple[bytes, int, bytes | None]] = []
-        for item in payload.split(";"):
-            if not item:
-                continue
-            parts = item.split(":")
-            if len(parts) < 2:
-                continue
-            value_hex = parts[0]
-            key_text = parts[1]
-            blob: bytes | None = None
-            if len(parts) > 2:
+        if payload:
+            for item in payload.split(";"):
+                if not item:
+                    continue
+                parts = item.split(":")
+                if len(parts) < 2:
+                    continue
+                value_hex = parts[0]
+                key_text = parts[1]
+                blob: bytes | None = None
+                if len(parts) > 2:
+                    try:
+                        blob = base64.b64decode(parts[2].encode("ascii"))
+                    except (ValueError, binascii.Error):
+                        blob = None
                 try:
-                    blob = base64.b64decode(parts[2].encode("ascii"))
-                except (ValueError, binascii.Error):
-                    blob = None
-            try:
-                value = bytes.fromhex(value_hex)
-                key = int(key_text)
-            except (ValueError, TypeError):
-                continue
-            entries.append((value, key, blob))
-        return entries
+                    value = bytes.fromhex(value_hex)
+                    key = int(key_text)
+                except (ValueError, TypeError):
+                    continue
+                entries.append((value, key, blob))
+        return entries, next_cursor
+
+    @staticmethod
+    def _split_response_sections(response: str) -> tuple[str, str]:
+        marker = ",items="
+        payload_start = response.find(marker)
+        if payload_start == -1:
+            return response, ""
+        header = response[:payload_start]
+        payload = response[payload_start + len(marker) :]
+        return header, payload
+
+    @staticmethod
+    def _extract_cursor(header: str) -> bytes | None:
+        for part in header.split(","):
+            if part.startswith("next_cursor="):
+                token = part.split("=", 1)[1]
+                if token.startswith("x"):
+                    try:
+                        return bytes.fromhex(token[1:])
+                    except ValueError:
+                        return None
+        return None
 
 
 @dataclass(frozen=True)
@@ -679,15 +720,28 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return []
         namespace_bytes = namespace.encode("utf-8") + b":"
         scoped_prefix = namespace_bytes + prefix
-        results = self._client.pair_scan(scoped_prefix, limit=limit)
-        if results is None:
-            self._disable(CheetahError("pair_scan failed"))
-            return []
         trimmed: list[tuple[bytes, int]] = []
-        for raw_value, key in results:
-            if not raw_value.startswith(namespace_bytes):
-                continue
-            trimmed.append((raw_value[len(namespace_bytes) :], key))
+        cursor: bytes | None = None
+        remaining = limit if limit > 0 else None
+        while True:
+            page_limit = remaining if remaining is not None else 0
+            result = self._client.pair_scan(scoped_prefix, limit=page_limit, cursor=cursor)
+            if result is None:
+                self._disable(CheetahError("pair_scan failed"))
+                return []
+            entries, cursor = result
+            if not entries:
+                break
+            for raw_value, key in entries:
+                if not raw_value.startswith(namespace_bytes):
+                    continue
+                trimmed.append((raw_value[len(namespace_bytes) :], key))
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining <= 0:
+                        return trimmed
+            if not cursor:
+                break
         return trimmed
 
     def iter_counts(self, order: int) -> list[RawCountsProjection]:
@@ -696,35 +750,47 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace = f"cnt:{order}"
         projections: list[RawCountsProjection] = []
         namespace_bytes = namespace.encode("utf-8") + b":"
-        results = self._client.pair_reduce("counts", namespace_bytes, limit=-1)
-        if results is None:
-            self._disable(CheetahError("pair_reduce counts failed"))
-            return []
-        for raw_value, key, payload in results:
-            if not raw_value.startswith(namespace_bytes):
-                continue
-            trimmed = raw_value[len(namespace_bytes) :]
-            blob = payload
-            if blob is None:
-                blob = self._client.read(key)
-            if not blob:
-                continue
-            record = self._serializer.decode_counts(blob)
-            if not record or record.order != order:
-                continue
-            if trimmed == b"__root__":
-                context_hash = "__root__"
-            else:
-                context_hash = trimmed.hex()
-            totals = sum(count for _, count in record.followers)
-            projections.append(
-                RawCountsProjection(
-                    context_hash=context_hash,
-                    order=order,
-                    totals=totals,
-                    followers=record.followers,
-                )
+        cursor: bytes | None = None
+        while True:
+            result = self._client.pair_reduce(
+                "counts",
+                namespace_bytes,
+                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                cursor=cursor,
             )
+            if result is None:
+                self._disable(CheetahError("pair_reduce counts failed"))
+                return []
+            entries, cursor = result
+            if not entries:
+                break
+            for raw_value, key, payload in entries:
+                if not raw_value.startswith(namespace_bytes):
+                    continue
+                trimmed = raw_value[len(namespace_bytes) :]
+                blob = payload
+                if blob is None:
+                    blob = self._client.read(key)
+                if not blob:
+                    continue
+                record = self._serializer.decode_counts(blob)
+                if not record or record.order != order:
+                    continue
+                if trimmed == b"__root__":
+                    context_hash = "__root__"
+                else:
+                    context_hash = trimmed.hex()
+                totals = sum(count for _, count in record.followers)
+                projections.append(
+                    RawCountsProjection(
+                        context_hash=context_hash,
+                        order=order,
+                        totals=totals,
+                        followers=record.followers,
+                    )
+                )
+            if not cursor:
+                break
         return projections
 
     def iter_probabilities(self, order: int) -> list[RawProbabilityProjection]:
@@ -732,34 +798,46 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return []
         namespace = f"prob:{order}"
         namespace_bytes = namespace.encode("utf-8") + b":"
-        results = self._client.pair_reduce("probabilities", namespace_bytes, limit=-1)
-        if results is None:
-            self._disable(CheetahError("pair_reduce probabilities failed"))
-            return []
         projections: list[RawProbabilityProjection] = []
-        for raw_value, key, payload in results:
-            if not raw_value.startswith(namespace_bytes):
-                continue
-            trimmed = raw_value[len(namespace_bytes) :]
-            blob = payload
-            if blob is None:
-                blob = self._client.read(key)
-            if not blob:
-                continue
-            record = self._serializer.decode_probabilities(blob)
-            if not record or record.order != order:
-                continue
-            if trimmed == b"__root__":
-                context_hash = "__root__"
-            else:
-                context_hash = trimmed.hex()
-            projections.append(
-                RawProbabilityProjection(
-                    context_hash=context_hash,
-                    order=order,
-                    followers=record.entries,
-                )
+        cursor: bytes | None = None
+        while True:
+            result = self._client.pair_reduce(
+                "probabilities",
+                namespace_bytes,
+                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                cursor=cursor,
             )
+            if result is None:
+                self._disable(CheetahError("pair_reduce probabilities failed"))
+                return []
+            entries, cursor = result
+            if not entries:
+                break
+            for raw_value, key, payload in entries:
+                if not raw_value.startswith(namespace_bytes):
+                    continue
+                trimmed = raw_value[len(namespace_bytes) :]
+                blob = payload
+                if blob is None:
+                    blob = self._client.read(key)
+                if not blob:
+                    continue
+                record = self._serializer.decode_probabilities(blob)
+                if not record or record.order != order:
+                    continue
+                if trimmed == b"__root__":
+                    context_hash = "__root__"
+                else:
+                    context_hash = trimmed.hex()
+                projections.append(
+                    RawProbabilityProjection(
+                        context_hash=context_hash,
+                        order=order,
+                        followers=record.entries,
+                    )
+                )
+            if not cursor:
+                break
         return projections
 
     def iter_continuations(self) -> list[RawContinuationProjection]:
@@ -767,28 +845,40 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return []
         namespace = "cont"
         namespace_bytes = namespace.encode("utf-8") + b":"
-        results = self._client.pair_reduce("continuations", namespace_bytes, limit=-1)
-        if results is None:
-            self._disable(CheetahError("pair_reduce continuations failed"))
-            return []
         projections: list[RawContinuationProjection] = []
-        for raw_value, key, payload in results:
-            if not raw_value.startswith(namespace_bytes):
-                continue
-            blob = payload
-            if blob is None:
-                blob = self._client.read(key)
-            if not blob:
-                continue
-            record = self._serializer.decode_continuation(blob)
-            if not record:
-                continue
-            projections.append(
-                RawContinuationProjection(
-                    token_id=record.token_id,
-                    num_contexts=record.num_contexts,
-                )
+        cursor: bytes | None = None
+        while True:
+            result = self._client.pair_reduce(
+                "continuations",
+                namespace_bytes,
+                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                cursor=cursor,
             )
+            if result is None:
+                self._disable(CheetahError("pair_reduce continuations failed"))
+                return []
+            entries, cursor = result
+            if not entries:
+                break
+            for raw_value, key, payload in entries:
+                if not raw_value.startswith(namespace_bytes):
+                    continue
+                blob = payload
+                if blob is None:
+                    blob = self._client.read(key)
+                if not blob:
+                    continue
+                record = self._serializer.decode_continuation(blob)
+                if not record:
+                    continue
+                projections.append(
+                    RawContinuationProjection(
+                        token_id=record.token_id,
+                        num_contexts=record.num_contexts,
+                    )
+                )
+            if not cursor:
+                break
         return projections
 
     def context_relativism(

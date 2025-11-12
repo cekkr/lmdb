@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -41,6 +42,67 @@ type PairReduceResult struct {
 	Value   []byte
 	Key     uint64
 	Payload []byte
+}
+
+const (
+	pairEntryKeyOffset   = 1
+	pairEntryChildOffset = pairEntryKeyOffset + PairEntryKeySize
+)
+
+func entryHasTerminal(entry []byte) bool {
+	return len(entry) > 0 && (entry[0]&FlagIsTerminal) != 0
+}
+
+func entryHasChild(entry []byte) bool {
+	if len(entry) == 0 || (entry[0]&FlagHasChild) == 0 {
+		return false
+	}
+	return binary.BigEndian.Uint32(entry[pairEntryChildOffset:pairEntryChildOffset+PairEntryChildSize]) != 0
+}
+
+func entryChildID(entry []byte) uint32 {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return 0
+	}
+	return binary.BigEndian.Uint32(entry[pairEntryChildOffset : pairEntryChildOffset+PairEntryChildSize])
+}
+
+func setEntryChild(entry []byte, childID uint32) {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return
+	}
+	entry[0] |= FlagHasChild
+	binary.BigEndian.PutUint32(entry[pairEntryChildOffset:], childID)
+}
+
+func clearEntryChild(entry []byte) {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return
+	}
+	entry[0] &^= FlagHasChild
+	for i := 0; i < PairEntryChildSize; i++ {
+		entry[pairEntryChildOffset+i] = 0
+	}
+}
+
+func setEntryTerminal(entry []byte, absKey uint64) {
+	if len(entry) < pairEntryKeyOffset+PairEntryKeySize {
+		return
+	}
+	entry[0] |= FlagIsTerminal
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], absKey)
+	copy(entry[pairEntryKeyOffset:pairEntryKeyOffset+PairEntryKeySize], buf[8-PairEntryKeySize:])
+}
+
+func clearEntryTerminal(entry []byte) {
+	if len(entry) < pairEntryKeyOffset+PairEntryKeySize {
+		return
+	}
+	entry[0] &^= FlagIsTerminal
+	for i := 0; i < PairEntryKeySize; i++ {
+		entry[pairEntryKeyOffset+i] = 0
+	}
 }
 
 func NewDatabase(path string) (*Database, error) {
@@ -287,11 +349,20 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 				return "ERROR,invalid_limit", nil
 			}
 		}
-		results, err := db.PairScan(prefix, limit)
+		var cursor []byte
+		if len(args) > 2 {
+			if args[2] != "*" {
+				cursor, err = parseValue(args[2])
+				if err != nil {
+					return err.Error(), nil
+				}
+			}
+		}
+		results, nextCursor, err := db.PairScan(prefix, limit, cursor)
 		if err != nil {
 			return "", err
 		}
-		return formatPairScanResponse(results), nil
+		return formatPairScanResponse(results, nextCursor), nil
 	case command == "PAIR_REDUCE":
 		if len(parts) < 2 {
 			return "ERROR,pair_reduce_requires_args", nil
@@ -316,7 +387,16 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 				return "ERROR,invalid_limit", nil
 			}
 		}
-		response, err := db.handlePairReduce(mode, prefix, limit)
+		var cursor []byte
+		if len(args) > 3 {
+			if args[3] != "*" {
+				cursor, err = parseValue(args[3])
+				if err != nil {
+					return err.Error(), nil
+				}
+			}
+		}
+		response, err := db.handlePairReduce(mode, prefix, limit, cursor)
 		if err != nil {
 			return "", err
 		}
@@ -339,12 +419,17 @@ func (db *Database) deletePairTable(tableID uint32) error {
 	return os.Remove(path)
 }
 
-func (db *Database) PairScan(prefix []byte, limit int) ([]PairScanResult, error) {
+func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairScanResult, []byte, error) {
 	limit = normalizePairScanLimit(limit)
 	results := make([]PairScanResult, 0, limit)
+	state := &pairScanState{
+		cursor: append([]byte{}, cursor...),
+	}
 	if len(prefix) == 0 {
-		err := db.collectPairEntries(0, nil, limit, &results)
-		return results, err
+		if _, err := db.collectPairEntries(0, nil, limit, &results, state); err != nil {
+			return nil, nil, err
+		}
+		return results, state.nextCursor(), nil
 	}
 
 	currentTableID := uint32(0)
@@ -352,108 +437,155 @@ func (db *Database) PairScan(prefix []byte, limit int) ([]PairScanResult, error)
 		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return results, nil
+				return results, state.nextCursor(), nil
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		entry, err := table.ReadEntry(branchByte)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		length := entry[0]
-		data := entry[1:]
 		isLast := i == len(prefix)-1
 		if isLast {
-			if length > 0 {
-				results = append(results, PairScanResult{
-					Value: append([]byte{}, prefix...),
-					Key:   decodeAbsoluteKey(entry),
-				})
-				return results, nil
+			if entryHasTerminal(entry) {
+				valueCopy := append([]byte{}, prefix...)
+				if state.include(valueCopy) {
+					results = append(results, PairScanResult{
+						Value: valueCopy,
+						Key:   decodeAbsoluteKey(entry),
+					})
+					state.record(valueCopy)
+					if limit > 0 && len(results) >= limit {
+						state.limitReached = true
+						return results, state.nextCursor(), nil
+					}
+				}
 			}
-			childID := binary.BigEndian.Uint32(data)
+			if !entryHasChild(entry) {
+				return results, state.nextCursor(), nil
+			}
+			childID := entryChildID(entry)
 			if childID == 0 {
-				return results, nil
+				return results, state.nextCursor(), nil
 			}
-			err := db.collectPairEntries(childID, append([]byte{}, prefix...), limit, &results)
-			return results, err
+			if _, err := db.collectPairEntries(childID, append([]byte{}, prefix...), limit, &results, state); err != nil {
+				return nil, nil, err
+			}
+			return results, state.nextCursor(), nil
 		}
-		if length > 0 {
-			return results, nil
+		if !entryHasChild(entry) {
+			return results, state.nextCursor(), nil
 		}
-		childID := binary.BigEndian.Uint32(data)
+		childID := entryChildID(entry)
 		if childID == 0 {
-			return results, nil
+			return results, state.nextCursor(), nil
 		}
 		currentTableID = childID
 	}
-	return results, nil
+	return results, state.nextCursor(), nil
 }
 
-func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int, acc *[]PairScanResult) error {
+func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int, acc *[]PairScanResult, state *pairScanState) (bool, error) {
 	if limit > 0 && len(*acc) >= limit {
-		return nil
+		state.limitReached = true
+		return true, nil
 	}
 	table, err := db.getPairTable(tableID)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	for branch := 0; branch < 256; branch++ {
 		entry, err := table.ReadEntry(byte(branch))
 		if err != nil {
-			return err
+			return false, err
 		}
-		length := entry[0]
-		data := entry[1:]
-		if length > 0 {
-			newValue := append(prefix, byte(branch))
-			*acc = append(*acc, PairScanResult{
-				Value: newValue,
-				Key:   decodeAbsoluteKey(entry),
-			})
-			if limit > 0 && len(*acc) >= limit {
-				return nil
+		if entryHasTerminal(entry) {
+			value := append(append([]byte{}, prefix...), byte(branch))
+			if state.include(value) {
+				*acc = append(*acc, PairScanResult{
+					Value: value,
+					Key:   decodeAbsoluteKey(entry),
+				})
+				state.record(value)
+				if limit > 0 && len(*acc) >= limit {
+					state.limitReached = true
+					return true, nil
+				}
 			}
-			continue
 		}
-		childID := binary.BigEndian.Uint32(data)
-		if childID == 0 {
-			continue
-		}
-		err = db.collectPairEntries(childID, append(prefix, byte(branch)), limit, acc)
-		if err != nil {
-			return err
-		}
-		if limit > 0 && len(*acc) >= limit {
-			return nil
+		if entryHasChild(entry) {
+			childID := entryChildID(entry)
+			if childID == 0 {
+				continue
+			}
+			nextPrefix := append(append([]byte{}, prefix...), byte(branch))
+			reached, err := db.collectPairEntries(childID, nextPrefix, limit, acc, state)
+			if err != nil {
+				return false, err
+			}
+			if reached {
+				return true, nil
+			}
 		}
 	}
-	return nil
+	return false, nil
 }
 
-func (db *Database) handlePairReduce(mode string, prefix []byte, limit int) (string, error) {
+type pairScanState struct {
+	cursor          []byte
+	cursorSatisfied bool
+	lastValue       []byte
+	limitReached    bool
+}
+
+func (s *pairScanState) include(value []byte) bool {
+	if len(s.cursor) == 0 {
+		return true
+	}
+	if s.cursorSatisfied {
+		return true
+	}
+	if bytes.Compare(value, s.cursor) <= 0 {
+		return false
+	}
+	s.cursorSatisfied = true
+	return true
+}
+
+func (s *pairScanState) record(value []byte) {
+	s.lastValue = append([]byte{}, value...)
+}
+
+func (s *pairScanState) nextCursor() []byte {
+	if !s.limitReached || len(s.lastValue) == 0 {
+		return nil
+	}
+	return append([]byte{}, s.lastValue...)
+}
+
+func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {
 	switch mode {
 	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		results, err := db.reduceWithPayload(prefix, limit)
+		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor)
 		if err != nil {
 			return "", err
 		}
-		return formatPairReduceResponse(results, mode), nil
+		return formatPairReduceResponse(results, mode, nextCursor), nil
 	default:
 		return "ERROR,unknown_reducer_mode", nil
 	}
 }
 
-func (db *Database) reduceWithPayload(prefix []byte, limit int) ([]PairReduceResult, error) {
-	scanResults, err := db.PairScan(prefix, limit)
+func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) ([]PairReduceResult, []byte, error) {
+	scanResults, nextCursor, err := db.PairScan(prefix, limit, cursor)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(scanResults) == 0 {
-		return nil, nil
+		return nil, nextCursor, nil
 	}
 
 	reduced := make([]PairReduceResult, len(scanResults))
@@ -511,10 +643,10 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int) ([]PairReduceRes
 
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return nil, nil, firstErr
 	}
 
-	return reduced, nil
+	return reduced, nextCursor, nil
 }
 
 func (db *Database) readValuePayload(key uint64) ([]byte, error) {
@@ -553,15 +685,21 @@ func normalizePairScanLimit(limit int) int {
 }
 
 func decodeAbsoluteKey(entry []byte) uint64 {
-	data := entry[1:]
+	if len(entry) < pairEntryKeyOffset+PairEntryKeySize {
+		return 0
+	}
+	data := entry[pairEntryKeyOffset : pairEntryKeyOffset+PairEntryKeySize]
 	var buf [8]byte
-	copy(buf[8-len(data):], data[:len(data)])
+	copy(buf[8-PairEntryKeySize:], data)
 	return binary.BigEndian.Uint64(buf[:])
 }
 
-func formatPairScanResponse(results []PairScanResult) string {
+func formatPairScanResponse(results []PairScanResult, nextCursor []byte) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("SUCCESS,count=%d", len(results)))
+	if len(nextCursor) > 0 {
+		b.WriteString(fmt.Sprintf(",next_cursor=x%x", nextCursor))
+	}
 	if len(results) == 0 {
 		return b.String()
 	}
@@ -575,9 +713,12 @@ func formatPairScanResponse(results []PairScanResult) string {
 	return b.String()
 }
 
-func formatPairReduceResponse(results []PairReduceResult, mode string) string {
+func formatPairReduceResponse(results []PairReduceResult, mode string, nextCursor []byte) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("SUCCESS,reducer=%s,count=%d", mode, len(results)))
+	if len(nextCursor) > 0 {
+		b.WriteString(fmt.Sprintf(",next_cursor=x%x", nextCursor))
+	}
 	if len(results) == 0 {
 		return b.String()
 	}

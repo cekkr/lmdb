@@ -11,11 +11,11 @@ class FakeCheetahClient:
         self.pairs: dict[bytes, int] = {}
         self._next_key = 1
 
-    def insert(self, payload: bytes) -> int:
+    def insert(self, payload: bytes) -> tuple[int, str | None]:
         key = self._next_key
         self._next_key += 1
         self.storage[key] = payload
-        return key
+        return key, None
 
     def edit(self, key: int, payload: bytes) -> bool:
         self.storage[key] = payload
@@ -24,9 +24,9 @@ class FakeCheetahClient:
     def read(self, key: int) -> bytes | None:
         return self.storage.get(key)
 
-    def pair_set(self, value: bytes, key: int) -> bool:
+    def pair_set(self, value: bytes, key: int) -> tuple[bool, str | None]:
         self.pairs[value] = key
-        return True
+        return True, None
 
     def pair_get(self, value: bytes) -> int | None:
         return self.pairs.get(value)
@@ -94,12 +94,19 @@ class CheetahHotPathAdapterTests(unittest.TestCase):
 class CheetahClientParsingTests(unittest.TestCase):
     def test_parse_pair_reduce_response_with_payload(self) -> None:
         response = "SUCCESS,reducer=counts,count=1,items=636e743a:42:SGVsbG8="
-        parsed = CheetahClient._parse_pair_reduce_response(response)
+        parsed, cursor = CheetahClient._parse_pair_reduce_response(response)
         self.assertEqual(len(parsed), 1)
+        self.assertIsNone(cursor)
         value, key, payload = parsed[0]
         self.assertEqual(value, bytes.fromhex("636e743a"))
         self.assertEqual(key, 42)
         self.assertEqual(payload, b"Hello")
+
+    def test_parse_pair_scan_response_with_cursor(self) -> None:
+        response = "SUCCESS,count=1,next_cursor=x616263,items=74657374:10"
+        parsed, cursor = CheetahClient._parse_pair_scan_response(response)
+        self.assertEqual(cursor, b"abc")
+        self.assertEqual(parsed, [(b"test", 10)])
 
 
 if __name__ == "__main__":

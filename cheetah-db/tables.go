@@ -266,50 +266,6 @@ func (t *PairTable) Snapshot() ([]byte, error) {
 	return buf, nil
 }
 
-// Analyze scansiona tutte le 256 entrate di un nodo per determinarne lo stato.
-// Restituisce:
-// - isTerminal: se il nodo stesso rappresenta la fine di una chiave. (Non applicabile in questo modello, ma utile per future estensioni)
-// - childCount: il numero di puntatori/chiavi non vuoti.
-// - singleChildByte: se childCount è 1, questo è il byte del singolo figlio.
-// - singleChildEntry: se childCount è 1, questa è l'intera entrata del figlio.
-func (t *PairTable) Analyze() (isTerminal bool, childCount int, singleChildByte byte, singleChildEntry []byte, err error) {
-	t.mu.RLock() // Basta un read lock per analizzare
-	defer t.mu.RUnlock()
-
-	info, err := t.file.Stat()
-	if err != nil {
-		return false, 0, 0, nil, err
-	}
-	if info.Size() == 0 {
-		return false, 0, 0, nil, nil
-	}
-
-	buffer := make([]byte, info.Size())
-	if _, errRead := t.file.ReadAt(buffer, 0); errRead != nil {
-		return false, 0, 0, nil, errRead
-	}
-
-	singleChildEntry = make([]byte, PairEntrySize)
-
-	for i := 0; i < len(buffer); i += PairEntrySize {
-		entry := buffer[i : i+PairEntrySize]
-		// Il primo byte di ogni entrata è la lunghezza/flag
-		if entry[0] != 0 {
-			childCount++
-			singleChildByte = byte(i / PairEntrySize)
-			copy(singleChildEntry, entry)
-		}
-	}
-
-	// Se il conteggio non è 1, azzeriamo i risultati del figlio singolo
-	if childCount != 1 {
-		singleChildEntry = nil
-		singleChildByte = 0
-	}
-
-	return false, childCount, singleChildByte, singleChildEntry, nil
-}
-
 // Path restituisce il percorso del file della tabella.
 func (t *PairTable) Path() string {
 	return t.path

@@ -2,7 +2,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -149,55 +148,37 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
 
-	currentTableID := uint32(0) // Si parte sempre dalla tabella radice '0'
-	var currentTable *PairTable
-	var err error
-
+	currentTableID := uint32(0)
 	for i, branchByte := range value {
-		currentTable, err = db.getPairTable(currentTableID)
+		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			return "", err
 		}
-
-		entry, _ := currentTable.ReadEntry(branchByte)
-		length := entry[0]
-		data := entry[1:]
-
-		isLastByte := (i == len(value)-1)
-
-		if isLastByte {
-			if length == 0 && binary.BigEndian.Uint32(data) != 0 {
-				return "ERROR,conflict: a longer key already exists on this path", nil
+		entry, _ := table.ReadEntry(branchByte)
+		isLast := i == len(value)-1
+		if isLast {
+			setEntryTerminal(entry, absKey)
+			if err := table.WriteEntry(branchByte, entry); err != nil {
+				return "", err
 			}
-			entry[0] = 6 // Lunghezza della chiave assoluta (48 bit)
-			var buf [8]byte
-			binary.BigEndian.PutUint64(buf[:], absKey)
-			copy(data[:6], buf[2:]) // Persist the lower 6 bytes
-			return "SUCCESS,pair_set", currentTable.WriteEntry(branchByte, entry)
+			return "SUCCESS,pair_set", nil
 		}
-
-		if length > 0 {
-			return "ERROR,conflict: a key already exists which is a prefix of your value", nil
-		}
-
-		nextTableID := binary.BigEndian.Uint32(data)
-		if nextTableID == 0 { // Il percorso non esiste, creiamolo
+		childID := entryChildID(entry)
+		if !entryHasChild(entry) || childID == 0 {
 			newID, err := db.getNewPairTableID()
 			if err != nil {
 				return "", err
 			}
-
-			entry[0] = 0 // Lunghezza 0 indica un puntatore
-			binary.BigEndian.PutUint32(data, newID)
-			if err := currentTable.WriteEntry(branchByte, entry); err != nil {
+			setEntryChild(entry, newID)
+			if err := table.WriteEntry(branchByte, entry); err != nil {
 				return "", err
 			}
 			currentTableID = newID
-		} else {
-			currentTableID = nextTableID
+			continue
 		}
+		currentTableID = childID
 	}
-	return "ERROR,internal_logic_error", nil // Non dovrebbe essere raggiunto
+	return "ERROR,internal_logic_error", nil
 }
 
 func (db *Database) PairGet(value []byte) (string, error) {
@@ -216,25 +197,19 @@ func (db *Database) PairGet(value []byte) (string, error) {
 		}
 
 		entry, _ := table.ReadEntry(branchByte)
-		length := entry[0]
-		data := entry[1:]
-
-		if isLastByte := (i == len(value)-1); isLastByte {
-			if length > 0 {
-				keyData := make([]byte, 8)
-				copy(keyData[2:], data[:length])
-				absKey := binary.BigEndian.Uint64(keyData)
-				return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
-			}
-			return "ERROR,not_found", nil
-		}
-
-		if length == 0 {
-			currentTableID = binary.BigEndian.Uint32(data)
-			if currentTableID == 0 {
+		isLast := i == len(value)-1
+		if isLast {
+			if !entryHasTerminal(entry) {
 				return "ERROR,not_found", nil
 			}
-		} else {
+			absKey := decodeAbsoluteKey(entry)
+			return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
+		}
+		if !entryHasChild(entry) {
+			return "ERROR,not_found", nil
+		}
+		currentTableID = entryChildID(entry)
+		if currentTableID == 0 {
 			return "ERROR,not_found", nil
 		}
 	}
@@ -279,26 +254,24 @@ func (db *Database) PairDel(value []byte) (string, error) {
 		acquiredLocks = append(acquiredLocks, &table.mu)
 
 		entry, err := table.ReadEntry(branchByte)
-		if err != nil || entry[0] == 0 {
+		if err != nil {
 			cleanupReadLocks()
 			return "ERROR,not_found", nil
 		}
 
 		pathStack = append(pathStack, pathStackFrame{TableID: currentTableID, BranchByte: branchByte})
-		length, data := entry[0], entry[1:]
-
-		isLastByte := (i == len(value)-1)
-		if isLastByte {
-			if length == 0 {
+		isLast := i == len(value)-1
+		if isLast {
+			if !entryHasTerminal(entry) {
 				cleanupReadLocks()
 				return "ERROR,not_found", nil
 			}
 		} else {
-			if length > 0 {
+			if !entryHasChild(entry) {
 				cleanupReadLocks()
 				return "ERROR,not_found", nil
 			}
-			currentTableID = binary.BigEndian.Uint32(data)
+			currentTableID = entryChildID(entry)
 		}
 	}
 	cleanupReadLocks() // Rilasciamo tutti i read lock prima di passare ai write lock
@@ -331,72 +304,37 @@ func (db *Database) PairDel(value []byte) (string, error) {
 	terminalFrame := pathStack[len(pathStack)-1]
 	terminalTable := lockedTables[terminalFrame.TableID]
 	terminalEntry, _ := terminalTable.ReadEntry(terminalFrame.BranchByte)
-	terminalEntry[0] = 0 // Azzera la lunghezza, cancellando di fatto la chiave
-	for k := 1; k < PairEntrySize; k++ {
-		terminalEntry[k] = 0
+	if !entryHasTerminal(terminalEntry) {
+		return "ERROR,not_found", nil
 	}
+	clearEntryTerminal(terminalEntry)
 	if err := terminalTable.WriteEntry(terminalFrame.BranchByte, terminalEntry); err != nil {
 		return "", fmt.Errorf("failed to clear terminal entry: %w", err)
 	}
 
-	// Risaliamo lo stack per pulire e comprimere
+	// Risaliamo lo stack per pulire eventuali nodi vuoti
 	for i := len(pathStack) - 1; i >= 0; i-- {
 		frame := pathStack[i]
 		tableToAnalyze := lockedTables[frame.TableID]
-
-		_, childCount, _ /*singleChildByte*/, singleChildEntry, err := tableToAnalyze.Analyze()
-		if err != nil {
-			continue
-		} // Se non riusciamo ad analizzare, meglio non fare nulla
-
-		// Otteniamo il genitore, se esiste
-		var parentTable *PairTable
-		var parentBranchByte byte
-		if i > 0 {
-			parentFrame := pathStack[i-1]
-			parentTable = lockedTables[parentFrame.TableID]
-			parentBranchByte = parentFrame.BranchByte
+		isEmpty, err := tableToAnalyze.IsEmpty()
+		if err != nil || !isEmpty {
+			break
 		}
-
-		if childCount == 0 { // Nodo diventato completamente vuoto
-			if parentTable == nil {
-				break
-			} // Non cancelliamo mai il nodo radice
-
-			// Azzera il puntatore nel genitore
-			parentEntry, _ := parentTable.ReadEntry(parentBranchByte)
-			parentEntry[0] = 0
-			for k := 1; k < PairEntrySize; k++ {
-				parentEntry[k] = 0
-			}
-			if err := parentTable.WriteEntry(parentBranchByte, parentEntry); err != nil {
-				return "", err
-			}
-
-			// Cancella il file del nodo corrente
-			if err := db.deletePairTable(frame.TableID); err != nil {
-				return "", err
-			}
-			delete(lockedTables, frame.TableID) // Rimuovi dalla mappa dei lock per evitare unlock doppio
-
-		} else if childCount == 1 { // Nodo diventato ridondante -> Path Compression
-			if parentTable == nil {
-				break
-			} // Il nodo radice può avere un solo figlio, non lo comprimiamo
-
-			// Fai puntare il genitore direttamente al nipote
-			if err := parentTable.WriteEntry(parentBranchByte, singleChildEntry); err != nil {
-				return "", err
-			}
-
-			// Cancella il file del nodo corrente (ormai bypassato)
+		if i == 0 {
+			break // non cancelliamo mai la radice
+		}
+		parentFrame := pathStack[i-1]
+		parentTable := lockedTables[parentFrame.TableID]
+		parentEntry, _ := parentTable.ReadEntry(parentFrame.BranchByte)
+		clearEntryChild(parentEntry)
+		if err := parentTable.WriteEntry(parentFrame.BranchByte, parentEntry); err != nil {
+			return "", err
+		}
+		if frame.TableID != 0 {
 			if err := db.deletePairTable(frame.TableID); err != nil {
 				return "", err
 			}
 			delete(lockedTables, frame.TableID)
-
-		} else { // Il nodo è ancora utile (ha >1 figli), fermiamo la pulizia
-			break
 		}
 	}
 

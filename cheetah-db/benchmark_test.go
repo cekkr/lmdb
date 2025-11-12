@@ -113,11 +113,19 @@ func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, e
 	if err := warmupInserts(db, state, valueSize, 512); err != nil {
 		return "", fmt.Errorf("warmup failed: %w", err)
 	}
+	pairWarmupCount := concurrency * 4
+	if pairWarmupCount < 256 {
+		pairWarmupCount = 256
+	}
+	if err := warmupPairs(db, state, pairWarmupCount); err != nil {
+		return "", fmt.Errorf("pair warmup failed: %w", err)
+	}
 
 	var insertOps atomic.Int64
 	var readOps atomic.Int64
 	var pairSetOps atomic.Int64
 	var pairGetOps atomic.Int64
+	var pairScanOps atomic.Int64
 	var errorOps atomic.Int64
 
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
@@ -137,7 +145,7 @@ func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, e
 				}
 				roll := r.Float64()
 				switch {
-				case roll < 0.45:
+				case roll < 0.40:
 					if key, err := insertRandomValue(db, r, valueSize); err != nil {
 						errorOps.Add(1)
 						time.Sleep(2 * time.Millisecond)
@@ -145,26 +153,33 @@ func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, e
 						state.addKey(key)
 						insertOps.Add(1)
 					}
-				case roll < 0.75:
+				case roll < 0.70:
 					if err := readRandomValue(db, r, state); err != nil {
 						errorOps.Add(1)
 						time.Sleep(2 * time.Millisecond)
 					} else {
 						readOps.Add(1)
 					}
-				case roll < 0.90:
+				case roll < 0.85:
 					if err := pairSetRandom(db, r, state); err != nil {
 						errorOps.Add(1)
 						time.Sleep(2 * time.Millisecond)
 					} else {
 						pairSetOps.Add(1)
 					}
-				default:
+				case roll < 0.95:
 					if err := pairGetRandom(db, r, state); err != nil {
 						errorOps.Add(1)
 						time.Sleep(2 * time.Millisecond)
 					} else {
 						pairGetOps.Add(1)
+					}
+				default:
+					if err := pairScanRandom(db, r, state); err != nil {
+						errorOps.Add(1)
+						time.Sleep(2 * time.Millisecond)
+					} else {
+						pairScanOps.Add(1)
 					}
 				}
 			}
@@ -195,29 +210,48 @@ loop:
 		case <-ctx.Done():
 			break loop
 		case <-ticker.C:
-			printSnapshot(logFile, start, insertOps.Load(), readOps.Load(), pairSetOps.Load(), pairGetOps.Load(), errorOps.Load())
+			printSnapshot(
+				logFile,
+				start,
+				insertOps.Load(),
+				readOps.Load(),
+				pairSetOps.Load(),
+				pairGetOps.Load(),
+				pairScanOps.Load(),
+				errorOps.Load(),
+			)
 		}
 	}
 
 	cancel()
 	wg.Wait()
-	printSnapshot(logFile, start, insertOps.Load(), readOps.Load(), pairSetOps.Load(), pairGetOps.Load(), errorOps.Load())
+	printSnapshot(
+		logFile,
+		start,
+		insertOps.Load(),
+		readOps.Load(),
+		pairSetOps.Load(),
+		pairGetOps.Load(),
+		pairScanOps.Load(),
+		errorOps.Load(),
+	)
 	return logPath, nil
 }
 
-func printSnapshot(logFile *os.File, start time.Time, inserts, reads, pairSets, pairGets, errs int64) {
+func printSnapshot(logFile *os.File, start time.Time, inserts, reads, pairSets, pairGets, pairScans, errs int64) {
 	elapsed := time.Since(start).Seconds()
 	if elapsed == 0 {
 		return
 	}
-	line := fmt.Sprintf("[%.1fs] inserts=%d reads=%d pair_set=%d pair_get=%d errors=%d | total_qps=%.1f",
+	line := fmt.Sprintf("[%.1fs] inserts=%d reads=%d pair_set=%d pair_get=%d pair_scan=%d errors=%d | total_qps=%.1f",
 		elapsed,
 		inserts,
 		reads,
 		pairSets,
 		pairGets,
+		pairScans,
 		errs,
-		float64(inserts+reads+pairSets+pairGets)/elapsed,
+		float64(inserts+reads+pairSets+pairGets+pairScans)/elapsed,
 	)
 	fmt.Println(line)
 	if logFile != nil {
@@ -233,6 +267,19 @@ func warmupInserts(db *Database, state *sharedState, valueSize int, count int) e
 			return err
 		}
 		state.addKey(key)
+	}
+	return nil
+}
+
+func warmupPairs(db *Database, state *sharedState, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < count; i++ {
+		if err := pairSetRandom(db, r, state); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -297,6 +344,30 @@ func pairGetRandom(db *Database, r *rand.Rand, state *sharedState) error {
 	expected := fmt.Sprintf("key=%d", entry.key)
 	if !strings.Contains(resp, expected) {
 		return fmt.Errorf("pair_get mismatch: expected %s got %s", expected, resp)
+	}
+	return nil
+}
+
+func pairScanRandom(db *Database, r *rand.Rand, state *sharedState) error {
+	entry, ok := state.randomPair(r)
+	if !ok {
+		return errors.New("no pairs available for pair_scan")
+	}
+	value := []byte(entry.value)
+	if len(value) == 0 {
+		return errors.New("empty pair value")
+	}
+	prefixLen := len(value)
+	if prefixLen > 1 {
+		prefixLen = r.Intn(prefixLen-1) + 1
+	}
+	prefix := value[:prefixLen]
+	results, _, err := db.PairScan(prefix, 64, nil)
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		return errors.New("pair_scan returned no entries")
 	}
 	return nil
 }
