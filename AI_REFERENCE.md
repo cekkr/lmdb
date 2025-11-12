@@ -10,7 +10,7 @@ change so the next agent inherits the latest context.
   investigations.
 - Work incrementally, document breaking changes, and run the available build/test commands before
   yielding control.
-- Always launch long-running services and workloads (e.g., `cheetah-server`, smoke-train/benchmark runs, CI smoke tests) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent.
+- Always launch long-running services and workloads (e.g., `cheetah-server`, smoke-train/benchmark runs, CI smoke tests) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent. When the WSL image cannot keep `screen` alive (missing setuid bit), fall back to `tmux` with the exact same discipline and log the substitution in your notes/runbook.
 
 ### Next Steps
 
@@ -63,9 +63,10 @@ change so the next agent inherits the latest context.
   coexist. `PAIR_SCAN`/`PAIR_REDUCE` accept optional cursors and emit `next_cursor=x...` when a page
   hits the configured limit, allowing clients to stream arbitrarily large namespaces without
   reopening readers. Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from
-  `cheetah-db/` to reproduce the 30-second benchmark (latest log:
-  `var/eval_logs/cheetah_db_benchmark_20251112-130623.log`, ~90 qps pair scans folded into the
-  existing ~900 mixed ops/s workload).
+  `cheetah-db/` to reproduce the latest snapshots:
+  - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
+  - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
+  - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
@@ -181,6 +182,15 @@ change so the next agent inherits the latest context.
   cheetah namespaces isolated, allowing the smoke train to stop one DB session and spin up another
   without restarting the Go service. Override the cheetah namespace manually by setting
   `DBSLM_CHEETAH_DATABASE` before launching any CLI if you need ad-hoc names outside the matrix.
+- New helpers:
+  - `scripts/start_cheetah_server.sh` / `scripts/stop_cheetah_server.sh` wrap the tmux fallback for
+    launching/stopping the Go server when `screen` cannot stay attached inside WSL.
+  - `scripts/run_cheetah_smoke.sh` enforces the cheetah-only smoke flags (tmp SQLite DB, metrics
+    export, timeout), and `scripts/start_cheetah_smoke_session.sh` runs it inside a tmux session so
+    progress can be tailed independently of PowerShell.
+  - Always monitor the emitted log; kill the `cheetah_smoke` session if the tail stops advancing.
+    Current failure to triage: `var/eval_logs/cheetah_smoke_train_20251112-190626.log` sticks on
+    `datasets/emotion_data.json#chunk1` even though the server shows no errors.
 - Use `--scenarios a,b` or `SMOKE_SCENARIOS=a,b` to run a subset, `--resume-from name` to skip ahead,
   and `--dry-run` to print the commands while still updating `benchmarks.json` for planning.
 

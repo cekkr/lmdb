@@ -71,8 +71,27 @@ adapter status stays visible to future maintainers.
   ```
   `screen -ls` shows the session; `screen -wipe` (or `pkill -f cheetah-server`) shuts it down before
   you rebuild.
+- When `screen` is unavailable (WSL often lacks the setuid bit), use the tmux helper scripts instead:
+  `scripts/start_cheetah_server.sh` spawns the `cheetahdb` session and appends logs to
+  `var/cheetah-server-linux.log`, while `scripts/stop_cheetah_server.sh` kills the tmux session and
+  any stray `cheetah-server` PIDs.
 - The Windows binary (`cheetah-server.exe`) honors the same `CHEETAH_HEADLESS=1` toggle if you prefer
   to run directly from PowerShell.
+
+## Smoke ingest helper
+
+- `scripts/run_cheetah_smoke.sh` standardizes the cheetah-backed smoke train flags. It automatically
+  points SQLite at `/tmp/cheetah_smoke*.sqlite3`, emits logs/metrics under
+  `var/eval_logs/cheetah_smoke_train_*.{log,json}`, and enforces a configurable timeout
+  (`CHEETAH_SMOKE_TIMEOUT`, defaults to 30 minutes).
+- `scripts/start_cheetah_smoke_session.sh` wraps the smoke run in a dedicated tmux session so the
+  ingest continues in the background. The script kills any prior `cheetah_smoke` session, spawns the
+  helper above with freshly generated paths, and prints the absolute log file location so you can
+  `tail -f` from PowerShell.
+- Always watch the log tail while the session runs. If the log stops advancing (e.g., the current
+  run in `var/eval_logs/cheetah_smoke_train_20251112-190626.log` has been stuck on
+  `datasets/emotion_data.json#chunk1` for several minutes), kill the `cheetah_smoke` tmux session,
+  capture the timestamp + cheetah server log, and record the failure before retrying.
 
 ## Python bridge status
 
@@ -177,6 +196,16 @@ Latest run (2025-11-12, 30s, 24 workers, 256-byte payloads) produced:
 See `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` for the full timeline (including the
 massively throttled tail when the benchmark idles before shutdown). Override
 `CHEETAHDB_BENCH_DURATION`/`CHEETAHDB_BENCH_WORKERS` to reproduce alternative mixes.
+
+Additional snapshots:
+
+- `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 45 s run with 32 workers. Total_qps
+  stayed above 56 ops/s through the 40 s mark (peaking at 90.4 ops/s @5 s) before falling to 10.9
+  during the graceful shutdown; final counts 1002/663/346/265/123 (insert/read/pair ops) with 0
+  errors.
+- `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 30 s rerun at 24 workers. Mirrors the
+  earlier throughput curve (95.6 → 66.7 ops/s across the first 25 s) while proving the pagination
+  fix (pair scans show up in each window, zero reducer EOFs).
 
 ## Directory map
 
