@@ -11,4 +11,4 @@ Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- ec
 When executing cheetah-db server and both train/smoke-trains, use screen or you get stuck. Example:
 `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/Sources/GitHub/lmdb/cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`.
 Remember to kill the session (`screen -ls` + `screen -wipe` or `pkill -f cheetah-server`) when you finish or re-compile the server, and even before beginning check.
-Remember that you have to run in parallel cheetah-db server with other script, and to stop both of them before recompilation and after end of executions.
+Remember that you have to run in parallel cheetah-db server with other scripts, and to stop both of them before recompilation and after end of executions.
