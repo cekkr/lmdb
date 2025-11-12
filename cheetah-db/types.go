@@ -5,16 +5,19 @@ import "encoding/binary"
 
 // --- CONSTANTS ---
 const (
+	// Recycle / pointer metadata
+	ValueLocationIndexSize = 5
+	ValueSizeBytes         = 4
+
 	// Main Table
-	MainKeysEntrySize = 6
+	MainKeysEntrySize = ValueSizeBytes + ValueLocationIndexSize
 	KeyStripeCount    = 1024
 
 	// Values Table
 	EntriesPerValueTable = 1 << 16
 
 	// Recycle Table
-	ValueLocationIndexSize = 5
-	RecycleCounterSize     = 2
+	RecycleCounterSize = 2
 
 	// Pair Table (New Architecture)
 	PairTableDataSize         = 6 // Dimensione fissa per i dati (contiene o un absKey o un tableID)

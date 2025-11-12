@@ -98,7 +98,7 @@ func (db *Database) Close() error {
 }
 
 // getValuesTable e getRecycleTable sono i gestori della cache delle tabelle.
-func (db *Database) getValuesTable(size uint8, tableID uint32) (*ValuesTable, error) {
+func (db *Database) getValuesTable(size uint32, tableID uint32) (*ValuesTable, error) {
 	key := fmt.Sprintf("%d_%d", size, tableID)
 	if table, ok := db.valuesTables.Load(key); ok {
 		return table.(*ValuesTable), nil
@@ -118,7 +118,7 @@ func (db *Database) getValuesTable(size uint8, tableID uint32) (*ValuesTable, er
 }
 
 // todo: unificate getValuesTable and getRecycleTable
-func (db *Database) getRecycleTable(size uint8) (*RecycleTable, error) {
+func (db *Database) getRecycleTable(size uint32) (*RecycleTable, error) {
 	key := size
 	if table, ok := db.recycleTables.Load(key); ok {
 		return table.(*RecycleTable), nil
@@ -471,16 +471,16 @@ func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	valueSize := uint8(entry[0])
+	valueSize := readValueSize(entry)
 	if valueSize == 0 {
 		return nil, fmt.Errorf("key %d has no payload", key)
 	}
-	location := DecodeValueLocationIndex(entry[1:])
+	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
 	table, err := db.getValuesTable(valueSize, location.TableID)
 	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, valueSize)
+	payload := make([]byte, int(valueSize))
 	offset := int64(location.EntryID) * int64(valueSize)
 	if _, err := table.ReadAt(payload, offset); err != nil {
 		return nil, err

@@ -179,6 +179,13 @@ change so the next agent inherits the latest context.
   an error unless you explicitly pass `--backonsqlite` (intended only for emergency smoke reruns).
   Keep the compiled server running in parallel with every ingest/smoke session to avoid wasting
   runs on the wrong backend.
+- Current blocker: the Go pair-trie (`PAIR_SET`) still assumes no key can be a prefix of another and
+  therefore rejects some namespace inserts even though the trainer now feeds it fixed-length payloads.
+  Until we teach `PairSet` how to split nodes (or normalize metadata keys to fixed-length hashes),
+  cheetah-only smoke ingests die within the first chunk (`cheetah pair_set failed for namespace=ctx ...`).
+  The `PAIR_REDUCE counts` streaming path also dies with `ERROR,internal_error:EOF` once the new
+  32-bit value slices cross ~60K bytes, so the reducer needs chunked responses as well. Track both
+  fixes before retrying the backlog’s smoke ingest run.
 - There is no SQL migration step or MariaDB destination anymore. Reset SQLite in place when you
   need a clean rebuild; cheetah already mirrors every context/top-K slice as part of the ingest loop.
 - Watch `DBSLMEngine.cheetah_topk_ratio()` (or the training log line) to confirm cache coverage stays

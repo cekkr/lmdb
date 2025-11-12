@@ -61,15 +61,15 @@ class CheetahClient:
         with self._lock:
             self._close_socket()
 
-    def insert(self, payload: bytes) -> int | None:
+    def insert(self, payload: bytes) -> tuple[int | None, str | None]:
         encoded = self._encode_value(payload)
         response = self._command(f"INSERT:{len(encoded)} {encoded}")
-        return self._parse_key_response(response)
+        return self._parse_key_response(response), response
 
-    def edit(self, key: int, payload: bytes) -> bool:
+    def edit(self, key: int, payload: bytes) -> tuple[bool, str | None]:
         encoded = self._encode_value(payload)
         response = self._command(f"EDIT {key} {encoded}")
-        return response is not None and response.startswith("SUCCESS")
+        return (response is not None and response.startswith("SUCCESS")), response
 
     def read(self, key: int) -> bytes | None:
         response = self._command(f"READ {key}")
@@ -82,9 +82,9 @@ class CheetahClient:
                 return self._decode_value(raw)
         return None
 
-    def pair_set(self, value: bytes, key: int) -> bool:
+    def pair_set(self, value: bytes, key: int) -> tuple[bool, str | None]:
         response = self._command(f"PAIR_SET x{value.hex()} {key}")
-        return response is not None and response.startswith("SUCCESS")
+        return (response is not None and response.startswith("SUCCESS")), response
 
     def pair_get(self, value: bytes) -> int | None:
         response = self._command(f"PAIR_GET x{value.hex()}")
@@ -493,8 +493,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
             if key is None:
                 self._insert(namespace, context_hash, payload)
             else:
-                if not self._client.edit(key, payload):
-                    raise CheetahError("failed to edit cheetah value")
+                success, response = self._client.edit(key, payload)
+                if not success:
+                    logger.warning(
+                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                        namespace,
+                        context_hash,
+                        key,
+                        response,
+                    )
+                    self._insert(namespace, context_hash, payload)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -508,8 +516,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
             if key is None:
                 self._insert(namespace, context_hash, payload)
             else:
-                if not self._client.edit(key, payload):
-                    raise CheetahError("failed to edit cheetah counts payload")
+                success, response = self._client.edit(key, payload)
+                if not success:
+                    logger.warning(
+                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                        namespace,
+                        context_hash,
+                        key,
+                        response,
+                    )
+                    self._insert(namespace, context_hash, payload)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -528,8 +544,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
             if key is None:
                 self._insert(namespace, context_hash, payload)
             else:
-                if not self._client.edit(key, payload):
-                    raise CheetahError("failed to edit cheetah probability payload")
+                success, response = self._client.edit(key, payload)
+                if not success:
+                    logger.warning(
+                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                        namespace,
+                        context_hash,
+                        key,
+                        response,
+                    )
+                    self._insert(namespace, context_hash, payload)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -545,8 +569,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 if key is None:
                     self._insert(namespace, identifier, payload)
                 else:
-                    if not self._client.edit(key, payload):
-                        raise CheetahError("failed to edit continuation payload")
+                    success, response = self._client.edit(key, payload)
+                    if not success:
+                        logger.warning(
+                            "cheetah edit failed for namespace=%s identifier=%s key=%s response=%s; reinserting",
+                            namespace,
+                            identifier,
+                            key,
+                            response,
+                        )
+                        self._insert(namespace, identifier, payload)
             except CheetahError as exc:
                 self._disable(exc)
                 return
@@ -592,13 +624,34 @@ class CheetahHotPathAdapter(HotPathAdapter):
         try:
             existing = self._lookup_key(namespace, raw_value=raw_value)
             if existing is None:
-                new_key = self._client.insert(payload)
+                new_key, response = self._client.insert(payload)
                 if new_key is None:
+                    logger.error(
+                        "cheetah insert failed for metadata key=%s response=%s",
+                        key,
+                        response,
+                    )
                     raise CheetahError("failed to insert metadata payload")
                 self._register_pair(namespace, new_key, raw_value=raw_value)
             else:
-                if not self._client.edit(existing, payload):
-                    raise CheetahError("failed to edit metadata payload")
+                success, response = self._client.edit(existing, payload)
+                if not success:
+                    logger.error(
+                        "cheetah edit failed for metadata key=%s entry=%s response=%s",
+                        key,
+                        existing,
+                        response,
+                    )
+                    logger.info("Reinserting metadata key=%s after failed edit", key)
+                    replacement_key, insert_response = self._client.insert(payload)
+                    if replacement_key is None:
+                        logger.error(
+                            "cheetah insert retry failed for metadata key=%s response=%s",
+                            key,
+                            insert_response,
+                        )
+                        raise CheetahError("failed to edit metadata payload")
+                    self._register_pair(namespace, replacement_key, raw_value=raw_value)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -789,8 +842,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
     # Internal helpers
     # ------------------------------------------------------------------ #
     def _insert(self, namespace: str, context_hash: str, payload: bytes) -> int:
-        key = self._client.insert(payload)
+        key, response = self._client.insert(payload)
         if key is None:
+            logger.error(
+                "cheetah insert failed for namespace=%s context_hash=%s response=%s",
+                namespace,
+                context_hash,
+                response,
+            )
             raise CheetahError("failed to insert cheetah payload")
         self._register_pair(namespace, key, context_hash=context_hash)
         return key
@@ -804,7 +863,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
         raw_value: bytes | None = None,
     ) -> None:
         value = self._pair_value(namespace, context_hash=context_hash, raw_value=raw_value)
-        if not self._client.pair_set(value, key):
+        success, response = self._client.pair_set(value, key)
+        if not success:
+            identifier = self._normalize_identifier(context_hash=context_hash, raw_value=raw_value)
+            logger.error(
+                "cheetah pair_set failed for namespace=%s identifier=%s key=%s response=%s",
+                namespace,
+                identifier or "<unknown>",
+                key,
+                response,
+            )
             raise CheetahError("failed to register cheetah pair mapping")
         self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
 

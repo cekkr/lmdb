@@ -10,6 +10,8 @@ import (
 	"sync"
 )
 
+const maxValueSize = int(^uint32(0))
+
 // --- Metodi CRUD per Database ---
 
 func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
@@ -17,28 +19,29 @@ func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
 	if specifiedSize > 0 && valueSize != specifiedSize {
 		return fmt.Sprintf("ERROR,value_size_mismatch (expected %d, got %d)", specifiedSize, valueSize), nil
 	}
-	if valueSize == 0 || valueSize > 255 {
+	if valueSize <= 0 || valueSize > maxValueSize {
 		return "ERROR,invalid_value_size", nil
 	}
 
-	location, err := db.getAvailableLocation(uint8(valueSize))
+	sizeField := uint32(valueSize)
+	location, err := db.getAvailableLocation(sizeField)
 	if err != nil {
 		return "ERROR,cannot_get_value_location", err
 	}
 
-	vTable, err := db.getValuesTable(uint8(valueSize), location.TableID)
+	vTable, err := db.getValuesTable(sizeField, location.TableID)
 	if err != nil {
 		return "ERROR,cannot_load_values_table", err
 	}
-	offset := int64(location.EntryID) * int64(valueSize)
+	offset := int64(location.EntryID) * int64(sizeField)
 	if _, err := vTable.WriteAt(value, offset); err != nil {
 		return "ERROR,value_write_failed", err
 	}
 
 	newKey := db.highestKey.Add(1)
 	entry := make([]byte, MainKeysEntrySize)
-	entry[0] = byte(valueSize)
-	copy(entry[1:], location.Encode())
+	writeValueSize(entry, sizeField)
+	copy(entry[ValueSizeBytes:], location.Encode())
 
 	if err := db.mainKeys.WriteEntry(newKey, entry); err != nil {
 		db.highestKey.Add(^uint64(0)) // Rollback del contatore in caso di errore
@@ -57,17 +60,17 @@ func (db *Database) Read(key uint64) (string, error) {
 		return "ERROR,key_read_failed", err
 	}
 
-	valueSize := uint8(entry[0])
+	valueSize := readValueSize(entry)
 	if valueSize == 0 {
 		return "ERROR,key_not_found (deleted)", nil
 	}
-	location := DecodeValueLocationIndex(entry[1:])
+	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
 
 	vTable, err := db.getValuesTable(valueSize, location.TableID)
 	if err != nil {
 		return "ERROR,cannot_load_values_table", err
 	}
-	value := make([]byte, valueSize)
+	value := make([]byte, int(valueSize))
 	offset := int64(location.EntryID) * int64(valueSize)
 	if _, err := vTable.ReadAt(value, offset); err != nil {
 		return "ERROR,value_read_failed", err
@@ -81,7 +84,7 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 	if err != nil {
 		return "ERROR,key_not_found", err
 	}
-	valueSize := uint8(entry[0])
+	valueSize := readValueSize(entry)
 	if valueSize == 0 {
 		return "ERROR,key_not_found (deleted)", nil
 	}
@@ -89,7 +92,7 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 		return fmt.Sprintf("ERROR,value_size_mismatch (expected %d, got %d)", valueSize, len(newValue)), nil
 	}
 
-	location := DecodeValueLocationIndex(entry[1:])
+	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
 	vTable, err := db.getValuesTable(valueSize, location.TableID)
 	if err != nil {
 		return "ERROR,cannot_load_values_table", err
@@ -111,14 +114,14 @@ func (db *Database) Delete(key uint64) (string, error) {
 	if err != nil {
 		return "ERROR,key_not_found", err
 	}
-	valueSize := uint8(entry[0])
+	valueSize := readValueSize(entry)
 	if valueSize == 0 {
 		return "ERROR,already_deleted", nil
 	}
 
 	// Aggiungi l'indice alla tabella di riciclo
 	locationBytes := make([]byte, ValueLocationIndexSize)
-	copy(locationBytes, entry[1:])
+	copy(locationBytes, entry[ValueSizeBytes:])
 	rTable, err := db.getRecycleTable(valueSize)
 	if err != nil {
 		return "ERROR,cannot_load_recycle_table", err
@@ -166,8 +169,10 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 			if length == 0 && binary.BigEndian.Uint32(data) != 0 {
 				return "ERROR,conflict: a longer key already exists on this path", nil
 			}
-			entry[0] = 6                             // Lunghezza della chiave assoluta
-			binary.BigEndian.PutUint64(data, absKey) // Scrive la chiave nei 6 byte
+			entry[0] = 6 // Lunghezza della chiave assoluta (48 bit)
+			var buf [8]byte
+			binary.BigEndian.PutUint64(buf[:], absKey)
+			copy(data[:6], buf[2:]) // Persist the lower 6 bytes
 			return "SUCCESS,pair_set", currentTable.WriteEntry(branchByte, entry)
 		}
 
