@@ -31,7 +31,9 @@ cheetah-db`) for the DB-SLM stack.
   - `RecycleTable` files keep tombstoned slots per byte length so inserts can reuse space without
     compacting.
   - `PairTable` nodes under `pairs/` encode byte-wise trees whose leaves can store absolute keys or
-    child pointers, giving us a hardware-friendly trie for contextual lookups.
+    child pointers, giving us a hardware-friendly trie for contextual lookups. Each node now keeps a
+    persistent file descriptor guarded by RW locks so concurrent scans/reducers no longer thrash the
+    OS with `OpenFile` calls.
 - `server.go` accepts newline-delimited commands over TCP (same grammar as the CLI) so we can script
   adapters before we embed the engine directly.
 
@@ -119,8 +121,9 @@ stores in either mode.
 ### Reducer hooks
 
 - `PAIR_REDUCE <mode> <prefix> [limit]` piggybacks on the pair iterator but now streams inline
-  payloads (`items=<key_hex>:<abs_key>:<base64_payload>`). Clients no longer have to issue a follow-up
-  `READ` per entry—the reducer returns the binary blob directly.
+  payloads (`items=<key_hex>:<abs_key>:<base64_payload>`). Reducers fan out payload reads across a
+  bounded worker pool to overlap disk I/O with encoding work, so they avoid the single-goroutine
+  bottleneck and still skip the follow-up `READ` hop.
 - Implemented modes:
   - `PAIR_REDUCE counts cnt:<order>` → follower counts serialized via `CheetahSerializer.encode_counts`.
   - `PAIR_REDUCE probabilities prob:<order>` → quantized log-probabilities + backoff alphas.
@@ -129,10 +132,34 @@ stores in either mode.
   union-by-mode pattern. Update `cheetah-db/CONCEPTS.md` when adding new modes so the RPC contract
   remains easy to discover from the Go side.
 
+## Benchmark harness
+
+Use the built-in load generator to run a 30-second mock ingest/lookup cycle:
+
+```bash
+cd cheetah-db
+CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v
+```
+
+The test spins up its own scratch database under `cheetah_data/bench_perf`, spawns `runtime.NumCPU()`
+workers (override via `CHEETAHDB_BENCH_WORKERS`), and records 5-second snapshots in
+`var/eval_logs/cheetah_db_benchmark_<timestamp>.log`.
+
+Latest run (2025-11-12, 30s, 24 workers, 256-byte payloads) produced:
+
+- `inserts=12,293` (`~409/s`)
+- `reads=8,007` (`~266/s`)
+- `pair_set=4,177` (`~139/s`)
+- `pair_get=2,628` (`~87/s`)
+- `errors=115` (expected transient misses while the random sampler waits for keys/pairs)
+- total throughput `~901 ops/s`
+
+See `var/eval_logs/cheetah_db_benchmark_20251112-122356.log` for the full timeline.
+
 ## Directory map
 
-- `commands.go` – user-facing operations (INSERT/READ/EDIT/DELETE/PAIRSET/PAIRGET/etc.).
-- `tables.go` – on-disk table implementations (`MainKeysTable`, `ValuesTable`, `RecycleTable`,
+- `commands.go` - user-facing operations (INSERT/READ/EDIT/DELETE/PAIRSET/PAIRGET/etc.).
+- `tables.go` - on-disk table implementations (`MainKeysTable`, `ValuesTable`, `RecycleTable`,
   `PairTable`).
 - `types.go` – constants and binary layouts shared across tables.
 - `helpers.go` – low-level utilities (value allocations, binary encoding helpers).

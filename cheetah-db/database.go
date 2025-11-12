@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -451,18 +452,68 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int) ([]PairReduceRes
 	if err != nil {
 		return nil, err
 	}
-	reduced := make([]PairReduceResult, 0, len(scanResults))
-	for _, res := range scanResults {
-		payload, err := db.readValuePayload(res.Key)
-		if err != nil {
-			return nil, err
+	if len(scanResults) == 0 {
+		return nil, nil
+	}
+
+	reduced := make([]PairReduceResult, len(scanResults))
+	workerCount := runtime.NumCPU() * 2
+	if workerCount > len(scanResults) {
+		workerCount = len(scanResults)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	var abort atomic.Bool
+
+	setErr := func(e error) {
+		if e == nil {
+			return
 		}
-		reduced = append(reduced, PairReduceResult{
-			Value:   res.Value,
-			Key:     res.Key,
-			Payload: payload,
+		errOnce.Do(func() {
+			firstErr = e
+			abort.Store(true)
 		})
 	}
+
+	for idx, res := range scanResults {
+		if abort.Load() {
+			break
+		}
+		wg.Add(1)
+		go func(i int, res PairScanResult) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if abort.Load() {
+				return
+			}
+			payload, err := db.readValuePayload(res.Key)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			if abort.Load() {
+				return
+			}
+			reduced[i] = PairReduceResult{
+				Value:   res.Value,
+				Key:     res.Key,
+				Payload: payload,
+			}
+		}(idx, res)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
 	return reduced, nil
 }
 

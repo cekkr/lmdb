@@ -169,6 +169,7 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 // /
 type PairTable struct {
 	path string
+	file *os.File
 	mu   sync.RWMutex
 }
 
@@ -177,21 +178,23 @@ func NewPairTable(path string) (*PairTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	// Pre-alloca il file alla dimensione corretta se è nuovo
+	// Pre-alloca il file alla dimensione corretta se A" nuovo
 	info, err := file.Stat()
 	if err != nil {
+		file.Close()
 		return nil, err
 	}
 	if info.Size() == 0 {
 		if err := file.Truncate(int64(PairTablePreallocatedSize)); err != nil {
+			file.Close()
 			return nil, err
 		}
 	}
 
-	return &PairTable{path: path}, nil
+	return &PairTable{path: path, file: file}, nil
 }
+
 
 func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
 	t.mu.RLock()
@@ -199,12 +202,7 @@ func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
 
 	entry := make([]byte, PairEntrySize)
 	offset := int64(branchByte) * int64(PairEntrySize)
-	file, err := os.OpenFile(t.path, os.O_RDONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	_, err = file.ReadAt(entry, offset)
+	_, err := t.file.ReadAt(entry, offset)
 	return entry, err
 }
 
@@ -213,12 +211,7 @@ func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
 	defer t.mu.Unlock()
 
 	offset := int64(branchByte) * int64(PairEntrySize)
-	file, err := os.OpenFile(t.path, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = file.WriteAt(entry, offset)
+	_, err := t.file.WriteAt(entry, offset)
 	return err
 }
 
@@ -227,17 +220,11 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	file, err := os.OpenFile(t.path, os.O_RDONLY, 0644)
+	info, err := t.file.Stat()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return true, nil
 		}
-		return false, err
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
 		return false, err
 	}
 	if info.Size() == 0 {
@@ -245,7 +232,7 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	}
 
 	buffer := make([]byte, info.Size())
-	if _, err := file.ReadAt(buffer, 0); err != nil && err != io.EOF {
+	if _, err := t.file.ReadAt(buffer, 0); err != nil && err != io.EOF {
 		return false, err
 	}
 
@@ -259,7 +246,12 @@ func (t *PairTable) IsEmpty() (bool, error) {
 }
 
 func (t *PairTable) Close() {
-	// I file vengono aperti per operazione; nessuna risorsa persistente da rilasciare.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.file != nil {
+		t.file.Close()
+		t.file = nil
+	}
 }
 
 // Snapshot returns a full copy of the current table state so callers can scan without holding locks.
@@ -267,14 +259,8 @@ func (t *PairTable) Snapshot() ([]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	file, err := os.OpenFile(t.path, os.O_RDONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
 	buf := make([]byte, PairTablePreallocatedSize)
-	if _, err := file.ReadAt(buf, 0); err != nil && err != io.EOF {
+	if _, err := t.file.ReadAt(buf, 0); err != nil && err != io.EOF {
 		return nil, err
 	}
 	return buf, nil
@@ -290,13 +276,7 @@ func (t *PairTable) Analyze() (isTerminal bool, childCount int, singleChildByte 
 	t.mu.RLock() // Basta un read lock per analizzare
 	defer t.mu.RUnlock()
 
-	file, err := os.OpenFile(t.path, os.O_RDONLY, 0644)
-	if err != nil {
-		return false, 0, 0, nil, err
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
+	info, err := t.file.Stat()
 	if err != nil {
 		return false, 0, 0, nil, err
 	}
@@ -305,7 +285,7 @@ func (t *PairTable) Analyze() (isTerminal bool, childCount int, singleChildByte 
 	}
 
 	buffer := make([]byte, info.Size())
-	if _, errRead := file.ReadAt(buffer, 0); errRead != nil {
+	if _, errRead := t.file.ReadAt(buffer, 0); errRead != nil {
 		return false, 0, 0, nil, errRead
 	}
 

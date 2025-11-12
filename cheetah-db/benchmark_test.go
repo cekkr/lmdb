@@ -1,0 +1,315 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type pairEntry struct {
+	value string
+	key   uint64
+}
+
+type sharedState struct {
+	keyMu sync.RWMutex
+	keys  []uint64
+
+	pairMu     sync.RWMutex
+	pairValues []pairEntry
+}
+
+func (s *sharedState) addKey(key uint64) {
+	s.keyMu.Lock()
+	s.keys = append(s.keys, key)
+	s.keyMu.Unlock()
+}
+
+func (s *sharedState) randomKey(r *rand.Rand) (uint64, bool) {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	if len(s.keys) == 0 {
+		return 0, false
+	}
+	return s.keys[r.Intn(len(s.keys))], true
+}
+
+func (s *sharedState) addPair(entry pairEntry) {
+	s.pairMu.Lock()
+	s.pairValues = append(s.pairValues, entry)
+	s.pairMu.Unlock()
+}
+
+func (s *sharedState) randomPair(r *rand.Rand) (pairEntry, bool) {
+	s.pairMu.RLock()
+	defer s.pairMu.RUnlock()
+	if len(s.pairValues) == 0 {
+		return pairEntry{}, false
+	}
+	return s.pairValues[r.Intn(len(s.pairValues))], true
+}
+
+func TestCheetahDBBenchmark(t *testing.T) {
+	if os.Getenv("CHEETAHDB_BENCH") == "" {
+		t.Skip("set CHEETAHDB_BENCH=1 to run the 30s benchmark")
+	}
+	duration := 30 * time.Second
+	if custom := os.Getenv("CHEETAHDB_BENCH_DURATION"); custom != "" {
+		if parsed, err := time.ParseDuration(custom); err == nil {
+			duration = parsed
+		}
+	}
+	valueSize := 256
+	if v := os.Getenv("CHEETAHDB_BENCH_VALUE_SIZE"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			valueSize = parsed
+		}
+	}
+	concurrency := runtime.NumCPU()
+	if v := os.Getenv("CHEETAHDB_BENCH_WORKERS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			concurrency = parsed
+		}
+	}
+
+	logPath, err := runBenchmark(duration, concurrency, valueSize)
+	if err != nil {
+		t.Fatalf("benchmark failed: %v", err)
+	}
+	t.Logf("cheetah-db benchmark finished, log at %s", logPath)
+}
+
+func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, error) {
+	baseDir := filepath.Join("cheetah_data", "bench_perf")
+	if err := os.RemoveAll(baseDir); err != nil {
+		return "", fmt.Errorf("cleanup bench dir: %w", err)
+	}
+
+	engine, err := NewEngine(baseDir)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		engine.Close()
+		_ = os.RemoveAll(baseDir)
+	}()
+
+	db, err := engine.GetDatabase("bench")
+	if err != nil {
+		return "", err
+	}
+
+	state := &sharedState{}
+	if err := warmupInserts(db, state, valueSize, 512); err != nil {
+		return "", fmt.Errorf("warmup failed: %w", err)
+	}
+
+	var insertOps atomic.Int64
+	var readOps atomic.Int64
+	var pairSetOps atomic.Int64
+	var pairGetOps atomic.Int64
+	var errorOps atomic.Int64
+
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)*37))
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				roll := r.Float64()
+				switch {
+				case roll < 0.45:
+					if key, err := insertRandomValue(db, r, valueSize); err != nil {
+						errorOps.Add(1)
+						time.Sleep(2 * time.Millisecond)
+					} else {
+						state.addKey(key)
+						insertOps.Add(1)
+					}
+				case roll < 0.75:
+					if err := readRandomValue(db, r, state); err != nil {
+						errorOps.Add(1)
+						time.Sleep(2 * time.Millisecond)
+					} else {
+						readOps.Add(1)
+					}
+				case roll < 0.90:
+					if err := pairSetRandom(db, r, state); err != nil {
+						errorOps.Add(1)
+						time.Sleep(2 * time.Millisecond)
+					} else {
+						pairSetOps.Add(1)
+					}
+				default:
+					if err := pairGetRandom(db, r, state); err != nil {
+						errorOps.Add(1)
+						time.Sleep(2 * time.Millisecond)
+					} else {
+						pairGetOps.Add(1)
+					}
+				}
+			}
+		}(i)
+	}
+
+	logDir := filepath.Join("..", "var", "eval_logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return "", err
+	}
+	logPath := filepath.Join(logDir, fmt.Sprintf("cheetah_db_benchmark_%s.log", time.Now().UTC().Format("20060102-150405")))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return "", err
+	}
+	defer logFile.Close()
+
+	fmt.Fprintf(logFile, "duration=%s concurrency=%d valueSize=%d\n", duration, concurrency, valueSize)
+	fmt.Fprintf(logFile, "timestamp=%s\n", time.Now().Format(time.RFC3339))
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	start := time.Now()
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		case <-ticker.C:
+			printSnapshot(logFile, start, insertOps.Load(), readOps.Load(), pairSetOps.Load(), pairGetOps.Load(), errorOps.Load())
+		}
+	}
+
+	cancel()
+	wg.Wait()
+	printSnapshot(logFile, start, insertOps.Load(), readOps.Load(), pairSetOps.Load(), pairGetOps.Load(), errorOps.Load())
+	return logPath, nil
+}
+
+func printSnapshot(logFile *os.File, start time.Time, inserts, reads, pairSets, pairGets, errs int64) {
+	elapsed := time.Since(start).Seconds()
+	if elapsed == 0 {
+		return
+	}
+	line := fmt.Sprintf("[%.1fs] inserts=%d reads=%d pair_set=%d pair_get=%d errors=%d | total_qps=%.1f",
+		elapsed,
+		inserts,
+		reads,
+		pairSets,
+		pairGets,
+		errs,
+		float64(inserts+reads+pairSets+pairGets)/elapsed,
+	)
+	fmt.Println(line)
+	if logFile != nil {
+		fmt.Fprintln(logFile, line)
+	}
+}
+
+func warmupInserts(db *Database, state *sharedState, valueSize int, count int) error {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < count; i++ {
+		key, err := insertRandomValue(db, r, valueSize)
+		if err != nil {
+			return err
+		}
+		state.addKey(key)
+	}
+	return nil
+}
+
+func insertRandomValue(db *Database, r *rand.Rand, valueSize int) (uint64, error) {
+	payload := make([]byte, valueSize)
+	if _, err := r.Read(payload); err != nil {
+		return 0, err
+	}
+	resp, err := db.Insert(payload, valueSize)
+	if err != nil {
+		return 0, err
+	}
+	key, err := parseKey(resp)
+	if err != nil {
+		return 0, err
+	}
+	return key, nil
+}
+
+func readRandomValue(db *Database, r *rand.Rand, state *sharedState) error {
+	key, ok := state.randomKey(r)
+	if !ok {
+		return errors.New("no keys available")
+	}
+	resp, err := db.Read(key)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(resp, "SUCCESS") {
+		return fmt.Errorf("read failed: %s", resp)
+	}
+	return nil
+}
+
+func pairSetRandom(db *Database, r *rand.Rand, state *sharedState) error {
+	key, ok := state.randomKey(r)
+	if !ok {
+		return errors.New("no keys available for pair_set")
+	}
+	value := fmt.Sprintf("ctx:%08x:%04x", r.Uint32(), r.Uint32())
+	resp, err := db.PairSet([]byte(value), key)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(resp, "SUCCESS") {
+		return fmt.Errorf("pair_set failed: %s", resp)
+	}
+	state.addPair(pairEntry{value: value, key: key})
+	return nil
+}
+
+func pairGetRandom(db *Database, r *rand.Rand, state *sharedState) error {
+	entry, ok := state.randomPair(r)
+	if !ok {
+		return errors.New("no pairs available")
+	}
+	resp, err := db.PairGet([]byte(entry.value))
+	if err != nil {
+		return err
+	}
+	expected := fmt.Sprintf("key=%d", entry.key)
+	if !strings.Contains(resp, expected) {
+		return fmt.Errorf("pair_get mismatch: expected %s got %s", expected, resp)
+	}
+	return nil
+}
+
+func parseKey(resp string) (uint64, error) {
+	const prefix = "SUCCESS,key="
+	if !strings.HasPrefix(resp, prefix) {
+		return 0, fmt.Errorf("unexpected insert response: %s", resp)
+	}
+	val := strings.TrimPrefix(resp, prefix)
+	key, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return key, nil
+}

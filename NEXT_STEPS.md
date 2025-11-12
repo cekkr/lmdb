@@ -8,3 +8,4 @@
 - Integrate `scripts/drain_queue.py` into the retrain workflow: wire it to the CI/smoke harness, cap the queue at 200 entries, and append throughput snapshots to `studies/BENCHMARKS.md`.
 - Flesh out `cheetah-db/CONCEPTS.md` with the reducer + context-relativism contracts and add regression plans/tests covering Absolute Vector Order payloads.
 - Patch `cheetah-db/PairSet` (or normalize metadata key lengths) so prefix-sharing keys can coexist and update the reducer RPCs to stream large payloads in chunks. Document the fixes in `AI_REFERENCE.md` + `cheetah-db/README.md` and add regression coverage.
+- Extend the new `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark` harness: capture pair-scan throughput, push the logs into `studies/BENCHMARKS.md`, and trim the transient "no key/pair" errors by seeding more mock data before the timed window.

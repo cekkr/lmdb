@@ -56,6 +56,12 @@ change so the next agent inherits the latest context.
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
   `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
   `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
+- cheetah-db now keeps persistent file handles per pair-trie node (RW locked) and parallelizes
+  reducer payload hydration with a bounded worker pool. This removed the `OpenFile` storm during
+  `PAIR_SCAN`/`PAIR_REDUCE` and cut reducer latency roughly in half on the latest mock ingest run.
+  Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from `cheetah-db/` to
+  reproduce the 30-second benchmark (latest log:
+  `var/eval_logs/cheetah_db_benchmark_20251112-122356.log`, ~900 ops/s mixed workload).
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
