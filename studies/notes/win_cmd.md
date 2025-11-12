@@ -6,6 +6,9 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive -
 > PS C:\Users\Riccardo Cecchini> wsl.exe -d Ubuntu-24.04 -- whoami
 > riccardo
 
+### Default "next steps" prompt:
+[AI_REFERENCE.md](AI_REFERENCE.md) continue with NEXT_STEPS.md implementations to do in code or later updating [NEXT_STEPS.md](NEXT_STEPS.md). 
+
 The current OS is Windows: use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
 Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- echo example
 When executing cheetah-db server and both train/smoke-trains, use screen or you get stuck. Example:
@@ -15,3 +18,4 @@ Remember that you have to run in parallel cheetah-db server with other scripts, 
 You can fallback on tmux, but for keeping alive a screen session detaching it you have to do: screen -d -m -S session_name "your_command_here".
 Example: screen -d -m -S web_server "python3 -m http.server 8000"
 Save and check logs in real time (every 30 seconds circa in long term cases, for preventing excessive number of calls), prevent stucks (no more outputs), infinity loops and running test no longer than 30 minutes.
+
