@@ -30,20 +30,23 @@ For the "lmdb" version to be implemented, it must be adapted as best as possible
 - The Python bridge now mirrors higher-level metadata into cheetah so a restarted trainer or decoder
   can warm its caches without reading SQLite. All entries live under the `meta` namespace using the
   `PAIR_SET meta x<key>` path (see `CheetahHotPathAdapter.write_metadata`).
-- Keys and layouts:
-  - `l2:stats:<conversation_id>` → JSON object with `message_count`, `user_turns`,
+- Keys and layouts (visible as `meta:l2:*` entries because the Python adapter writes `l2:*` keys
+  through the `meta` namespace automatically):
+  - `meta:l2:stats:<conversation_id>` → JSON object with `message_count`, `user_turns`,
     `assistant_turns`, `started_at`, `updated_at`.
-  - `l2:corr:<conversation_id>` → JSON array containing the most recent correction digests, each
+  - `meta:l2:corr:<conversation_id>` → JSON array containing the most recent correction digests, each
     shaped as `{"correction_id": "...", "payload": {...}}`.
-  - `l2:bias:<conversation_id | __global__>` → JSON array of bias presets mirroring
-    `tbl_l2_token_bias` rows (`pattern`, `token_id`, `q_bias`, `expires_at`).
+  - `meta:l2:bias:<conversation_id | __global__>` → JSON array of bias presets mirroring
+    `tbl_l2_token_bias` rows (`pattern`, `token_id`, `q_bias`, `expires_at`). Legacy
+    `meta:meta:l2:*` entries (written by older trainers) continue to load because Python now
+    canonicalizes keys before reading/writing.
 - When these entries exist the decoder skips the SQL round-trip entirely; the mirroring happens
   synchronously whenever the conversation log, correction store, or bias table mutates.
 - Regression plan:
   1. Log a conversation turn, then `PAIR_GET meta x6c32...` (stats key) and assert the counts tick up.
-  2. Record a correction and ensure the `l2:corr:` array is trimmed to the configured window.
-  3. Insert a global bias row and confirm both `l2:bias:__global__` and prefix scans return the JSON
-     payload without needing SQLite.
+  2. Record a correction and ensure the `meta:l2:corr:` array is trimmed to the configured window.
+  3. Insert a global bias row and confirm both `meta:l2:bias:__global__` and prefix scans return the
+     JSON payload without needing SQLite.
 
 ### Reducer RPCs
 

@@ -61,7 +61,8 @@ change so the next agent inherits the latest context.
   `meta:l2:stats:<conversation_id>`, correction digests to `meta:l2:corr:<conversation_id>`, and
   bias presets to `meta:l2:bias:<conversation_id|__global__>`. Decoder/cache components consult those
   JSON blobs first so a restarted trainer no longer needs warm-up SQL reads before issuing concept or
-  bias-aware generations.
+  bias-aware generations. Metadata helpers now strip duplicate `meta:` prefixes and fall back to
+  legacy `meta:meta:l2:*` entries so existing mirrors stay readable while new writes remain canonical.
 - cheetah-db now keeps persistent file handles per pair-trie node (RW locked), parallelizes reducer
   payload hydration with a bounded worker pool, and treats child pointers + terminal keys as
   independent flags so prefix-sharing namespaces (`ctx:*`, `ctxv:*`, `topk:*`, etc.) finally

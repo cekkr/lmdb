@@ -120,7 +120,10 @@ adapter status stays visible to future maintainers.
   mirrored alongside counts, so reducers can fetch everything needed for MKNS without touching
   SQLite.
 - Metadata (context dimensions, decode profiles, cache lambdas) is persisted under the `meta:`
-  namespace so new Python processes can cold-start without re-reading SQLite tables.
+  namespace so new Python processes can cold-start without re-reading SQLite tables. Level 2
+  conversation stats, correction digests, and bias presets surface as `meta:l2:*` keys, and the
+  Python helpers normalize duplicate `meta:` prefixes so older mirrors (`meta:meta:l2:*`) remain
+  readable while new writes stay canonical.
 - Upcoming roadmap items (statistical reducers, ordered trie slices) should extend the same adapter
   so DB-SLM can eventually run entirely on the Go engine once Level 2/3 tables get equivalents.
 

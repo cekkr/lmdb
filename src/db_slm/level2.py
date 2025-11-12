@@ -11,6 +11,35 @@ if TYPE_CHECKING:  # pragma: no cover
 
 from .db import DatabaseEnvironment
 
+META_NAMESPACE_PREFIX = "meta:"
+
+
+def _canonical_meta_key(key: str) -> str:
+    """Strip any leading meta namespace prefix so hot-path adapters don't double-prefix."""
+    if key.startswith(META_NAMESPACE_PREFIX):
+        return key[len(META_NAMESPACE_PREFIX) :]
+    return key
+
+
+def _meta_key_candidates(key: str) -> tuple[str, ...]:
+    """Return ordered metadata key candidates including legacy meta-prefixed forms."""
+    canonical = _canonical_meta_key(key)
+    candidates = [canonical]
+    if key != canonical:
+        candidates.append(key)
+    else:
+        prefixed = f"{META_NAMESPACE_PREFIX}{canonical}"
+        if prefixed:
+            candidates.append(prefixed)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return tuple(ordered)
+
 
 @dataclass(frozen=True)
 class Message:
@@ -194,7 +223,8 @@ class ConversationMemory:
         writer = getattr(self.hot_path, "write_metadata", None)
         if not writer:
             return
-        writer(key, json.dumps(value, separators=(",", ":")))
+        canonical = _canonical_meta_key(key) or key
+        writer(canonical, json.dumps(value, separators=(",", ":")))
 
     def _read_metadata(self, key: str) -> Any | None:
         if not self.hot_path:
@@ -202,13 +232,15 @@ class ConversationMemory:
         reader = getattr(self.hot_path, "read_metadata", None)
         if not reader:
             return None
-        raw = reader(key)
-        if not raw:
-            return None
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return None
+        for candidate in _meta_key_candidates(key):
+            raw = reader(candidate)
+            if not raw:
+                continue
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+        return None
 
     def _empty_stats(self) -> Dict[str, int | str | None]:
         return {
@@ -524,7 +556,8 @@ class BiasEngine:
         writer = getattr(self.hot_path, "write_metadata", None)
         if not writer:
             return
-        writer(key, json.dumps(entries[: self._bias_cache_limit], separators=(",", ":")))
+        canonical = _canonical_meta_key(key) or key
+        writer(canonical, json.dumps(entries[: self._bias_cache_limit], separators=(",", ":")))
 
     def _read_bias_metadata(self, key: str) -> List[dict[str, Any]] | None:
         if not self.hot_path:
@@ -532,17 +565,19 @@ class BiasEngine:
         reader = getattr(self.hot_path, "read_metadata", None)
         if not reader:
             return None
-        raw = reader(key)
-        if not raw:
-            return None
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, list):
-            return None
-        entries: List[dict[str, Any]] = []
-        for item in data:
-            if isinstance(item, dict):
-                entries.append(item)
-        return entries
+        for candidate in _meta_key_candidates(key):
+            raw = reader(candidate)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, list):
+                continue
+            entries: List[dict[str, Any]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    entries.append(item)
+            return entries
+        return None
