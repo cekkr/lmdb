@@ -72,10 +72,26 @@ def build_command(
         "--chunk-eval-percent",
         "0",
         "--profile-ingest",
+        "--max-json-lines",
+        str(args.max_json_lines),
         "--metrics-export",
         str(metrics_path),
     ]
     return cmd
+
+
+def _cap_queue(queue_path: Path, cap: int) -> None:
+    if cap <= 0 or not queue_path.exists():
+        return
+    with queue_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        lines = handle.readlines()
+    if len(lines) <= cap:
+        return
+    trimmed = lines[-cap:]
+    tmp_path = queue_path.with_suffix(queue_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.writelines(trimmed)
+    tmp_path.replace(queue_path)
 
 
 def main(argv: list[str]) -> int:
@@ -91,6 +107,18 @@ def main(argv: list[str]) -> int:
         type=int,
         default=200,
         help="Chunk size to reuse from the queue-drain preset (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-json-lines",
+        type=int,
+        default=500,
+        help="Force the trainer to process at most this many JSON lines per batch (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--queue-cap",
+        type=int,
+        default=200,
+        help="Trim the queue back down to this many entries after a successful drain (default: %(default)s).",
     )
     parser.add_argument(
         "--ngram-order",
@@ -139,6 +167,7 @@ def main(argv: list[str]) -> int:
         print("[drain] dry-run command:", " ".join(cmd))
         return 0
     subprocess.run(cmd, check=True, env=env)
+    _cap_queue(queue_path, args.queue_cap)
     stats = _parse_metrics(metrics_path)
     if stats:
         tokens = stats.get("tokens")

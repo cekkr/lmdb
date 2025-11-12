@@ -6,7 +6,10 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive -
 > PS C:\Users\Riccardo Cecchini> wsl.exe -d Ubuntu-24.04 -- whoami
 > riccardo
 
-Use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
-Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- whoami
+The current OS is Windows: use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
+Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- echo example
+When executing cheetah-db server, use screen or you get stuck. Example:
+`wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/Sources/GitHub/lmdb/cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`.
+Remember to kill the session (`screen -ls` + `screen -wipe` or `pkill -f cheetah-server`) when you finish or re-compile the server.
 
 Remember that you have to run in parallel cheetah-db server with other script, and to stop both of them before recompilation and after end of executions.

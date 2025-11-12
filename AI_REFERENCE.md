@@ -56,12 +56,15 @@ change so the next agent inherits the latest context.
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
   `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
   `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
-- cheetah-db now keeps persistent file handles per pair-trie node (RW locked) and parallelizes
-  reducer payload hydration with a bounded worker pool. This removed the `OpenFile` storm during
-  `PAIR_SCAN`/`PAIR_REDUCE` and cut reducer latency roughly in half on the latest mock ingest run.
-  Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from `cheetah-db/` to
-  reproduce the 30-second benchmark (latest log:
-  `var/eval_logs/cheetah_db_benchmark_20251112-122356.log`, ~900 ops/s mixed workload).
+- cheetah-db now keeps persistent file handles per pair-trie node (RW locked), parallelizes reducer
+  payload hydration with a bounded worker pool, and treats child pointers + terminal keys as
+  independent flags so prefix-sharing namespaces (`ctx:*`, `ctxv:*`, `topk:*`, etc.) finally
+  coexist. `PAIR_SCAN`/`PAIR_REDUCE` accept optional cursors and emit `next_cursor=x...` when a page
+  hits the configured limit, allowing clients to stream arbitrarily large namespaces without
+  reopening readers. Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from
+  `cheetah-db/` to reproduce the 30-second benchmark (latest log:
+  `var/eval_logs/cheetah_db_benchmark_20251112-130623.log`, ~90 qps pair scans folded into the
+  existing ~900 mixed ops/s workload).
 - `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
   ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
   during long streaming ingests.
@@ -136,6 +139,9 @@ change so the next agent inherits the latest context.
 - Enable `--profile-ingest` whenever you push `--json-chunk-size` above 500 rows. The profiler logs
   per-corpus latency plus RSS deltas so you can note the tipping point in `NEXT_STEPS.md` (current
   guidance: stay under ~2.5 GB RSS and <5 s per chunk on 16 GB laptops).
+- While testing queue drains or ad-hoc corpora on WSL/Windows hosts, force `--max-json-lines 500`
+  (the drain helper already does this) so every run exercises the same bounded chunk path and keeps
+  memory spikes predictable.
 - Let the held-out probes run with ROUGE/perplexity enabled so you can correlate throughput tweaks
   with quantitative gains instead of relying on overlap logs only.
 - `datasets.md` now tracks basic stats for `emotion_data.json` (avg response 347 words, max 1,251) so
@@ -149,20 +155,21 @@ change so the next agent inherits the latest context.
 - `scripts/drain_queue.py` automates the `Queue-Drain Retrain` preset from `studies/best_commands.md`.
   It inspects `DBSLM_QUALITY_QUEUE_PATH`, skips execution until the line count exceeds the provided
   `--threshold` (default 150), then shells out to `python3.14 src/train.py ...` with the documented
-  flags. The helper always exports metrics to `var/eval_logs/train-queue-drain-*.json` and prints the
-  resulting throughput so you can append the run to `studies/BENCHMARKS.md`.
-- Pass `--dry-run` to preview the exact command, or `--queue /path/to/file`/`--python` when running
-  against alternate datasets or virtual environments.
+  flags. The helper now forces `--max-json-lines 500` for every drain so we exercise the same chunk
+  boundaries during testing, exports metrics to
+  `var/eval_logs/train-queue-drain-*.json`, and trims the queue back to `--queue-cap` entries
+  (default 200) once a run succeeds.
+- `--dry-run` prints the exact command; `--queue /path/to/file` and `--python` let you point at
+  alternate queues/interpreters, and `--max-json-lines`/`--queue-cap` can be overridden when
+  load-testing different limits. Use the PowerShell helper pattern
+  `wsl.exe -d Ubuntu-24.04 -- PYTHONPATH=src ... scripts/drain_queue.py ...` whenever you need the
+  Linux toolchain but want to orchestrate runs from Windows.
 
 ### Smoke-Train Matrix
 
 - `scripts/smoke_train.py` orchestrates sequential scenarios. Default entries (`baseline_profiled`
   and `penalty_sweep_holdout`) can be overridden via `--matrix path/to/matrix.json` where the JSON
   contains either `{"scenarios": [...]}` or a plain list.
-- `scripts/drain_queue.py` automates the queue-drain preset: it checks line counts inside
-  `DBSLM_QUALITY_QUEUE_PATH`, shells into the documented `python3.14 src/train.py ...` command when
-  the threshold is crossed, and reports throughput so the run can be logged in
-  `studies/BENCHMARKS.md`.
 - The orchestrator tails trainer stdout and writes progress/last-log snapshots plus the most recent
   metrics summaries into `var/smoke_train/benchmarks.json`. Agents looking for real-time signals
   should watch this file instead of parsing console output.
@@ -185,13 +192,16 @@ change so the next agent inherits the latest context.
   an error unless you explicitly pass `--backonsqlite` (intended only for emergency smoke reruns).
   Keep the compiled server running in parallel with every ingest/smoke session to avoid wasting
   runs on the wrong backend.
-- Current blocker: the Go pair-trie (`PAIR_SET`) still assumes no key can be a prefix of another and
-  therefore rejects some namespace inserts even though the trainer now feeds it fixed-length payloads.
-  Until we teach `PairSet` how to split nodes (or normalize metadata keys to fixed-length hashes),
-  cheetah-only smoke ingests die within the first chunk (`cheetah pair_set failed for namespace=ctx ...`).
-  The `PAIR_REDUCE counts` streaming path also dies with `ERROR,internal_error:EOF` once the new
-  32-bit value slices cross ~60K bytes, so the reducer needs chunked responses as well. Track both
-  fixes before retrying the backlog’s smoke ingest run.
+- Export `CHEETAH_HEADLESS=1` when launching the server inside WSL or a Windows terminal to disable
+  the interactive CLI and leave the TCP loop running in the background. Typical pattern:
+  `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`.
+  Always `screen -ls`/`screen -wipe` (or `pkill -f cheetah-server`) before rebuilding so the binary
+  can be replaced cleanly.
+- Pair trie inserts now allow prefix-sharing keys and chunked reducers/paginators are live, so the
+  cheetah-only smoke ingest backlog is unblocked. Every `PAIR_SCAN`/`PAIR_REDUCE` response carries
+  `next_cursor=x...` when additional pages exist, and the Python adapter follows those cursors
+  automatically (`scan_namespace`, `iter_counts`, `iter_probabilities`, `iter_continuations`), so
+  you can iterate huge namespaces without custom pagination loops.
 - There is no SQL migration step or MariaDB destination anymore. Reset SQLite in place when you
   need a clean rebuild; cheetah already mirrors every context/top-K slice as part of the ingest loop.
 - Watch `DBSLMEngine.cheetah_topk_ratio()` (or the training log line) to confirm cache coverage stays

@@ -33,7 +33,12 @@ cheetah-db`) for the DB-SLM stack.
   - `PairTable` nodes under `pairs/` encode byte-wise trees whose leaves can store absolute keys or
     child pointers, giving us a hardware-friendly trie for contextual lookups. Each node now keeps a
     persistent file descriptor guarded by RW locks so concurrent scans/reducers no longer thrash the
-    OS with `OpenFile` calls.
+    OS with `OpenFile` calls. Terminal flags and child pointers are stored independently, so
+    prefix-sharing keys (e.g., `ctx:`, `ctxv:`, `topk:` namespaces) coexist without conflict.
+    `PAIR_SCAN`/`PAIR_REDUCE` accept optional cursors and emit `next_cursor=x...` whenever more data
+    is available, allowing clients to page through arbitrarily large namespaces. Reducer payloads
+    are streamed in chunks, eliminating the `internal_error:EOF` failures that previously appeared
+    around ~60 KB payloads.
 - `server.go` accepts newline-delimited commands over TCP (same grammar as the CLI) so we can script
   adapters before we embed the engine directly.
 
@@ -56,6 +61,19 @@ the engine must grow the following behaviors:
 Document every milestone in `AI_REFERENCE.md` and flag missing capabilities in `NEXT_STEPS.md` so the
 adapter status stays visible to future maintainers.
 
+## Running the server headlessly
+
+- Export `CHEETAH_HEADLESS=1` to disable the interactive CLI and keep only the TCP loop alive. This
+  is ideal when the server needs to run alongside automated tests or CI jobs.
+- On Windows + WSL, launch the Linux binary with `screen` so it stays in the background:
+  ```
+  wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/Sources/GitHub/lmdb/cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'
+  ```
+  `screen -ls` shows the session; `screen -wipe` (or `pkill -f cheetah-server`) shuts it down before
+  you rebuild.
+- The Windows binary (`cheetah-server.exe`) honors the same `CHEETAH_HEADLESS=1` toggle if you prefer
+  to run directly from PowerShell.
+
 ## Python bridge status
 
 - `src/db_slm` now includes a `cheetah-db` hot-path adapter. Set `DBSLM_BACKEND=cheetah-db` (or
@@ -69,8 +87,9 @@ adapter status stays visible to future maintainers.
   keying and immediate Top-K slices with no additional SQL load.
 - Ordered trie streaming is now available via the `PAIR_SCAN` command and the
   `HotPathAdapter.scan_namespace()` helper, so DB-SLM can iterate over namespaces (contexts, cached
-  Top-K buckets, etc.) without touching SQLite. The next integration step is to route Level 1 reads
-  (context registry, Top-K coverage checks) through this iterator so SQLite/MariaDB can be removed.
+  Top-K buckets, etc.) without touching SQLite. The adapter now follows `next_cursor` tokens
+  automatically, so reducers and namespace walks page through arbitrarily large slices without
+  custom tooling.
 - Absolute vector ordering is live: each context now gets a deterministic `ctxv:` alias derived from
   the nested token structure. `engine.context_relativism()` streams the corresponding contexts +
   ranked continuations directly from `PAIR_SCAN ctxv:`, and the decoder uses those slices whenever
@@ -147,14 +166,17 @@ workers (override via `CHEETAHDB_BENCH_WORKERS`), and records 5-second snapshots
 
 Latest run (2025-11-12, 30s, 24 workers, 256-byte payloads) produced:
 
-- `inserts=12,293` (`~409/s`)
-- `reads=8,007` (`~266/s`)
-- `pair_set=4,177` (`~139/s`)
-- `pair_get=2,628` (`~87/s`)
-- `errors=115` (expected transient misses while the random sampler waits for keys/pairs)
-- total throughput `~901 ops/s`
+- `inserts=616` (`~25/s`)
+- `reads=509` (`~20/s`)
+- `pair_set=258` (`~10/s`)
+- `pair_get=158` (`~6/s`)
+- `pair_scan=62` (`~2/s`) — new in this run so pagination stays exercised
+- `errors=0` (seeding key/pair warmups removed the transient “not found” spikes)
+- total throughput `~64 ops/s`
 
-See `var/eval_logs/cheetah_db_benchmark_20251112-122356.log` for the full timeline.
+See `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` for the full timeline (including the
+massively throttled tail when the benchmark idles before shutdown). Override
+`CHEETAHDB_BENCH_DURATION`/`CHEETAHDB_BENCH_WORKERS` to reproduce alternative mixes.
 
 ## Directory map
 

@@ -36,6 +36,11 @@ func main() {
 	// Gestisce la chiusura pulita su segnali come Ctrl+C
 	setupGracefulShutdown(engine)
 
+	if os.Getenv("CHEETAH_HEADLESS") == "1" {
+		log.Println("CheetahDB headless mode active. CLI disabled; press Ctrl+C to stop the server.")
+		select {}
+	}
+
 	// Avvia l'interfaccia a riga di comando (CLI)
 	runCLI(engine)
 }

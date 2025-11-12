@@ -52,6 +52,10 @@ from the database.
 - `cheetah-db/` hosts the Go service that now acts as a low-latency mirror for Level 1 contexts.
   Build it with `bash cheetah-db/build.sh` and launch `./cheetah-db/cheetah-server` before
   running the Python tools.
+- Export `CHEETAH_HEADLESS=1` when launching the server (e.g.
+  `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`)
+  to disable the interactive CLI and keep the TCP listener running in the background. Remember to
+  `screen -ls`/`screen -wipe` (or stop the Windows process) before rebuilding the binary.
 - Leave `DBSLM_BACKEND=cheetah-db` (the new default) when you want the trainer/decoder to fetch
   Top-K slices from the Go engine. When you only need a sidecar cache (SQLite remains canonical),
   switch the backend to `sqlite` and toggle `DBSLM_CHEETAH_MIRROR=1`.
@@ -60,6 +64,9 @@ from the database.
 - During ingest the Python pipeline now streams new context metadata and Top-K probability slices
   into cheetah so the decoder can read them without re-querying SQLite, satisfying the first step of
   the adapter roadmap outlined in `cheetah-db/README.md`.
+- `PAIR_SCAN`/`PAIR_REDUCE` now accept optional cursors and return `next_cursor=x...` when more data
+  is available. The Python adapter follows these cursors automatically, so namespace walks and
+  reducer projections can stream through arbitrary volumes of contexts without manual pagination.
 
 ## Training CLI (`src/train.py`)
 
@@ -220,9 +227,13 @@ laptops.
 
 Use `scripts/drain_queue.py` when the retrain queue approaches 150 entries. The helper inspects
 `DBSLM_QUALITY_QUEUE_PATH`, runs the documented queue-drain preset via `python3.14 src/train.py ...`,
-and writes the resulting metrics JSON path + throughput back to stdout so you can log the cleanup
-inside `studies/BENCHMARKS.md`. Pass `--threshold <value>` to tune when the drain should fire or
-`--dry-run` to print the command without launching a run.
+forces `--max-json-lines 500` to keep chunk sizes consistent during tests, and trims the queue back
+to `--queue-cap` entries (defaults to 200) after a successful drain. Metrics land in
+`var/eval_logs/train-queue-drain-*.json`; throughput and the metrics path are echoed to stdout so you
+can log the cleanup inside `studies/BENCHMARKS.md`. `--threshold`, `--max-json-lines`, and
+`--queue-cap` are tunable, `--python` lets you point at a custom interpreter, and `--dry-run`
+previews the exact command (useful when orchestrating via
+`wsl.exe -d Ubuntu-24.04 -- PYTHONPATH=src ... scripts/drain_queue.py ...`).
 
 ## Inference CLI (`src/run.py`)
 
