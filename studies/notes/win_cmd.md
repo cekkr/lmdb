@@ -7,7 +7,7 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive -
 > riccardo
 
 ### Default "next steps" prompt:
-[AI_REFERENCE.md](AI_REFERENCE.md) continue with NEXT_STEPS.md implementations to do in code or later updating [NEXT_STEPS.md](NEXT_STEPS.md). 
+[AI_REFERENCE.md](AI_REFERENCE.md): continue with NEXT_STEPS.md implementations to do in code or later updating [NEXT_STEPS.md](NEXT_STEPS.md). 
 
 The current OS is Windows: use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
 Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- echo example
