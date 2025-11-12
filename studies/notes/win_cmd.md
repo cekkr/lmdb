@@ -8,3 +8,5 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive -
 
 Use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
 Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- whoami
+
+Remember that you have to run in parallel cheetah-db server with other script, and to stop both of them before recompilation and after end of executions.
