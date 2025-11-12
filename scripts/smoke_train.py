@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -187,11 +188,17 @@ class RunTracker:
 
 
 class TelemetryMonitor(threading.Thread):
-    def __init__(self, settings: DBSLMSettings, interval: float = 15.0) -> None:
+    def __init__(
+        self,
+        settings: DBSLMSettings,
+        interval: float = 15.0,
+        queue_drain: "QueueDrainAutomation | None" = None,
+    ) -> None:
         super().__init__(daemon=True)
         self.settings = settings
         self.interval = interval
         self._stop_event = threading.Event()
+        self._queue_drain = queue_drain
         self._client = CheetahClient(
             settings.cheetah_host,
             settings.cheetah_port,
@@ -266,6 +273,161 @@ class TelemetryMonitor(threading.Thread):
             f"cpu_seconds={cpu_seconds:.2f}" if cpu_seconds is not None else "cpu_seconds=unknown",
             f"rss_mb={rss_mb:.1f}" if rss_mb is not None else "rss_mb=unknown",
         )
+        if self._queue_drain:
+            self._queue_drain.maybe_trigger(queue_depth)
+
+
+class QueueDrainAutomation:
+    """Automatically kicks off queue drains and mirrors their metrics into studies."""
+
+    def __init__(
+        self,
+        *,
+        python_bin: str,
+        script_path: Path,
+        metrics_dir: Path,
+        benchmarks_path: Path,
+        threshold: int,
+        cooldown_seconds: float,
+        chunk_size: int = 200,
+        max_json_lines: int = 500,
+        queue_cap: int = 200,
+    ) -> None:
+        self.python_bin = python_bin
+        self.script_path = script_path
+        self.metrics_dir = metrics_dir
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
+        self.benchmarks_path = benchmarks_path
+        self.benchmarks_path.parent.mkdir(parents=True, exist_ok=True)
+        self.threshold = max(1, threshold)
+        self.cooldown_seconds = max(10.0, cooldown_seconds)
+        self.chunk_size = max(1, chunk_size)
+        self.max_json_lines = max(1, max_json_lines)
+        self.queue_cap = max(1, queue_cap)
+        self._lock = threading.Lock()
+        self._active = False
+        self._last_trigger = 0.0
+
+    def maybe_trigger(self, queue_depth: int) -> None:
+        if queue_depth < self.threshold:
+            return
+        with self._lock:
+            now = time.time()
+            if self._active:
+                return
+            if (now - self._last_trigger) < self.cooldown_seconds:
+                return
+            self._active = True
+        thread = threading.Thread(target=self._run_once, args=(queue_depth,), daemon=True)
+        thread.start()
+
+    def _run_once(self, queue_depth: int) -> None:
+        metrics_path = self.metrics_dir / f"train-queue-auto-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        command = [
+            self.python_bin,
+            str(self.script_path),
+            "--threshold",
+            str(self.threshold),
+            "--chunk-size",
+            str(self.chunk_size),
+            "--max-json-lines",
+            str(self.max_json_lines),
+            "--queue-cap",
+            str(self.queue_cap),
+            "--metrics",
+            str(metrics_path),
+        ]
+        env = os.environ.copy()
+        src_path = str(SRC_ROOT)
+        existing_pythonpath = env.get("PYTHONPATH")
+        if existing_pythonpath and src_path not in existing_pythonpath.split(os.pathsep):
+            env["PYTHONPATH"] = os.pathsep.join([src_path, existing_pythonpath])
+        elif not existing_pythonpath:
+            env["PYTHONPATH"] = src_path
+        log(
+            "[queue-drain]",
+            f"trigger depth={queue_depth}",
+            f"command={' '.join(shlex.quote(part) for part in command)}",
+        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(SCRIPT_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log("[queue-drain]", f"failed to start drain: {exc}")
+            self._mark_finished()
+            return
+        if result.returncode != 0:
+            log(
+                "[queue-drain]",
+                f"drain command failed (exit={result.returncode})",
+                f"stdout={result.stdout.strip() or '<empty>'}",
+                f"stderr={result.stderr.strip() or '<empty>'}",
+            )
+            self._mark_finished()
+            return
+        self._record_benchmark(queue_depth, metrics_path, command)
+        self._mark_finished()
+
+    def _mark_finished(self) -> None:
+        with self._lock:
+            self._active = False
+            self._last_trigger = time.time()
+
+    def _record_benchmark(self, queue_depth: int, metrics_path: Path, command: list[str]) -> None:
+        if not metrics_path.exists():
+            log("[queue-drain]", f"metrics not found: {metrics_path}")
+            return
+        try:
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log("[queue-drain]", f"invalid metrics JSON: {metrics_path}")
+            return
+        summary = self._summarize_metrics(payload)
+        formatted_command = " ".join(shlex.quote(part) for part in command)
+        heading = f"## {datetime.now(timezone.utc).strftime('%Y-%m-%d')} - Queue Drain (auto smoke harness)"
+        lines = [
+            "",
+            heading,
+            f"- Trigger: queue depth {queue_depth} exceeded {self.threshold}; command `{formatted_command}`.",
+            f"- Metrics file: `{metrics_path.as_posix()}`; tokens={summary['tokens']} windows={summary['windows']} throughput={summary['throughput']}.",
+            f"- Status: {summary['status']} (started {summary['started_at']} / completed {summary['completed_at']}).",
+            "- Notes: appended automatically by `scripts/smoke_train.py` when the quality queue overflowed.",
+            "",
+        ]
+        with self.benchmarks_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        log("[queue-drain]", f"recorded metrics -> {self.benchmarks_path}")
+
+    def _summarize_metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        totals = payload.get("totals", {})
+        tokens = totals.get("tokens", "unknown")
+        windows = totals.get("windows", "unknown")
+        started = payload.get("started_at")
+        completed = payload.get("completed_at")
+        throughput = "unknown"
+        if started and completed and isinstance(tokens, (int, float)):
+            try:
+                start_ts = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                end_ts = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                elapsed = max((end_ts - start_ts).total_seconds(), 0.001)
+                throughput = f"{float(tokens) / elapsed:.2f} tokens/s"
+            except Exception:
+                throughput = "unknown"
+        status = payload.get("status", "unknown")
+        return {
+            "tokens": tokens,
+            "windows": windows,
+            "throughput": throughput,
+            "status": status,
+            "started_at": started or "unknown",
+            "completed_at": completed or "unknown",
+        }
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -621,6 +783,38 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between cheetah telemetry snapshots (default %(default)s).",
     )
     parser.add_argument(
+        "--queue-drain-threshold",
+        type=int,
+        default=175,
+        help="Queue depth that triggers the automatic drain helper (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--queue-drain-cooldown",
+        type=float,
+        default=900.0,
+        help="Minimum seconds between automated drains (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--queue-drain-script",
+        default="scripts/drain_queue.py",
+        help="Path to the drain helper script (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--queue-drain-metrics-dir",
+        default="var/smoke_train/drains",
+        help="Directory for automated queue-drain metrics exports.",
+    )
+    parser.add_argument(
+        "--queue-drain-benchmarks",
+        default="studies/BENCHMARKS.md",
+        help="Markdown file that receives auto queue-drain entries (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--disable-auto-queue-drain",
+        action="store_true",
+        help="Disable automatic queue draining even when depth exceeds the threshold.",
+    )
+    parser.add_argument(
         "--matrix",
         type=Path,
         help="Optional JSON file describing the smoke-train scenario matrix.",
@@ -666,8 +860,22 @@ def main() -> int:
         log("[smoke-train] No scenarios selected.")
         return 0
     monitor: TelemetryMonitor | None = None
+    drain_automation: QueueDrainAutomation | None = None
+    if not args.disable_auto_queue_drain and not args.dry_run:
+        drain_automation = QueueDrainAutomation(
+            python_bin=args.python,
+            script_path=Path(args.queue_drain_script),
+            metrics_dir=Path(args.queue_drain_metrics_dir),
+            benchmarks_path=Path(args.queue_drain_benchmarks),
+            threshold=args.queue_drain_threshold,
+            cooldown_seconds=args.queue_drain_cooldown,
+        )
     if not args.dry_run:
-        monitor = TelemetryMonitor(settings, interval=max(1.0, args.telemetry_interval))
+        monitor = TelemetryMonitor(
+            settings,
+            interval=max(1.0, args.telemetry_interval),
+            queue_drain=drain_automation,
+        )
         monitor.start()
     result_code = 0
     try:

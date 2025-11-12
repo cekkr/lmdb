@@ -4,7 +4,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Sequence, TYPE_CHECKING
+from typing import Any, Dict, List, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from .adapters.base import HotPathAdapter
@@ -30,9 +30,18 @@ class Correction:
 class ConversationMemory:
     """Level 2 episodic store with cached rolling windows."""
 
-    def __init__(self, db: DatabaseEnvironment, window: int = 8) -> None:
+    def __init__(
+        self,
+        db: DatabaseEnvironment,
+        window: int = 8,
+        *,
+        hot_path: "HotPathAdapter | None" = None,
+        correction_cache: int = 5,
+    ) -> None:
         self.db = db
         self.window = window
+        self.hot_path = hot_path
+        self._correction_cache = max(1, correction_cache)
 
     def start_conversation(self, user_id: str, agent_name: str) -> str:
         conversation_id = str(uuid.uuid4())
@@ -43,6 +52,8 @@ class ConversationMemory:
             """,
             (conversation_id, user_id, agent_name),
         )
+        self._write_metadata(self._stats_metadata_key(conversation_id), self._empty_stats())
+        self._write_metadata(self._correction_metadata_key(conversation_id), [])
         return conversation_id
 
     def log_message(self, conversation_id: str, sender: str, content: str) -> str:
@@ -55,6 +66,7 @@ class ConversationMemory:
             (message_id, conversation_id, sender, content),
         )
         self._refresh_window_cache(conversation_id)
+        self._mirror_stats(conversation_id)
         return message_id
 
     def _refresh_window_cache(self, conversation_id: str) -> None:
@@ -138,9 +150,115 @@ class ConversationMemory:
                 json.dumps(corrected_fact),
             ),
         )
+        self._mirror_corrections(conversation_id)
         return correction_id
 
     def lookup_corrections(self, conversation_id: str, limit: int = 5) -> List[Correction]:
+        cache_key = self._correction_metadata_key(conversation_id)
+        cached = self._read_metadata(cache_key)
+        corrections = self._deserialize_corrections(conversation_id, cached)
+        if corrections is not None:
+            return corrections[:limit]
+        fetch_limit = max(limit, self._correction_cache)
+        corrections = self._query_corrections(conversation_id, fetch_limit)
+        self._write_metadata(
+            cache_key,
+            [
+                {"correction_id": item.correction_id, "payload": item.payload}
+                for item in corrections[: self._correction_cache]
+            ],
+        )
+        return corrections[:limit]
+
+    def conversation_stats(self, conversation_id: str) -> Dict[str, int | str | None]:
+        cache_key = self._stats_metadata_key(conversation_id)
+        cached = self._deserialize_stats(self._read_metadata(cache_key))
+        if cached is not None:
+            return cached
+        stats = self._compute_stats(conversation_id)
+        self._write_metadata(cache_key, stats)
+        return stats
+
+    # ------------------------------------------------------------------ #
+    # Metadata helpers
+    # ------------------------------------------------------------------ #
+    def _stats_metadata_key(self, conversation_id: str) -> str:
+        return f"l2:stats:{conversation_id}"
+
+    def _correction_metadata_key(self, conversation_id: str) -> str:
+        return f"l2:corr:{conversation_id}"
+
+    def _write_metadata(self, key: str, value: Any) -> None:
+        if not self.hot_path:
+            return
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if not writer:
+            return
+        writer(key, json.dumps(value, separators=(",", ":")))
+
+    def _read_metadata(self, key: str) -> Any | None:
+        if not self.hot_path:
+            return None
+        reader = getattr(self.hot_path, "read_metadata", None)
+        if not reader:
+            return None
+        raw = reader(key)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def _empty_stats(self) -> Dict[str, int | str | None]:
+        return {
+            "message_count": 0,
+            "user_turns": 0,
+            "assistant_turns": 0,
+            "started_at": None,
+            "updated_at": None,
+        }
+
+    def _mirror_stats(self, conversation_id: str) -> None:
+        stats = self._compute_stats(conversation_id)
+        self._write_metadata(self._stats_metadata_key(conversation_id), stats)
+
+    def _mirror_corrections(self, conversation_id: str) -> None:
+        corrections = self._query_corrections(conversation_id, self._correction_cache)
+        self._write_metadata(
+            self._correction_metadata_key(conversation_id),
+            [
+                {"correction_id": item.correction_id, "payload": item.payload}
+                for item in corrections
+            ],
+        )
+
+    def _compute_stats(self, conversation_id: str) -> Dict[str, int | str | None]:
+        rows = self.db.query(
+            """
+            SELECT
+                COUNT(*) AS message_count,
+                SUM(CASE WHEN sender='user' THEN 1 ELSE 0 END) AS user_turns,
+                SUM(CASE WHEN sender='assistant' THEN 1 ELSE 0 END) AS assistant_turns,
+                MIN(created_at) AS started_at,
+                MAX(created_at) AS updated_at
+            FROM tbl_l2_messages
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        )
+        if not rows:
+            return self._empty_stats()
+        row = rows[0]
+        return {
+            "message_count": row["message_count"] or 0,
+            "user_turns": row["user_turns"] or 0,
+            "assistant_turns": row["assistant_turns"] or 0,
+            "started_at": row["started_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _query_corrections(self, conversation_id: str, limit: int) -> List[Correction]:
         rows = self.db.query(
             """
             SELECT correction_id, conversation_id, corrected_fact_json
@@ -157,36 +275,32 @@ class ConversationMemory:
             corrections.append(Correction(row["correction_id"], row["conversation_id"], payload))
         return corrections
 
-    def conversation_stats(self, conversation_id: str) -> Dict[str, int | str | None]:
-        rows = self.db.query(
-            """
-            SELECT
-                COUNT(*) AS message_count,
-                SUM(CASE WHEN sender='user' THEN 1 ELSE 0 END) AS user_turns,
-                SUM(CASE WHEN sender='assistant' THEN 1 ELSE 0 END) AS assistant_turns,
-                MIN(created_at) AS started_at,
-                MAX(created_at) AS updated_at
-            FROM tbl_l2_messages
-            WHERE conversation_id = ?
-            """,
-            (conversation_id,),
-        )
-        if not rows:
-            return {
-                "message_count": 0,
-                "user_turns": 0,
-                "assistant_turns": 0,
-                "started_at": None,
-                "updated_at": None,
-            }
-        row = rows[0]
+    def _deserialize_stats(self, payload: Any) -> Dict[str, int | str | None] | None:
+        if not isinstance(payload, dict):
+            return None
+        required = {"message_count", "user_turns", "assistant_turns", "started_at", "updated_at"}
+        if not required.issubset(payload):
+            return None
         return {
-            "message_count": row["message_count"] or 0,
-            "user_turns": row["user_turns"] or 0,
-            "assistant_turns": row["assistant_turns"] or 0,
-            "started_at": row["started_at"],
-            "updated_at": row["updated_at"],
+            "message_count": payload.get("message_count", 0),
+            "user_turns": payload.get("user_turns", 0),
+            "assistant_turns": payload.get("assistant_turns", 0),
+            "started_at": payload.get("started_at"),
+            "updated_at": payload.get("updated_at"),
         }
+
+    def _deserialize_corrections(self, conversation_id: str, payload: Any) -> List[Correction] | None:
+        if not isinstance(payload, list):
+            return None
+        parsed: List[Correction] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            correction_id = item.get("correction_id")
+            if not correction_id:
+                continue
+            parsed.append(Correction(str(correction_id), conversation_id, dict(item.get("payload") or {})))
+        return parsed
 
 
 class SessionCache:
@@ -295,12 +409,14 @@ class SessionCache:
 
 
 class BiasEngine:
-    def __init__(self, db: DatabaseEnvironment) -> None:
+    def __init__(self, db: DatabaseEnvironment, *, hot_path: "HotPathAdapter | None" = None, cache_limit: int = 128) -> None:
         self.db = db
+        self.hot_path = hot_path
+        self._bias_cache_limit = max(1, cache_limit)
 
     def upsert_bias(
         self,
-        conversation_id: str,
+        conversation_id: str | None,
         pattern: str,
         token_id: int,
         q_bias: int,
@@ -319,20 +435,17 @@ class BiasEngine:
             """,
             (conversation_id, pattern or "", token_id, q_bias, expires_at),
         )
+        self._mirror_bias(conversation_id)
 
     def lookup(self, conversation_id: str, context_snippet: str) -> Dict[int, int]:
-        rows = self.db.query(
-            """
-            SELECT pattern, token_id, q_bias, expires_at
-            FROM tbl_l2_token_bias
-            WHERE conversation_id = ? OR conversation_id IS NULL
-            """,
-            (conversation_id,),
-        )
+        entries = self._load_bias_entries(None) + self._load_bias_entries(conversation_id)
         active: Dict[int, int] = {}
+        if not entries:
+            return active
         now = datetime.now(timezone.utc)
-        for row in rows:
-            expires_at = row["expires_at"]
+        snippet = context_snippet.lower()
+        for entry in entries:
+            expires_at = entry.get("expires_at")
             if expires_at:
                 try:
                     expires_dt = datetime.fromisoformat(expires_at)
@@ -340,9 +453,96 @@ class BiasEngine:
                     continue
                 if expires_dt.replace(tzinfo=timezone.utc) < now:
                     continue
-            pattern = row["pattern"] or ""
-            if pattern and pattern.lower() not in context_snippet.lower():
+            pattern = entry.get("pattern") or ""
+            if pattern and pattern.lower() not in snippet:
                 continue
-            token_id = row["token_id"]
-            active[token_id] = active.get(token_id, 0) + row["q_bias"]
+            token_id = int(entry.get("token_id", 0))
+            q_bias = int(entry.get("q_bias", 0))
+            active[token_id] = active.get(token_id, 0) + q_bias
         return active
+
+    # ------------------------------------------------------------------ #
+    # Bias metadata helpers
+    # ------------------------------------------------------------------ #
+    def _bias_metadata_key(self, conversation_id: str | None) -> str:
+        suffix = conversation_id or "__global__"
+        return f"l2:bias:{suffix}"
+
+    def _mirror_bias(self, conversation_id: str | None) -> None:
+        entries = self._query_bias_entries(conversation_id, self._bias_cache_limit)
+        self._write_bias_metadata(
+            self._bias_metadata_key(conversation_id),
+            entries,
+        )
+
+    def _load_bias_entries(self, conversation_id: str | None) -> List[dict[str, Any]]:
+        key = self._bias_metadata_key(conversation_id)
+        cached = self._read_bias_metadata(key)
+        if cached is not None:
+            return cached
+        entries = self._query_bias_entries(conversation_id, self._bias_cache_limit)
+        self._write_bias_metadata(key, entries)
+        return entries
+
+    def _query_bias_entries(self, conversation_id: str | None, limit: int) -> List[dict[str, Any]]:
+        params: tuple[Any, ...]
+        if conversation_id is None:
+            sql = """
+                SELECT conversation_id, pattern, token_id, q_bias, expires_at
+                FROM tbl_l2_token_bias
+                WHERE conversation_id IS NULL
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """
+            params = (limit,)
+        else:
+            sql = """
+                SELECT conversation_id, pattern, token_id, q_bias, expires_at
+                FROM tbl_l2_token_bias
+                WHERE conversation_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """
+            params = (conversation_id, limit)
+        rows = self.db.query(sql, params)
+        entries: List[dict[str, Any]] = []
+        for row in rows:
+            entries.append(
+                {
+                    "conversation_id": row["conversation_id"],
+                    "pattern": row["pattern"],
+                    "token_id": row["token_id"],
+                    "q_bias": row["q_bias"],
+                    "expires_at": row["expires_at"],
+                }
+            )
+        return entries
+
+    def _write_bias_metadata(self, key: str, entries: List[dict[str, Any]]) -> None:
+        if not self.hot_path:
+            return
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if not writer:
+            return
+        writer(key, json.dumps(entries[: self._bias_cache_limit], separators=(",", ":")))
+
+    def _read_bias_metadata(self, key: str) -> List[dict[str, Any]] | None:
+        if not self.hot_path:
+            return None
+        reader = getattr(self.hot_path, "read_metadata", None)
+        if not reader:
+            return None
+        raw = reader(key)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, list):
+            return None
+        entries: List[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, dict):
+                entries.append(item)
+        return entries

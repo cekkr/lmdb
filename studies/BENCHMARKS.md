@@ -1,5 +1,8 @@
 # Benchmarks
 
+> The smoke harness now appends queue-drain snapshots automatically whenever the quality queue
+> crosses its threshold. Look for sections titled “Queue Drain (auto smoke harness)” for those runs.
+
 ## 2025-11-10 - Smoke Train (python3.11)
 
 - Command: `python3.11 src/train.py datasets/emotion_data.json --db var/smoke-train-run.sqlite3 --reset --json-chunk-size 120 --max-json-lines 400 --eval-interval 1500 --eval-samples 2 --eval-pool-size 40 --profile-ingest`, followed by `python3.11 src/run.py --db var/smoke-train-run.sqlite3 --prompt "Summarize how the DB-SLM handles short validation runs." --user smoke-test --agent db-slm`.

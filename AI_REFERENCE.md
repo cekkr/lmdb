@@ -57,6 +57,11 @@ change so the next agent inherits the latest context.
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
   `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
   `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
+- Level 2 metadata now rides the same channel: `ConversationMemory` writes stats to
+  `meta:l2:stats:<conversation_id>`, correction digests to `meta:l2:corr:<conversation_id>`, and
+  bias presets to `meta:l2:bias:<conversation_id|__global__>`. Decoder/cache components consult those
+  JSON blobs first so a restarted trainer no longer needs warm-up SQL reads before issuing concept or
+  bias-aware generations.
 - cheetah-db now keeps persistent file handles per pair-trie node (RW locked), parallelizes reducer
   payload hydration with a bounded worker pool, and treats child pointers + terminal keys as
   independent flags so prefix-sharing namespaces (`ctx:*`, `ctxv:*`, `topk:*`, etc.) finally
@@ -161,6 +166,10 @@ change so the next agent inherits the latest context.
   boundaries during testing, exports metrics to
   `var/eval_logs/train-queue-drain-*.json`, and trims the queue back to `--queue-cap` entries
   (default 200) once a run succeeds.
+- The smoke-train harness watches queue depth too: passing `--queue-drain-threshold`/`--queue-drain-cooldown`
+  (defaults 175 / 900s) arms an automated drain worker that launches the helper as soon as telemetry
+  crosses the threshold, writes the resulting metrics file under `var/smoke_train/drains/`, and
+  appends a summary section (“Queue Drain (auto smoke harness) …”) to `studies/BENCHMARKS.md`.
 - `--dry-run` prints the exact command; `--queue /path/to/file` and `--python` let you point at
   alternate queues/interpreters, and `--max-json-lines`/`--queue-cap` can be overridden when
   load-testing different limits. Use the PowerShell helper pattern
@@ -191,6 +200,10 @@ change so the next agent inherits the latest context.
   - Always monitor the emitted log; kill the `cheetah_smoke` session if the tail stops advancing.
     Current failure to triage: `var/eval_logs/cheetah_smoke_train_20251112-190626.log` sticks on
     `datasets/emotion_data.json#chunk1` even though the server shows no errors.
+- The telemetry thread now exposes `--queue-drain-threshold`, `--queue-drain-cooldown`,
+  `--queue-drain-{script,metrics-dir,benchmarks}`, and `--disable-auto-queue-drain`. Leaving the
+  automation enabled means queue overflows trigger `scripts/drain_queue.py` automatically and the
+  resulting metrics block is mirrored into `studies/BENCHMARKS.md` without manual editing.
 - Use `--scenarios a,b` or `SMOKE_SCENARIOS=a,b` to run a subset, `--resume-from name` to skip ahead,
   and `--dry-run` to print the commands while still updating `benchmarks.json` for planning.
 

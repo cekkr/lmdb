@@ -17,6 +17,33 @@ For the "lmdb" version to be implemented, it must be adapted as best as possible
 - `PAIR_SCAN ctxv:` already provides everything needed to service `engine.context_relativism()`:
   iterate the namespace, look up the referenced payload via `READ`, and re-use the Top-K entry via
   `PAIR_GET topk:<order>` when present. Future Go-native reducers can inline that second hop.
+- Regression checklist:
+  1. Insert a deterministic context tree (e.g., `[ [ [1,2], [3,4] ], [ [5] ] ]`) twice and verify
+     both writes land on the same `ctxv:` key and return the same payload.
+  2. Exercise `PAIR_SCAN ctxv:` with a `limit` and cursor token to confirm pagination never skips or
+     repeats keys. The CLI exposes the `next_cursor` token to make this visible.
+  3. Use `PAIR_REDUCE counts cnt:<order>` followed by `PAIR_SCAN ctxv:` to ensure each relativistic
+     projection can hydrate a `topk:` payload without additional SQLite calls.
+
+### Level 2/3 metadata mirrors
+
+- The Python bridge now mirrors higher-level metadata into cheetah so a restarted trainer or decoder
+  can warm its caches without reading SQLite. All entries live under the `meta` namespace using the
+  `PAIR_SET meta x<key>` path (see `CheetahHotPathAdapter.write_metadata`).
+- Keys and layouts:
+  - `l2:stats:<conversation_id>` → JSON object with `message_count`, `user_turns`,
+    `assistant_turns`, `started_at`, `updated_at`.
+  - `l2:corr:<conversation_id>` → JSON array containing the most recent correction digests, each
+    shaped as `{"correction_id": "...", "payload": {...}}`.
+  - `l2:bias:<conversation_id | __global__>` → JSON array of bias presets mirroring
+    `tbl_l2_token_bias` rows (`pattern`, `token_id`, `q_bias`, `expires_at`).
+- When these entries exist the decoder skips the SQL round-trip entirely; the mirroring happens
+  synchronously whenever the conversation log, correction store, or bias table mutates.
+- Regression plan:
+  1. Log a conversation turn, then `PAIR_GET meta x6c32...` (stats key) and assert the counts tick up.
+  2. Record a correction and ensure the `l2:corr:` array is trimmed to the configured window.
+  3. Insert a global bias row and confirm both `l2:bias:__global__` and prefix scans return the JSON
+     payload without needing SQLite.
 
 ### Reducer RPCs
 
@@ -34,3 +61,10 @@ For the "lmdb" version to be implemented, it must be adapted as best as possible
 - Upcoming reducers (`PAIR_REDUCE cache`, Level 2 bias presets, queue-drain snapshots) should follow
   the same command grammar (`PAIR_REDUCE <mode> <prefix> [limit]`) and document their payload
   layouts here so both the CLI and TCP clients can decode them safely.
+- Reducer regression plan:
+  1. Issue `PAIR_REDUCE counts cnt:3 10` and verify both CLI and Python decode the inline payload
+     without performing a follow-up `READ`.
+  2. Saturate `PAIR_REDUCE probabilities prob:4` so the response spans multiple pages and ensure the
+     cursor resumes on the next call.
+  3. Spot-check `PAIR_REDUCE continuations cont:` against SQLite (`tbl_l1_continuations`) to confirm
+     the mirrored follower counts stay in sync with rebuilds.

@@ -64,9 +64,9 @@ class DBSLMEngine:
             hot_path=self.hot_path,
         )
         self.smoother = MKNSmoother(self.db, self.store, self.quantizer)
-        self.memory = ConversationMemory(self.db)
+        self.memory = ConversationMemory(self.db, hot_path=self.hot_path)
         self.cache = SessionCache(self.db, hot_path=self.hot_path)
-        self.bias = BiasEngine(self.db)
+        self.bias = BiasEngine(self.db, hot_path=self.hot_path)
         self.decoder = Decoder(
             self.db,
             self.store,
