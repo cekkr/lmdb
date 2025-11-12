@@ -152,6 +152,7 @@ class DatabaseEnvironment:
                 token_id INTEGER NOT NULL,
                 q_bias INTEGER NOT NULL,
                 expires_at TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (conversation_id, pattern, token_id)
             );
 
@@ -196,6 +197,7 @@ class DatabaseEnvironment:
             """
         )
         cur.close()
+        self._ensure_column("tbl_l2_token_bias", "updated_at", "TEXT DEFAULT CURRENT_TIMESTAMP")
         for order in range(1, self.max_order + 1):
             self.ensure_order_tables(order)
         self._ensure_metadata_defaults()
@@ -237,6 +239,14 @@ class DatabaseEnvironment:
             """
         )
         cur.close()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        """Add the requested column when legacy schemas are missing it."""
+        rows = self.query(f"PRAGMA table_info({table})")
+        existing = {row["name"] for row in rows}
+        if column in existing:
+            return
+        self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _ensure_metadata_defaults(self) -> None:
         rows = self.query("SELECT 1 FROM tbl_quant_meta WHERE name = 'default' LIMIT 1")

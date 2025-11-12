@@ -459,11 +459,19 @@ class BiasEngine:
             expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
         self.db.execute(
             """
-            INSERT INTO tbl_l2_token_bias(conversation_id, pattern, token_id, q_bias, expires_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO tbl_l2_token_bias(
+                conversation_id,
+                pattern,
+                token_id,
+                q_bias,
+                expires_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(conversation_id, pattern, token_id) DO UPDATE SET
                 q_bias = excluded.q_bias,
-                expires_at = excluded.expires_at
+                expires_at = excluded.expires_at,
+                updated_at = CURRENT_TIMESTAMP
             """,
             (conversation_id, pattern or "", token_id, q_bias, expires_at),
         )

@@ -31,3 +31,11 @@
 - Snapshot timeline: total_qps=95.6 @5s, 87.6 @10s, 78.7 @15s, 72.0 @20s, 66.7 @25s, 12.4 while draining at 148.5 s. Final counters: inserts=760, reads=528, pair_set=276, pair_get=186, pair_scan=94, errors=0.
 - Confirms the warmup/pagination fixes at the default worker count: each 5-second bucket included pair scans and no reducer/EOF errors surfaced.
 
+## 2025-11-12 - cheetah-only smoke ingest (30 min budget)
+
+- Command: `DBSLM_BACKEND=cheetah-db python3.11 src/train.py datasets/emotion_data.json --db /tmp/db_slm_smoke.sqlite3 --ngram-order 3 --eval-interval 2000 --json-chunk-size 250 --max-json-lines 1000` (run inside WSL tmux `cheetah_smoke`, cheetah server running in `cheetahdb` tmux).
+- Logs/artifacts: trainer trace in `var/cheetah_smoke_train_20251112-205914.log`; cheetah server stdout in `var/cheetah-server-linux.log`. Metrics JSON did not flush because we stopped the run exactly at the 30-minute mark per policy.
+- Runtime/highlights: chunk `datasets/emotion_data.json#chunk1` finished (`543,747` tokens → `543,745` n-grams) around +297 s; the remaining time was spent on evaluation probes (6 prompts every 2k tokens) until the timeout cutoff at +1,794 s.
+- Probe snapshots (quality, lex, ROUGE-L, ppl(gen), ppl(ref), sim, len_ratio) steadily improved: `0.59 / 0.14 / 0.12 / 1.83k / 9.2 / 0.69 / 0.91` @20k tokens, `0.60 / 0.15 / 0.11 / 1.79k / 8.7 / 0.65 / 0.94` @128k tokens. The quality gate still flags most samples due to low structure variety, so probes keep retrying until the 2-attempt budget is exhausted.
+- Hot-path + latency: `Disabling cheetah hot-path adapter: pair_reduce counts failed` fired immediately, so the decoder fell back to SQLite and the observed cheetah Top-K hit ratio remained `0%`. Decoder latency percentiles are unavailable for this run; rerun after fixing `PAIR_REDUCE counts` so the metrics writer can flush `var/eval_logs/train-*.json`.
+

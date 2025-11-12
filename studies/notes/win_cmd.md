@@ -12,4 +12,6 @@ When executing cheetah-db server and both train/smoke-trains, use screen or you 
 `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/Sources/GitHub/lmdb/cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`.
 Remember to kill the session (`screen -ls` + `screen -wipe` or `pkill -f cheetah-server`) when you finish or re-compile the server, and even before beginning check.
 Remember that you have to run in parallel cheetah-db server with other scripts, and to stop both of them before recompilation and after end of executions.
+You can fallback on tmux, but for keeping alive a screen session detaching it you have to do: screen -d -m -S session_name "your_command_here".
+Example: screen -d -m -S web_server "python3 -m http.server 8000"
 Save and check logs in real time, prevent stucks (no more output), infinity loops and working running test no longer than 30 minutes.

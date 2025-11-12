@@ -93,6 +93,15 @@ adapter status stays visible to future maintainers.
   `datasets/emotion_data.json#chunk1` for several minutes), kill the `cheetah_smoke` tmux session,
   capture the timestamp + cheetah server log, and record the failure before retrying.
 
+### 2025-11-12 cheetah-only smoke snapshot
+
+- Command (tmux `cheetah_smoke`, SQLite on ext4):\
+  `DBSLM_BACKEND=cheetah-db python3.11 src/train.py datasets/emotion_data.json --db /tmp/db_slm_smoke.sqlite3 --ngram-order 3 --eval-interval 2000 --json-chunk-size 250 --max-json-lines 1000`
+- Runtime/logs: ran under WSL tmux for 29m50s before we stopped it at the 30-minute budget. Full trainer/decoder trace lives in `var/cheetah_smoke_train_20251112-205914.log`; cheetah server output stayed in `var/cheetah-server-linux.log`.
+- Ingest results: `datasets/emotion_data.json#chunk1` completed (`543,747` tokens → `543,745` n-grams). Probe snapshots climbed from quality `0.59 @ 20k` tokens to `0.62 @ 128k` tokens (`lex=0.15`, `ROUGE-L=0.11`, `sim=0.65`, `len_ratio=0.94`, `ppl(gen)=1.79k`).
+- Hot-path status: `Disabling cheetah hot-path adapter: pair_reduce counts failed` fired immediately, so the decoder fell back to SQLite and the observed cheetah Top-K hit ratio stayed at `0%`. This run documents the failure for the follow-up task to debug `PAIR_REDUCE counts`.
+- Decoder latency: the metrics writer never flushed (run cut at 30 minutes), so we do not have fresh latency percentiles yet. Once `PAIR_REDUCE` works again we should rerun the same command to produce the `var/eval_logs/train-*.json` artifact and capture latency/tablet stats.
+
 ## Python bridge status
 
 - `src/db_slm` now includes a `cheetah-db` hot-path adapter. Set `DBSLM_BACKEND=cheetah-db` (or
