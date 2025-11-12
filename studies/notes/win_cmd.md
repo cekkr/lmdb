@@ -5,3 +5,6 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive -
 # How to execute through Ubuntu 24 WSL on Windows:
 > PS C:\Users\Riccardo Cecchini> wsl.exe -d Ubuntu-24.04 -- whoami
 > riccardo
+
+Use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
+Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- whoami
