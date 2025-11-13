@@ -18,6 +18,12 @@ change so the next agent inherits the latest context.
 
 ## Codebase State
 
+- **Cheetah-db is now the authoritative database.** Every ingest run, decoder lookup, and evaluation
+  must assume cheetah is the primary store for counts/probabilities/context metadata. SQLite survives
+  only as a scratch/cache/export format (e.g., `--db var/tmp.sqlite3` for quick analysis or when
+  emitting `.sqlite3` artifacts) and should never be treated as the long-term source of truth again.
+  When in doubt: start/attach to the cheetah server first, keep `DBSLM_BACKEND=cheetah-db`, and only
+  lean on SQLite when a workflow explicitly requires a transient file.
 - `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
   default or Hugging Face `tokenizers` when configured), hashed
   context registry, Modified Kneser–Ney smoother, quantized probability tables, and Top-K cache.
@@ -258,15 +264,17 @@ change so the next agent inherits the latest context.
 
 ### DB Adapters
 
-- `sqlite` remains the compatibility backend exposed through `DBSLMSettings.backend`, but it is now
-  considered legacy. Keep it only for metadata bootstrapping while the Level 1 pipelines move over
-  to cheetah; new work should avoid adding features that would be SQLite-only and instead target the
-  Go engine.
-- `cheetah-db` (see `cheetah-db/`) now doubles as the hot-path mirror for contexts, Top-K slices, and
-  raw follower counts. Keeping `DBSLM_BACKEND=cheetah-db` (or leaving the backend as `sqlite` and
-  enabling `DBSLM_CHEETAH_MIRROR=1`) makes the trainer push every newly discovered context and MKNS
-  Top-K bucket into the Go service via its TCP commands; the decoder then queries cheetah first and
-  falls back to SQLite only when a key is missing. As of this pass:
+- `sqlite` is **strictly a convenience/export format** now. Use it for short-lived corpus slicing,
+  ad-hoc diffs, or when emitting `.sqlite3` bundles for downstream tools, but do not ship features or
+  workflows that depend on SQLite-specific behavior. If you need a clean state, blow away the SQLite
+  file with `--reset` and/or pick a new cheetah namespace—never attempt to keep long-running state in
+  SQLite.
+- `cheetah-db` (see `cheetah-db/`) is the real database. Always ensure `cheetah-db/cheetah-server`
+  is running, set `DBSLM_BACKEND=cheetah-db` (or at least `DBSLM_CHEETAH_MIRROR=1` during local
+  smoke tests), and double-check every new command or script prints the cheetah namespace it targets.
+  The default train command in this repo assumes cheetah is healthy; if cheetah is down you must
+  either fix it or pass `--backonsqlite` with an explicit rationale recorded in `NEXT_STEPS.md`.
+  As of this pass:
   - the trie exposes `PAIR_SCAN` plus `PAIR_REDUCE counts`, so MKNS rebuilds and cache coverage
     metrics stream directly from Go without materializing temporary tables in SQLite;
   - the absolute vector ordering codec (`ctxv:` namespace) allows byte-identical context relativism,
