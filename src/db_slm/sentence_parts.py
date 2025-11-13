@@ -15,23 +15,6 @@ from log_helpers import log
 
 _DEFAULT_SPLITS = [".", "!", "?", ";", ":", ",", "\n"]
 _EMOTION_RE = re.compile(r"emotion\s*:\s*([A-Za-z0-9 _-]+)", re.IGNORECASE)
-_EMOTION_WORDS = {
-    "joy",
-    "trust",
-    "fear",
-    "surprise",
-    "sadness",
-    "disgust",
-    "anger",
-    "anticipation",
-    "calm",
-    "hope",
-    "gratitude",
-    "curiosity",
-    "empathy",
-    "doubt",
-    "stress",
-}
 
 
 class RealtimeTokenizerProfiler:
@@ -305,15 +288,16 @@ class SentencePartEmbeddingPipeline:
         return " ".join(tokens)
 
     def _emotional_keywords(self, segment: str, vector: Sequence[float]) -> List[str]:
-        candidates = keyword_summary(segment, limit=5)
-        hits = [word for word in candidates if word in _EMOTION_WORDS]
-        if hits:
-            return hits
+        candidates = keyword_summary(segment, limit=6)
+        if not candidates:
+            return []
         energy = self.embedder.energy(vector)
         if energy <= 0.12:
             limit = 1
         elif energy <= 0.25:
             limit = 2
-        else:
+        elif energy <= 0.4:
             limit = 3
+        else:
+            limit = min(4, len(candidates))
         return candidates[:limit]

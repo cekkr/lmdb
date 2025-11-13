@@ -60,8 +60,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-dimensions",
         help=(
-            "Comma-separated token span ranges (e.g. '1-2,3-5') used to group context penalties. "
-            "Use 'off' to disable the additional grouping penalties."
+            "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like '4,8,4' "
+            "used to group context penalties. Use 'off' to disable the additional grouping penalties."
         ),
     )
     parser.add_argument(

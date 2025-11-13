@@ -35,6 +35,9 @@ class DBSLMSettings:
     cheetah_database: str
     cheetah_timeout_seconds: float
     cheetah_mirror: bool
+    tokenizer_backend: str
+    tokenizer_json_path: str | None
+    tokenizer_lowercase: bool
 
     def sqlite_dsn(self) -> str:
         """Return the SQLite DSN currently used by the CLI utilities."""
@@ -62,6 +65,11 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     cheetah_timeout_seconds = float(read("DBSLM_CHEETAH_TIMEOUT_SECONDS", "1.0"))
     mirror_flag = read("DBSLM_CHEETAH_MIRROR", "0").lower()
     cheetah_mirror = mirror_flag in {"1", "true", "yes", "on"}
+    tokenizer_backend = read("DBSLM_TOKENIZER_BACKEND", "regex").strip().lower()
+    tokenizer_json_raw = read("DBSLM_TOKENIZER_JSON", "").strip()
+    tokenizer_json_path = tokenizer_json_raw or None
+    tokenizer_lower_flag = read("DBSLM_TOKENIZER_LOWERCASE", "1").strip().lower()
+    tokenizer_lowercase = tokenizer_lower_flag not in {"0", "false", "no", "off"}
 
     env_file_used = env_file if env_file.exists() else None
     return DBSLMSettings(
@@ -76,4 +84,7 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         cheetah_database=cheetah_database,
         cheetah_timeout_seconds=cheetah_timeout_seconds,
         cheetah_mirror=cheetah_mirror,
+        tokenizer_backend=tokenizer_backend,
+        tokenizer_json_path=tokenizer_json_path,
+        tokenizer_lowercase=tokenizer_lowercase,
     )

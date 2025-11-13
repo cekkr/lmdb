@@ -54,7 +54,12 @@ class DBSLMEngine:
         self.hot_path = build_cheetah_adapter(self.settings)
         self.context_dimensions = self._init_context_dimensions(context_dimensions)
         self.vocab = Vocabulary(self.db)
-        self.tokenizer = Tokenizer(self.vocab)
+        self.tokenizer = Tokenizer(
+            self.vocab,
+            backend=self.settings.tokenizer_backend,
+            tokenizer_path=self.settings.tokenizer_json_path,
+            lowercase_tokens=self.settings.tokenizer_lowercase,
+        )
         self.quantizer = LogProbQuantizer(self.db)
         self.store = NGramStore(
             self.db,

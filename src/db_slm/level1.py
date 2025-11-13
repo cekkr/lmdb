@@ -4,13 +4,55 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 from .adapters.base import HotPathAdapter, NullHotPathAdapter
 
 from .db import DatabaseEnvironment
 
+from log_helpers import log
+
+try:
+    from tokenizers import Tokenizer as HFTokenizer
+except ImportError:  # pragma: no cover - optional dependency
+    HFTokenizer = None
+
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+class _TokenizerBackend:
+    def tokenize(self, text: str) -> List[str]:
+        raise NotImplementedError
+
+
+class RegexTokenizerBackend(_TokenizerBackend):
+    def __init__(self, lowercase: bool) -> None:
+        self.lowercase = lowercase
+
+    def tokenize(self, text: str) -> List[str]:
+        tokens = [match.group(0) for match in TOKEN_PATTERN.finditer(text)]
+        if self.lowercase:
+            return [token.lower() for token in tokens]
+        return tokens
+
+
+class HuggingFaceTokenizerBackend(_TokenizerBackend):
+    def __init__(self, tokenizer_path: str, lowercase: bool) -> None:
+        if HFTokenizer is None:
+            raise RuntimeError("Install the 'tokenizers' package to use the Hugging Face backend.")
+        path = Path(tokenizer_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"No tokenizer JSON found at {path}")
+        self._tokenizer = HFTokenizer.from_file(str(path))
+        self.lowercase = lowercase
+
+    def tokenize(self, text: str) -> List[str]:
+        encoding = self._tokenizer.encode(text, add_special_tokens=False)
+        tokens = list(encoding.tokens)
+        if self.lowercase:
+            return [token.lower() for token in tokens]
+        return tokens
 
 
 @dataclass(frozen=True)
@@ -86,13 +128,38 @@ class Vocabulary:
 
 
 class Tokenizer:
-    """Simple regex tokenizer wrapped around the vocabulary."""
+    """Vocabulary-aware tokenizer with pluggable backends."""
 
-    def __init__(self, vocab: Vocabulary) -> None:
+    def __init__(
+        self,
+        vocab: Vocabulary,
+        *,
+        backend: str = "regex",
+        tokenizer_path: str | None = None,
+        lowercase_tokens: bool = True,
+    ) -> None:
         self.vocab = vocab
+        self._backend = self._init_backend(backend, tokenizer_path, lowercase_tokens)
+
+    def _init_backend(
+        self,
+        backend: str,
+        tokenizer_path: str | None,
+        lowercase_tokens: bool,
+    ) -> _TokenizerBackend:
+        name = (backend or "regex").strip().lower()
+        if name in {"huggingface", "hf"}:
+            if not tokenizer_path:
+                log("[tokenizer] Hugging Face backend requested but DBSLM_TOKENIZER_JSON was not provided; using regex fallback.")
+            else:
+                try:
+                    return HuggingFaceTokenizerBackend(tokenizer_path, lowercase_tokens)
+                except Exception as exc:  # pragma: no cover - backend optional
+                    log(f"[tokenizer] Falling back to regex backend ({exc}).")
+        return RegexTokenizerBackend(lowercase_tokens)
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
-        tokens = [match.group(0).lower() for match in TOKEN_PATTERN.finditer(text)]
+        tokens = self._backend.tokenize(text)
         if add_special_tokens:
             tokens = ["<BOS>", *tokens, "<EOS>"]
         return [self.vocab.token_id(token) for token in tokens]
@@ -100,16 +167,43 @@ class Tokenizer:
     def decode(self, token_ids: Iterable[int]) -> str:
         pieces: List[str] = []
         for token_id in token_ids:
-            token = self.vocab.token_text(token_id)
-            if token in {"<BOS>", "<EOS>", "<PAD>"}:
+            raw_token = self.vocab.token_text(token_id)
+            if raw_token in {"<BOS>", "<EOS>", "<PAD>"}:
                 continue
-            if not pieces:
-                pieces.append(token)
-            elif token.isalnum():
-                pieces.append(f" {token}")
+            normalized = self._normalize_generated_token(raw_token)
+            if normalized is None:
+                continue
+            if normalized == "\n":
+                pieces.append("\n")
+                continue
+            if self._needs_leading_space(raw_token, normalized, pieces):
+                pieces.append(f" {normalized}")
             else:
-                pieces.append(token)
+                pieces.append(normalized)
         return "".join(pieces).strip()
+
+    @staticmethod
+    def _normalize_generated_token(token: str) -> str | None:
+        adjusted = token.replace("Ċ", "\n")
+        adjusted = adjusted.replace("▁", "").replace("Ġ", "")
+        adjusted = adjusted.strip(" \t\r")
+        if not adjusted:
+            if "\n" in token:
+                return "\n"
+            return None
+        return adjusted
+
+    @staticmethod
+    def _needs_leading_space(raw_token: str, normalized: str, pieces: List[str]) -> bool:
+        if not pieces:
+            return False
+        if normalized == "\n":
+            return False
+        if raw_token.startswith(("▁", "Ġ")):
+            return True
+        if raw_token and raw_token[0].isalnum():
+            return True
+        return normalized[0].isalnum()
 
     def tokens_to_text(self, token_ids: Iterable[int]) -> List[str]:
         return [self.vocab.token_text(token_id) for token_id in token_ids]

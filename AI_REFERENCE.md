@@ -18,15 +18,17 @@ change so the next agent inherits the latest context.
 
 ## Codebase State
 
-- `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, regex tokenizer, hashed
+- `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
+  default or Hugging Face `tokenizers` when configured), hashed
   context registry, Modified Kneser–Ney smoother, quantized probability tables, and Top-K cache.
   Level 2 combines episodic logging, concept-ready correction digests, pointer-sentinel session
   caches, and token-level bias plumbing. Level 3 provides concept dictionaries, template
   verbalization, probability materialization, and conversation-scoped signals.
 - `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
   for the relational layout plus the KN materialization + decoding loops implemented in Python.
-- `requirements.txt` now installs `sentence-transformers` (external embedding baseline) and
-  `language-tool-python` (grammar deltas for the quality gate). Optional GPU acceleration is
+- `requirements.txt` now installs `sentence-transformers` (external embedding baseline),
+  `language-tool-python` (grammar deltas for the quality gate), and Hugging Face `tokenizers`
+  (optional but enabled by default for the new tokenizer backend). Optional GPU acceleration is
   auto-detected via PyTorch when present.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
@@ -37,8 +39,15 @@ change so the next agent inherits the latest context.
 - Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; the smoke-train harness also mirrors cheetah latency/queue stats, tracks lingering subprocesses, and enforces 30-minute budgets before logging the same bundle to `var/cheetah_smoke_ingest.log`.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
-  real time. Configure the embedding backbone with `DBSLM_EMBEDDER_MODEL`, or force hashed-only,
-  offline guidance (no Hugging Face downloads) via `DBSLM_EMBEDDER_OFFLINE=1`.
+  real time. Emotion tags are now derived solely from the segment keywords + embedder energy
+  (the `_EMOTION_WORDS` allowlist is gone), so corpora dictate which affective tokens show up. Configure
+  the embedding backbone with `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no
+  Hugging Face downloads) via `DBSLM_EMBEDDER_OFFLINE=1`.
+- Tokenization now supports a Hugging Face-backed backend: set
+  `DBSLM_TOKENIZER_BACKEND=huggingface`, point `DBSLM_TOKENIZER_JSON` at a tokenizer.json
+  (usually exported from `tokenizers` or HF Hub), and optionally disable lower-casing with
+  `DBSLM_TOKENIZER_LOWERCASE=0`. Missing packages or files trigger a logged warning and fall back to
+  the legacy regex splitter so training/evals always proceed.
 - Context relativism is now first-class: `AbsoluteVectorOrder` deterministically sorts nested token
   structures and mirrors them into the `ctxv:` namespace, `DBSLMEngine.context_relativism()` streams
   probabilistic projections directly from cheetah, and `Decoder` falls back to those slices whenever
@@ -78,11 +87,15 @@ change so the next agent inherits the latest context.
   during long streaming ingests.
 - `src/train.py` now accepts `--decoder-presence-penalty` and `--decoder-frequency-penalty` so repeat
   penalty grids can run directly from the CLI; overrides propagate to periodic + hold-out probes and
-  are recorded inside the metrics metadata for downstream comparisons.
-- `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of token span
-  ranges (default `1-2,3-5`) that extend presence/frequency penalties to grouped tokens. The selected
-  spans are persisted inside `tbl_metadata`, automatically loaded by `DBSLMEngine`, and the decoder
-  now down-weights candidates that would recreate overused word- or sentence-length sequences.
+  are recorded inside the metrics metadata for downstream comparisons. These knobs only influence
+  evaluation decoding—training statistics still reflect the raw corpus, so use higher penalties plus
+  richer context dimensions when repetition creeps into probe outputs.
+- `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of span ranges
+  (e.g., `1-2,3-5`) or progressive lengths (e.g., `4,8,4`). Length specs auto-expand to contiguous
+  spans starting at 1, and logs now append `(len=...)` so you can see the effective window widths.
+  Selections live in `tbl_metadata` (and the cheetah metadata mirror) so repeat penalty tracking
+  persists between runs and `Decoder` can down-weight word/sentence-length sequences that still leak
+  through.
 - `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
   `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
   inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
@@ -133,6 +146,10 @@ change so the next agent inherits the latest context.
   and the REPL reuse the same conversation bootstrapper.
 - MariaDB migrations are gone. Reset SQLite tables in place (or swap DB paths) and let cheetah's
   namespaces carry the hot/archive copies—no second store to reconcile or SQL bundle to ship.
+- `--reset` only unlinks the SQLite file resolved via `--db`/`DBSLM_SQLITE_PATH` (defaults to
+  `var/db_slm.sqlite3`). It never renames or truncates the cheetah namespace. Pick a distinct
+  `DBSLM_CHEETAH_DATABASE` per run (or run `cheetah-db` cleanup commands) when you need isolated
+  hot-path data instead of relying on `--reset`.
 - `scripts/run_paraphraser_regression.py` consumes `studies/paraphraser_regression.jsonl` to ensure
   multi-turn corrective threads, structural tags, and ordinary prompts all trigger the expected
   paraphraser behavior.

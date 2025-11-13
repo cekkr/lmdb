@@ -96,7 +96,7 @@ def parse_context_dimensions_arg(
     *,
     default: Sequence[ContextDimension] | None = DEFAULT_CONTEXT_DIMENSIONS,
 ) -> list[ContextDimension] | None:
-    """Parse CLI-style dimension strings like '1-2,3-5'."""
+    """Parse CLI-style dimension strings like '1-2,3-5' or length specs like '4,8,4'."""
     if raw_value is None:
         return list(default) if default is not None else None
     text = raw_value.strip()
@@ -109,19 +109,38 @@ def parse_context_dimensions_arg(
     if not parts:
         return []
     dimensions: list[ContextDimension] = []
+    next_start = 1
     for part in parts:
         if "-" in part:
             tokens = part.split("-", 1)
-        elif ":" in part:
+            try:
+                start = int(tokens[0])
+                end = int(tokens[1])
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"Invalid context dimension '{part}'") from exc
+            dimensions.append(ContextDimension(start, end))
+            next_start = end + 1
+            continue
+        if ":" in part:
             tokens = part.split(":", 1)
-        else:
-            tokens = [part, part]
+            try:
+                start = int(tokens[0])
+                end = int(tokens[1])
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"Invalid context dimension '{part}'") from exc
+            dimensions.append(ContextDimension(start, end))
+            next_start = end + 1
+            continue
         try:
-            start = int(tokens[0])
-            end = int(tokens[1])
-        except (ValueError, IndexError) as exc:
+            span = int(part)
+        except ValueError as exc:
             raise ValueError(f"Invalid context dimension '{part}'") from exc
+        if span < 1:
+            raise ValueError(f"Context dimension length must be >= 1 (got {span})")
+        start = next_start
+        end = start + span - 1
         dimensions.append(ContextDimension(start, end))
+        next_start = end + 1
     return dimensions
 
 
@@ -155,7 +174,24 @@ def format_context_dimensions(dimensions: Sequence[ContextDimension]) -> str:
             formatted.append(str(dim.start))
         else:
             formatted.append(f"{dim.start}-{dim.end}")
-    return ",".join(formatted)
+    collapsed = ",".join(formatted)
+    lengths = _infer_contiguous_lengths(dimensions)
+    if lengths:
+        return f"{collapsed} (len={','.join(str(length) for length in lengths)})"
+    return collapsed
+
+
+def _infer_contiguous_lengths(dimensions: Sequence[ContextDimension]) -> list[int] | None:
+    if not dimensions:
+        return None
+    expected = dimensions[0].start
+    spans: list[int] = []
+    for dim in dimensions:
+        if dim.start != expected:
+            return None
+        spans.append(dim.span)
+        expected = dim.end + 1
+    return spans
 
 
 def ensure_context_dimensions(dimensions: Sequence[ContextDimension] | None) -> list[ContextDimension]:

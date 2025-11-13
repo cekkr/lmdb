@@ -30,8 +30,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-dimensions",
         help=(
-            "Override the stored context-dimension penalties with a string like '1-2,3-5'. "
-            "Use 'off' to disable; omit to reuse metadata from the database."
+            "Override the stored context-dimension penalties with ranges like '1-2,3-5' or "
+            "length specs such as '4,8,4'. Use 'off' to disable; omit to reuse metadata from the database."
         ),
     )
     parser.add_argument(
