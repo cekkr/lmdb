@@ -266,9 +266,12 @@ class SentencePartEmbeddingPipeline:
 
         snapshot = self.profiler.snapshot()
         if snapshot:
+            formatted_splits = ",".join(
+                self._format_split_token(ch) for ch in snapshot["top_splits"]
+            )
             log(
                 "[tokenizer] realtime splits={splits} target_len={target} chars={chars}".format(
-                    splits=",".join(snapshot["top_splits"]),
+                    splits=formatted_splits,
                     target=snapshot["target_segment_len"],
                     chars=snapshot["chars_seen"],
                 )
@@ -301,3 +304,17 @@ class SentencePartEmbeddingPipeline:
         else:
             limit = min(4, len(candidates))
         return candidates[:limit]
+
+    @staticmethod
+    def _format_split_token(token: str) -> str:
+        if token == "\n":
+            return "\\n"
+        if token == "\r":
+            return "\\r"
+        if token == "\t":
+            return "\\t"
+        if token == " ":
+            return "<space>"
+        if not token:
+            return "<empty>"
+        return token
