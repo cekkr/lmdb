@@ -490,13 +490,6 @@ class SimpleParaphraser:
 class ResponseBackstop:
     """Ensures evaluation probes always emit text with a configurable floor."""
 
-    _FALLBACK_SENTENCES = [
-        "I will still draft a transparent answer even while the probabilities remain low.",
-        "This evaluation pass values coverage, so I am narrating the possible reasoning chain.",
-        "Key cues stay visible so future training steps can compare lexical and semantic overlap.",
-        "Uncertainty is acknowledged explicitly instead of returning an empty string.",
-    ]
-
     def ensure_min_words(self, prompt: str, response: str, min_words: int) -> str:
         if min_words <= 0:
             return response
@@ -505,27 +498,44 @@ class ResponseBackstop:
         if len(words) >= min_words:
             return response
         needed = min_words - len(words)
-        filler = self._build_filler(prompt, needed)
+        filler = self._build_filler(prompt, cleaned, needed)
         merged = f"{cleaned} {filler}".strip()
         return merged
 
-    def _build_filler(self, prompt: str, needed_words: int) -> str:
-        keywords = keyword_summary(prompt, limit=4)
-        phrases = list(self._FALLBACK_SENTENCES)
-        if keywords:
-            phrases.append(
-                f"The prompt emphasizes {', '.join(keywords)},"
-                " so I keep those motifs explicit while reasoning."
-            )
-        idx = 0
+    def _build_filler(self, prompt: str, response: str, needed_words: int) -> str:
+        fragments = self._extract_fragments(prompt)
+        if not fragments:
+            fragments = self._extract_fragments(response)
+        if not fragments:
+            return ""
         tokens: list[str] = []
-        while len(tokens) < needed_words and phrases:
-            sentence = phrases[idx % len(phrases)]
-            tokens.extend(sentence.split())
+        idx = 0
+        total_fragments = len(fragments)
+        while len(tokens) < needed_words and total_fragments:
+            fragment = fragments[idx % total_fragments]
+            tokens.extend(fragment.split())
             idx += 1
-        if len(tokens) > needed_words:
-            tokens = tokens[:needed_words]
-        return " ".join(tokens)
+        return " ".join(tokens[:needed_words])
+
+    @staticmethod
+    def _extract_fragments(text: str) -> list[str]:
+        normalized = text.strip()
+        if not normalized:
+            return []
+        fragments = [
+            fragment.strip()
+            for fragment in re.split(r"[.!?\n]+", normalized)
+            if fragment.strip()
+        ]
+        if fragments:
+            return fragments
+        words = normalized.split()
+        window = max(1, min(6, len(words)))
+        return [
+            " ".join(words[i : i + window]).strip()
+            for i in range(0, len(words), window)
+            if words[i : i + window]
+        ]
 
 
 class TaggedResponseFormatter:
