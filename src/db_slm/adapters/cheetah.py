@@ -419,8 +419,13 @@ class CheetahSerializer:
         buf.append(self.TOPK_VERSION)
         buf.append(order)
         clamped = list(ranked[: self.MAX_TOPK])
-        buf.append(len(clamped))
-        for token_id, q in clamped:
+        actual_count = len(clamped)
+        buf.append(actual_count)
+        for idx in range(self.MAX_TOPK):
+            if idx < actual_count:
+                token_id, q = clamped[idx]
+            else:
+                token_id, q = 0, 0
             buf.extend(struct.pack(">I", int(token_id)))
             buf.append(int(q) & 0xFF)
         return bytes(buf)

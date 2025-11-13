@@ -53,6 +53,17 @@ class CheetahSerializerTests(unittest.TestCase):
         self.assertEqual(record.order, 2)
         self.assertEqual(record.ranked, ranked)
 
+    def test_topk_payload_is_fixed_length(self) -> None:
+        expected = 3 + self.serializer.MAX_TOPK * 5
+        ranked_short = [(5, 200)]
+        ranked_full = [(i, 255) for i in range(self.serializer.MAX_TOPK)]
+        payload_short = self.serializer.encode_topk(2, ranked_short)
+        payload_empty = self.serializer.encode_topk(2, [])
+        payload_full = self.serializer.encode_topk(2, ranked_full)
+        self.assertEqual(len(payload_short), expected)
+        self.assertEqual(len(payload_empty), expected)
+        self.assertEqual(len(payload_full), expected)
+
     def test_probability_payload_round_trip(self) -> None:
         entries = [(7, 255, None), (8, 120, 400)]
         payload = self.serializer.encode_probabilities(3, entries)
