@@ -6,6 +6,7 @@ import logging
 import socket
 import struct
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -25,6 +26,7 @@ from .base import HotPathAdapter, NullHotPathAdapter
 logger = logging.getLogger(__name__)
 
 DEFAULT_REDUCE_PAGE_SIZE = 1024
+READLINE_IDLE_GRACE_SECONDS = 30.0
 
 
 class CheetahError(RuntimeError):
@@ -46,6 +48,7 @@ class CheetahClient:
         self.port = port
         self.database = database
         self.timeout = timeout
+        self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
 
@@ -192,11 +195,18 @@ class CheetahClient:
         if not self._sock:
             return None
         chunks: list[bytes] = []
+        idle_deadline = time.monotonic() + self._readline_idle_grace
         while True:
             try:
                 data = self._sock.recv(1)
             except socket.timeout:
-                return None
+                if time.monotonic() >= idle_deadline:
+                    logger.warning(
+                        "cheetah response timed out after %.1fs of inactivity",
+                        self._readline_idle_grace,
+                    )
+                    return None
+                continue
             if not data:
                 self._close_socket()
                 return None
@@ -204,6 +214,7 @@ class CheetahClient:
                 break
             if data != b"\r":
                 chunks.append(data)
+            idle_deadline = time.monotonic() + self._readline_idle_grace
         return b"".join(chunks).decode("utf-8", "replace")
 
     def _close_socket(self) -> None:

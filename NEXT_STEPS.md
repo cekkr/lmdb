@@ -11,7 +11,7 @@
 ## Active tasks
 - Cheetah-only smoke ingest follow-up:
   - 2025-11-12 run (tmux `cheetah_smoke`, `/tmp/db_slm_smoke.sqlite3`) hit the ≤30 minute budget and finished ingesting `datasets/emotion_data.json#chunk1`; see `var/cheetah_smoke_train_20251112-205914.log` for the transcript.
-  - `Disabling cheetah hot-path adapter: pair_reduce counts failed` kept the decoder on SQLite, so the cheetah Top-K hit ratio stayed at 0% and no latency JSON flushed before the timeout. Next step: fix `PAIR_REDUCE counts` on the Go side + adapter, rerun the same command, and record the decoder latency / Top-K stats in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
+  - `Disabling cheetah hot-path adapter: pair_reduce counts failed` kept the decoder on SQLite. Python now tolerates ~30 seconds of reducer inactivity before giving up on the cheetah socket, so `PAIR_REDUCE counts` should stay alive once the Go server finishes streaming a page. Next step: rerun the same smoke ingest with the tmux-backed cheetah server, tail both `var/cheetah_smoke_train_*.log` and `var/cheetah-server-linux.log` every 30 seconds, then capture decoder latency / Top-K stats in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
 - Investigate the cheetah smoke helper hang: `scripts/start_cheetah_smoke_session.sh` + `scripts/run_cheetah_smoke.sh` still wedge on `datasets/emotion_data.json#chunk1` (originally in `var/eval_logs/cheetah_smoke_train_20251112-190626.log`, now reproducible in `var/cheetah_smoke_train_20251112-205914.log` where the eval loop burns retries indefinitely). Capture stack traces and cheetah telemetry the moment it wedges so we can remove the repetitive “Zooming in…” scaffolds and finally unlock reliable latency/top-K recordings.
 
 ## Remember

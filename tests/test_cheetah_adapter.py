@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import unittest
 
 from db_slm.adapters.cheetah import CheetahClient, CheetahHotPathAdapter, CheetahSerializer
@@ -107,6 +108,32 @@ class CheetahClientParsingTests(unittest.TestCase):
         parsed, cursor = CheetahClient._parse_pair_scan_response(response)
         self.assertEqual(cursor, b"abc")
         self.assertEqual(parsed, [(b"test", 10)])
+
+    def test_readline_recovers_after_socket_timeouts(self) -> None:
+        client = CheetahClient("127.0.0.1", 0, timeout=0.01)
+
+        class FlakySocket:
+            def __init__(self) -> None:
+                self._timeouts = 3
+                self._payload = b"SUCCESS\n"
+                self._offset = 0
+
+            def recv(self, size: int) -> bytes:
+                if self._timeouts > 0:
+                    self._timeouts -= 1
+                    raise socket.timeout()
+                if self._offset >= len(self._payload):
+                    return b""
+                chunk = self._payload[self._offset : self._offset + size]
+                self._offset += size
+                return chunk
+
+            def close(self) -> None:  # pragma: no cover - not triggered in this test
+                pass
+
+        client._sock = FlakySocket()  # type: ignore[assignment]
+        client._readline_idle_grace = 0.5  # make the test deterministic
+        self.assertEqual(client._readline(), "SUCCESS")
 
 
 if __name__ == "__main__":

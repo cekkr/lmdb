@@ -212,6 +212,10 @@ change so the next agent inherits the latest context.
 
 - Start `cheetah-db/cheetah-server` before running the Python CLI. `DBSLM_BACKEND` defaults to
   `cheetah-db`, so Level 1 lookups hit the Go service automatically.
+- The Python bridge keeps reducer sockets alive across long-running queries: `CheetahClient` now
+  tolerates up to ~30 seconds of inactivity while waiting for `PAIR_REDUCE` responses, so heavy
+  count/probability pages no longer trip the 1-second TCP timeout. Increase
+  `DBSLM_CHEETAH_TIMEOUT_SECONDS` only if you truly need longer windows.
 - The trainer now refuses to silently fall back to SQLite when `DBSLM_BACKEND=cheetah-db`. If the
   Go server is down or you forgot to launch `cheetah-db/cheetah-server`, `src/train.py` exits with
   an error unless you explicitly pass `--backonsqlite` (intended only for emergency smoke reruns).
