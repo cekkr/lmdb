@@ -219,14 +219,17 @@ def _purge_cheetah_namespace(
     scan_warned = False
     delete_warned = False
     pair_warned = False
+    cursor: bytes | None = None
+    started = time.monotonic()
+    progress_interval = max(page_size * 5, 5000)
     while True:
-        result = client.pair_scan(prefix=prefix, limit=page_size)
+        result = client.pair_scan(prefix=prefix, limit=page_size, cursor=cursor)
         if result is None:
             if not scan_warned:
                 log(f"[train] Warning: cheetah reset aborted while scanning '{namespace_label}'.")
                 scan_warned = True
             break
-        entries, _ = result
+        entries, cursor = result
         if not entries:
             break
         for raw_value, key in entries:
@@ -246,6 +249,16 @@ def _purge_cheetah_namespace(
                     f"[train] Warning: unable to drop cheetah pair '{namespace_label}' entry {identifier}: {response}"
                 )
                 pair_warned = True
+            if removed % progress_interval == 0:
+                elapsed = time.monotonic() - started
+                log(
+                    "[train] cheetah reset: removed {count} '{label}' mappings so far "
+                    "(~{rate:.1f}/s)".format(
+                        count=removed,
+                        label=namespace_label,
+                        rate=removed / elapsed if elapsed > 0 else 0.0,
+                    )
+                )
     return removed
 
 
