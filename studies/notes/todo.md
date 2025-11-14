@@ -14,4 +14,4 @@ Example --context-dimension 4,8,4 (3 dimension, the first of 4 vectors, the seco
 
 # Step 2
 - Move any AI_REFERENCE.md directive and documentation exclusively about cheetah-db inside cheetah-db/ directory, but remember to @AI_REFERENCE.md to check cheetah-db/AI_REFERENCE.md when working with cheetah.
-- There was another thing but I forgot it
+- Update README.md and BEST_COMMANDS.md to document and show example about CURRENTLY EFFECTIVELY VALID commands arguments, especially about @train.js (There was another thing but I forgot it)
