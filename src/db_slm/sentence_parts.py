@@ -243,7 +243,14 @@ class SentencePartEmbeddingPipeline:
         if not payload:
             return text
         self.profiler.observe(payload)
-        splits = self.profiler.preferred_splits()
+        # Restrict sentence breaking to periods to keep other punctuation attached
+        # to the surrounding context; fall back to the profiler suggestion if no
+        # periods exist so extremely long strings still get segmented.
+        splits = ["."]
+        if "." not in payload:
+            profiled = self.profiler.preferred_splits()
+            if profiled:
+                splits = [profiled[0]]
         target = self.profiler.target_segment_length()
         segments = self.segmenter.segment(payload, splits, target)
         if not segments:
