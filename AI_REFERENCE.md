@@ -23,7 +23,12 @@ change so the next agent inherits the latest context.
   only as a scratch/cache/export format (e.g., `--db var/tmp.sqlite3` for quick analysis or when
   emitting `.sqlite3` artifacts) and should never be treated as the long-term source of truth again.
   When in doubt: start/attach to the cheetah server first, keep `DBSLM_BACKEND=cheetah-db`, and only
-  lean on SQLite when a workflow explicitly requires a transient file.
+  lean on SQLite when a workflow explicitly requires a transient file. The trainer now strictly exits
+  if the cheetah TCP endpoint cannot be reached—there is no SQLite fallback path anymore.
+- When training/decoding from inside WSL but pointing at a cheetah server running on Windows, the
+  hot-path adapter auto-retries the Windows bridge IP discovered via `/etc/resolv.conf` whenever the
+  configured `DBSLM_CHEETAH_HOST` resolves to loopback. Override `DBSLM_CHEETAH_HOST` with the exact
+  Windows/LAN address when cheetah lives elsewhere (container, remote host, etc.).
 - `cheetah-db` now keeps a bounded payload cache inside `database.go`, keyed by
   `<value_size, table_id, entry_id>` so hot `READ`/`PAIR_REDUCE` loops remain in RAM instead of
   pounding the same `values_<size>_<tableID>.table` sectors. It defaults to 16k entries (~64 MB) and

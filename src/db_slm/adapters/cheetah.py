@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import logging
+import os
 import socket
 import struct
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from ..cheetah_types import (
@@ -27,6 +30,59 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REDUCE_PAGE_SIZE = 1024
 READLINE_IDLE_GRACE_SECONDS = 30.0
+
+
+def _detect_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    for probe in ("/proc/sys/kernel/osrelease", "/proc/version"):
+        try:
+            contents = Path(probe).read_text(encoding="utf-8").lower()
+        except OSError:
+            continue
+        if "microsoft" in contents or "wsl" in contents:
+            return True
+    return False
+
+
+def _detect_wsl_host_ip() -> str | None:
+    resolv = Path("/etc/resolv.conf")
+    if not resolv.exists():
+        return None
+    try:
+        for raw_line in resolv.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("nameserver"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            candidate = parts[1]
+            try:
+                ip = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if ip.version == 4:
+                return candidate
+    except OSError:
+        return None
+    return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized in {"localhost", "loopback"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+_RUNNING_IN_WSL = _detect_wsl()
+_WSL_HOST_IP = _detect_wsl_host_ip() if _RUNNING_IN_WSL else None
 
 
 class CheetahError(RuntimeError):
@@ -49,6 +105,8 @@ class CheetahClient:
         self.database = database
         self.timeout = timeout
         self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
+        self._host_candidates = self._build_host_candidates(host)
+        self._active_host: str | None = None
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
 
@@ -57,6 +115,9 @@ class CheetahClient:
     # ------------------------------------------------------------------ #
     def healthy(self) -> bool:
         return self._sock is not None
+
+    def describe_targets(self) -> str:
+        return ", ".join(f"{host}:{self.port}" for host in self._host_candidates)
 
     def connect(self) -> bool:
         with self._lock:
@@ -163,21 +224,26 @@ class CheetahClient:
     def _ensure_connection(self) -> bool:
         if self._sock:
             return True
-        try:
-            sock = socket.create_connection((self.host, self.port), self.timeout)
-            sock.settimeout(self.timeout)
+        for host in self._host_candidates:
+            try:
+                sock = socket.create_connection((host, self.port), self.timeout)
+                sock.settimeout(self.timeout)
+            except OSError as exc:
+                logger.debug("Unable to reach cheetah-db at %s:%s (%s)", host, self.port, exc)
+                continue
             self._sock = sock
-        except OSError as exc:
-            logger.debug("Unable to reach cheetah-db at %s:%s (%s)", self.host, self.port, exc)
-            self._sock = None
-            return False
-        if self.database and self.database != "default":
-            response = self._command_unlocked(f"DATABASE {self.database}")
-            if not response or not response.startswith("SUCCESS"):
-                logger.debug("Failed to switch cheetah database: %s", response)
-                self._close_socket()
-                return False
-        return True
+            self._active_host = host
+            if self.database and self.database != "default":
+                response = self._command_unlocked(f"DATABASE {self.database}")
+                if not response or not response.startswith("SUCCESS"):
+                    logger.debug(
+                        "Failed to switch cheetah database on %s:%s: %s", host, self.port, response
+                    )
+                    self._close_socket()
+                    continue
+            return True
+        logger.debug("Unable to reach cheetah-db hosts (%s)", self.describe_targets())
+        return False
 
     def _command_unlocked(self, text: str) -> str | None:
         line = (text.strip() + "\n").encode("utf-8")
@@ -224,6 +290,14 @@ class CheetahClient:
             except OSError:
                 pass
             self._sock = None
+        self._active_host = None
+
+    def _build_host_candidates(self, host: str) -> list[str]:
+        hosts = [host]
+        if _RUNNING_IN_WSL and _is_loopback_host(host):
+            if _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
+                hosts.append(_WSL_HOST_IP)
+        return hosts
 
     @staticmethod
     def _parse_key_response(response: str | None) -> int | None:
@@ -1101,9 +1175,10 @@ def build_cheetah_adapter(
     )
     adapter = CheetahHotPathAdapter(client)
     if not client.connect():
-        logger.warning("cheetah hot-path backend unreachable") # there was: falling back to SQLite-only mode
-        exit(-1) # now exit if cheetah not found
-        return NullHotPathAdapter()
+        logger.warning(
+            "cheetah hot-path backend unreachable (tried %s)", client.describe_targets()
+        )  # there was: falling back to SQLite-only mode
+        raise SystemExit(1)  # now exit if cheetah not found
     return adapter
 
 
