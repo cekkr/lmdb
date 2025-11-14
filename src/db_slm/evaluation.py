@@ -8,8 +8,8 @@ import random
 import re
 import textwrap
 import uuid
-from collections import Counter
-from dataclasses import dataclass
+from collections import Counter, deque
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +18,7 @@ from .inference_shared import issue_prompt
 from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
 from .quality import SentenceQualityScorer
+from helpers.char_tree_similarity import similarity_score
 
 from log_helpers import log
 
@@ -67,7 +68,21 @@ class VariantSeedPlanner:
 
 _MAX_BATCH_ATTEMPTS = 2
 _MAX_FUTURE_BATCH_RETRIES = 3
+_CHAR_REPEAT_ALERT = 0.92
+_RECENT_GENERATION_LIMIT = 64
 _flagged_retry_budget: dict[str, int] = {}
+
+
+def _boost_decoder_penalties(
+    config: DecoderConfig | None,
+    *,
+    presence_delta: float = 0.05,
+    frequency_delta: float = 0.1,
+) -> DecoderConfig:
+    base = config if config is not None else DecoderConfig()
+    presence = min(1.5, base.presence_penalty + presence_delta)
+    frequency = min(1.5, base.frequency_penalty + frequency_delta)
+    return replace(base, presence_penalty=presence, frequency_penalty=frequency)
 
 
 def _record_signature(record: EvaluationRecord) -> str:
@@ -200,6 +215,7 @@ class ResponseEvaluator:
         embedder_model = getattr(getattr(engine, "settings", None), "embedder_model", "all-MiniLM-L6-v2")
         shared_embedder = getattr(getattr(engine, "segment_embedder", None), "embedder", None)
         self.quality = SentenceQualityScorer(embedder_model=embedder_model, embedder=shared_embedder)
+        self._recent_generations: deque[str] = deque(maxlen=_RECENT_GENERATION_LIMIT)
 
     def evaluate(self, prompt: str, reference: str, candidate: str) -> dict[str, float | int | None]:
         lexical = lexical_overlap(reference, candidate)
@@ -223,7 +239,35 @@ class ResponseEvaluator:
                 structure_metrics=structure_metrics,
             )
         )
+        metrics.update(self._repetition_metrics(candidate))
+        self._remember_generation(candidate)
         return metrics
+
+    def _repetition_metrics(self, candidate: str) -> dict[str, float]:
+        normalized = candidate.strip()
+        if not normalized or not self._recent_generations:
+            return {"char_repeat_max": 0.0, "char_repeat_avg": 0.0}
+        scores: list[float] = []
+        for previous in self._recent_generations:
+            try:
+                score = similarity_score(normalized, previous, substring_weight=0.35)
+            except Exception:
+                continue
+            scores.append(score)
+        if not scores:
+            return {"char_repeat_max": 0.0, "char_repeat_avg": 0.0}
+        max_score = max(scores)
+        avg_score = sum(scores) / len(scores)
+        return {
+            "char_repeat_max": round(max_score, 4),
+            "char_repeat_avg": round(avg_score, 4),
+        }
+
+    def _remember_generation(self, candidate: str) -> None:
+        normalized = candidate.strip()
+        if not normalized:
+            return
+        self._recent_generations.append(normalized)
 
     def _perplexity(self, prompt: str, target: str) -> float:
         tokens = self.engine.tokenizer.encode(target, add_special_tokens=False)
@@ -283,6 +327,8 @@ def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, fl
         "sentence_opener_diversity_mean": "sentence_opener_diversity",
         "punctuation_balance_mean": "punctuation_balance",
         "unique_bigram_ratio_mean": "unique_bigram_ratio",
+        "char_repeat_max_mean": "char_repeat_max",
+        "char_repeat_avg_mean": "char_repeat_avg",
     }
     return {summary_name: _mean_metric(samples, metric_name) for summary_name, metric_name in summary_keys.items()}
 
@@ -328,6 +374,7 @@ def run_inference_records(
                     "record_key": record_key,
                     "attempts": 0,
                     "variant": variant,
+                    "decoder_cfg_override": None,
                 }
             )
     while pending:
@@ -345,6 +392,7 @@ def run_inference_records(
         min_words = max(20, min(512, int(ref_words * 0.85)))
         flagged = False
         flag_reasons: list[str] = []
+        active_decoder_cfg = entry.get("decoder_cfg_override") or decoder_cfg
         _, generated = issue_prompt(
             engine,
             record.prompt,
@@ -352,17 +400,46 @@ def run_inference_records(
             agent_name=agent_name,
             seed_history=False,
             min_response_words=min_words,
-            decoder_cfg=decoder_cfg,
+            decoder_cfg=active_decoder_cfg,
             rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
         )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
+        repeat_similarity = metrics.get("char_repeat_max")
+        repeat_similarity_val = (
+            float(repeat_similarity)
+            if isinstance(repeat_similarity, (int, float)) and math.isfinite(repeat_similarity)
+            else 0.0
+        )
+        force_repeat_flag = repeat_similarity_val >= _CHAR_REPEAT_ALERT
+        flagged_for_repetition = False
         if quality_gate:
             flagged, flag_reasons = quality_gate.process(record, generated, metrics)
             if flagged:
                 joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
                 log(f"[eval] {tag}: flagged for retraining ({joined}).")
+        if force_repeat_flag:
+            flagged_for_repetition = True
+            if not flagged:
+                flagged = True
+            reason = f"repeat_similarity>={_CHAR_REPEAT_ALERT:.2f}"
+            if reason not in flag_reasons:
+                flag_reasons.append(reason)
+        elif flagged:
+            flagged_for_repetition = any(
+                str(reason).startswith("repeat_similarity>=") for reason in flag_reasons
+            )
         if flagged and attempts < _MAX_BATCH_ATTEMPTS:
             joined = "; ".join(flag_reasons) if flag_reasons else "low-quality sample"
+            if flagged_for_repetition:
+                boosted_cfg = _boost_decoder_penalties(
+                    entry.get("decoder_cfg_override") or decoder_cfg,
+                )
+                entry["decoder_cfg_override"] = boosted_cfg
+                log(
+                    f"[eval] {tag}: boosting decoder penalties to presence={boosted_cfg.presence_penalty:.2f} "
+                    f"/ frequency={boosted_cfg.frequency_penalty:.2f} after repeat similarity "
+                    f"{repeat_similarity_val:.2f}."
+                )
             log(
                 f"[eval] {tag}: re-queueing flagged sample "
                 f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
@@ -550,6 +627,7 @@ class QualityGate:
         similarity_floor: float = 0.55,
         structure_floor: float = 0.35,
         common_token_ceiling: float = 0.55,
+        repeat_similarity_ceiling: float = _CHAR_REPEAT_ALERT,
     ) -> None:
         self.path = Path(output_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -558,6 +636,7 @@ class QualityGate:
         self.similarity_floor = similarity_floor
         self.structure_floor = structure_floor
         self.common_token_ceiling = common_token_ceiling
+        self.repeat_similarity_ceiling = repeat_similarity_ceiling
 
     def process(
         self,
@@ -601,4 +680,10 @@ class QualityGate:
         token_penalty = metrics.get("common_token_penalty")
         if isinstance(token_penalty, (int, float)) and token_penalty > self.common_token_ceiling:
             reasons.append(f"common_token_penalty>{self.common_token_ceiling}")
+        repeat_similarity = metrics.get("char_repeat_max")
+        if (
+            isinstance(repeat_similarity, (int, float))
+            and repeat_similarity >= self.repeat_similarity_ceiling
+        ):
+            reasons.append(f"repeat_similarity>={self.repeat_similarity_ceiling:.2f}")
         return (len(reasons) > 0, reasons)

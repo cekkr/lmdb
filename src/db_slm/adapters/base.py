@@ -75,6 +75,9 @@ class HotPathAdapter(Protocol):
     def topk_hit_ratio(self) -> float:
         """Return the observed cheetah Top-K cache hit ratio (0-1)."""
 
+    def describe(self) -> str:
+        """Return a human-readable description of the adapter for logging."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -140,6 +143,9 @@ class NullHotPathAdapter:
 
     def topk_hit_ratio(self) -> float:
         return 0.0
+
+    def describe(self) -> str:
+        return "hot-path:disabled"
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

@@ -595,6 +595,9 @@ def main() -> None:
                 "to allow the SQLite fallback."
             )
         log("[train] Warning: cheetah-db backend unreachable; proceeding on SQLite because --backonsqlite was set.")
+    describe_adapter = getattr(engine.hot_path, "describe", None)
+    if callable(describe_adapter):
+        log(f"[train] Hot-path adapter active -> {describe_adapter()}")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
     if run_metadata is not None:
@@ -752,6 +755,9 @@ def main() -> None:
         log(
             f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
         )
+        ratio = engine.cheetah_topk_ratio()
+        if ratio:
+            log(f"[train] cheetah Top-K hit ratio ~ {ratio:.2%}")
         success = True
     finally:
         engine.db.close()

@@ -67,6 +67,14 @@ change so the next agent inherits the latest context.
 - Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
   via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
   truncated generations.
+- `src/train.py` now logs the active cheetah hot-path endpoint (host, port, namespace) at startup and
+  reports the observed Top-K hit ratio after ingest completes so every run leaves an explicit trace
+  that cheetah-db handled the work (runs still abort unless `--backonsqlite` is provided when the
+  server is unreachable).
+- Evaluation now tracks cross-sample repetition via `helpers/char_tree_similarity.py`, exposes
+  `char_repeat_max/avg` metrics, feeds them into `QualityGate`, and automatically re-queues variants
+  with stronger presence/frequency penalties whenever the generated text matches earlier prompts too
+  closely.
 - cheetah-db now mirrors context metadata + Top-K slices directly during ingest. `DBSLM_BACKEND`
   defaults to `cheetah-db`, the decoder reports its hit ratio via
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with

@@ -523,6 +523,9 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._enabled = True
         self._topk_total = 0
         self._topk_hits = 0
+        self._description = (
+            f"cheetah-db://{self._client.host}:{self._client.port}/{self._client.database}"
+        )
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -943,6 +946,9 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if self._topk_total <= 0:
             return 0.0
         return min(1.0, max(0.0, self._topk_hits / float(self._topk_total)))
+
+    def describe(self) -> str:
+        return self._description
 
     # ------------------------------------------------------------------ #
     # Internal helpers
