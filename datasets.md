@@ -13,3 +13,4 @@
 - When profiling the dataset, prefer chunk sizes ≥2,000 rows so the sentence-part embedder can observe enough punctuation statistics to avoid aggressive truncation.
 
 Source: [https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b](https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b)
+Fast download [https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing](https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing)
