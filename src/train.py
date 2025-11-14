@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 from db_slm import DBSLMEngine
 from db_slm.adapters.base import NullHotPathAdapter
+from db_slm.adapters.cheetah import CheetahClient
 from db_slm.context_dimensions import (
     DEFAULT_CONTEXT_DIMENSIONS,
     format_context_dimensions,
@@ -35,7 +36,7 @@ from db_slm.evaluation import (
     build_dependency_layer,
     run_inference_records,
 )
-from db_slm.settings import load_settings
+from db_slm.settings import DBSLMSettings, load_settings
 
 from log_helpers import log
 
@@ -193,6 +194,93 @@ def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
     if reset and path.exists():
         path.unlink()
     return str(path), path
+
+
+_CHEETAH_PURGE_PREFIXES: tuple[bytes, ...] = (
+    b"ctx:",
+    b"ctxv:",
+    b"topk:",
+    b"cnt:",
+    b"prob:",
+    b"cont:",
+    b"meta:",
+)
+
+
+def _purge_cheetah_namespace(
+    client: CheetahClient,
+    prefix: bytes,
+    *,
+    page_size: int = 1024,
+) -> int:
+    """Remove all pair entries (and backing values) for the given namespace prefix."""
+    namespace_label = prefix.decode("utf-8", "ignore").rstrip(":") or prefix.hex()
+    removed = 0
+    scan_warned = False
+    delete_warned = False
+    pair_warned = False
+    while True:
+        result = client.pair_scan(prefix=prefix, limit=page_size)
+        if result is None:
+            if not scan_warned:
+                log(f"[train] Warning: cheetah reset aborted while scanning '{namespace_label}'.")
+                scan_warned = True
+            break
+        entries, _ = result
+        if not entries:
+            break
+        for raw_value, key in entries:
+            deleted, response = client.delete(key)
+            if not deleted:
+                if not delete_warned:
+                    log(
+                        f"[train] Warning: failed to delete cheetah key {key} in '{namespace_label}': {response}"
+                    )
+                    delete_warned = True
+                continue
+            removed += 1
+            success, response = client.pair_del(raw_value)
+            if not success and not pair_warned:
+                identifier = raw_value.hex()
+                log(
+                    f"[train] Warning: unable to drop cheetah pair '{namespace_label}' entry {identifier}: {response}"
+                )
+                pair_warned = True
+    return removed
+
+
+def reset_cheetah_store(settings: DBSLMSettings) -> None:
+    """Clear the cached cheetah-db namespaces used by the trainer when --reset is supplied."""
+    backend_active = settings.backend == "cheetah-db" or settings.cheetah_mirror
+    if not backend_active:
+        log("[train] --reset requested: cheetah hot-path disabled, skipping cheetah-db cleanup.")
+        return
+    client = CheetahClient(
+        settings.cheetah_host,
+        settings.cheetah_port,
+        database=settings.cheetah_database,
+        timeout=settings.cheetah_timeout_seconds,
+    )
+    if not client.connect():
+        log(
+            "[train] Warning: --reset requested but cheetah-db is unreachable "
+            f"(targets: {client.describe_targets()}; errors: {client.describe_failures()})."
+        )
+        return
+    try:
+        total_removed = 0
+        for prefix in _CHEETAH_PURGE_PREFIXES:
+            removed = _purge_cheetah_namespace(client, prefix)
+            total_removed += removed
+            if removed:
+                label = prefix.decode("utf-8", "ignore").rstrip(":") or prefix.hex()
+                log(f"[train] cheetah reset: cleared {removed} '{label}' mapping(s).")
+        if total_removed == 0:
+            log("[train] cheetah reset: no cached namespaces required clearing.")
+        else:
+            log(f"[train] cheetah reset: removed {total_removed} cached mapping(s) total.")
+    finally:
+        client.close()
 
 
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
@@ -636,6 +724,8 @@ def main() -> None:
         parser.error(str(exc))
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
+    if args.reset:
+        reset_cheetah_store(settings)
     metrics_path = resolve_metrics_export_path(args.metrics_export)
     metrics_writer: EvalLogWriter | None = None
     run_metadata: dict[str, Any] | None = None

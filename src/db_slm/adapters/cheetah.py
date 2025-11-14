@@ -166,6 +166,10 @@ class CheetahClient:
                 return self._decode_value(raw)
         return None
 
+    def delete(self, key: int) -> tuple[bool, str | None]:
+        response = self._command(f"DELETE {key}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
     def pair_set(self, value: bytes, key: int) -> tuple[bool, str | None]:
         response = self._command(f"PAIR_SET x{value.hex()} {key}")
         return (response is not None and response.startswith("SUCCESS")), response
@@ -173,6 +177,10 @@ class CheetahClient:
     def pair_get(self, value: bytes) -> int | None:
         response = self._command(f"PAIR_GET x{value.hex()}")
         return self._parse_key_response(response)
+
+    def pair_del(self, value: bytes) -> tuple[bool, str | None]:
+        response = self._command(f"PAIR_DEL x{value.hex()}")
+        return (response is not None and response.startswith("SUCCESS")), response
 
     def pair_scan(
         self,
