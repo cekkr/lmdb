@@ -27,10 +27,12 @@ from db_slm.context_dimensions import (
 from db_slm.decoder import DecoderConfig
 from db_slm.evaluation import (
     EvalLogWriter,
+    DependencyLayer,
     EvaluationRecord,
     QualityGate,
     ResponseEvaluator,
     VariantSeedPlanner,
+    build_dependency_layer,
     run_inference_records,
 )
 from db_slm.settings import load_settings
@@ -273,6 +275,60 @@ class TrainingProgressPrinter:
         return labels.get(stage, stage)
 
 
+def _serialize_dependency_layer(layer: DependencyLayer | None) -> dict[str, Any] | None:
+    if layer is None:
+        return None
+    dependencies = [
+        {
+            "token": arc.token,
+            "lemma": arc.lemma,
+            "head": arc.head,
+            "dep": arc.dep,
+            "pos": arc.pos,
+        }
+        for arc in layer.arcs
+    ]
+    return {
+        "backend": layer.backend,
+        "token_count": layer.token_count,
+        "strong_tokens": layer.strong_token_groups,
+        "dependencies": dependencies,
+    }
+
+
+def _flatten_dependency_tokens(layer: DependencyLayer | None) -> list[str]:
+    if layer is None or not layer.strong_token_groups:
+        return []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for bucket in sorted(layer.strong_token_groups):
+        for token in layer.strong_token_groups[bucket]:
+            if token in seen:
+                continue
+            ordered.append(token)
+            seen.add(token)
+    return ordered
+
+
+def _dependency_layer_annotation(
+    prompt_layer: DependencyLayer | None,
+    response_layer: DependencyLayer | None,
+) -> str | None:
+    prompt_payload = _serialize_dependency_layer(prompt_layer)
+    response_payload = _serialize_dependency_layer(response_layer)
+    if not prompt_payload and not response_payload:
+        return None
+    payload = {
+        "prompt": prompt_payload,
+        "response": response_payload,
+        "strong_reference": {
+            "prompt": _flatten_dependency_tokens(prompt_layer),
+            "response": _flatten_dependency_tokens(response_layer),
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def iter_corpora(
     paths: Iterable[Path],
     encoding: str,
@@ -317,7 +373,9 @@ def iter_json_chunks(
             emotion = payload.get("emotion", "unknown")
             if not response:
                 continue
-            segment = "\n".join(
+            prompt_layer = build_dependency_layer(prompt or "")
+            response_layer = build_dependency_layer(response)
+            segment_lines = list(
                 filter(
                     None,
                     [
@@ -327,7 +385,17 @@ def iter_json_chunks(
                     ],
                 )
             )
-            record = EvaluationRecord(prompt=prompt or "", response=response, emotion=emotion)
+            annotation = _dependency_layer_annotation(prompt_layer, response_layer)
+            if annotation:
+                segment_lines.append(f"DependencyLayer: {annotation}")
+            segment = "\n".join(segment_lines)
+            record = EvaluationRecord(
+                prompt=prompt or "",
+                response=response,
+                emotion=emotion,
+                prompt_dependencies=prompt_layer,
+                response_dependencies=response_layer,
+            )
 
             log(f"[train] Staged line #{line_no} (Prompt: {prompt})")
 
@@ -392,11 +460,15 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
             response = payload.get("response")
             if not prompt or not response:
                 continue
+            prompt_layer = build_dependency_layer(prompt)
+            response_layer = build_dependency_layer(response)
             records.append(
                 EvaluationRecord(
                     prompt=prompt,
                     response=response,
                     emotion=payload.get("emotion", "unknown"),
+                    prompt_dependencies=prompt_layer,
+                    response_dependencies=response_layer,
                 )
             )
             if limit is not None and len(records) >= limit:

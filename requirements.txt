@@ -1,3 +1,5 @@
 sentence-transformers>=2.7.0
 language-tool-python>=2.7.1
 tokenizers>=0.19.0
+spacy>=3.7.0
+stanza>=1.6.2

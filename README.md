@@ -136,8 +136,29 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - **Penalty overrides (per-probe sampling tweaks):**
   - `--decoder-presence-penalty <float>=0+`: add a one-time penalty whenever a token (or grouped span)
     has already appeared in the current generation. Typical sweep range is `0.0-0.4`.
-  - `--decoder-frequency-penalty <float>=0+`: scales with how many times the token/span has appeared.
+- `--decoder-frequency-penalty <float>=0+`: scales with how many times the token/span has appeared.
     Values between `0.0` and `0.2` generally work best for conversational corpora.
+
+#### Dependency parsing layer & strong token groups
+
+- Every JSON/NDJSON row now runs through a dependency parser (spaCy first, Stanza as a fallback) when
+  preparing training/evaluation samples. The resulting arcs and categorical buckets are appended to
+  each segment as a `DependencyLayer: {...}` line so the downstream n-gram prep can treat those terms
+  as a strong reference set. This extra layer gives the hold-out sampler the "important tokens" with
+  far fewer n-gram windows than a naïve surface-form scan.
+- The serialized payload includes the backend (`spacy` or `stanza`), the flattened dependency arcs,
+  and a `strong_reference` map that classifies lemmas into buckets such as `subjects`, `objects`,
+  `actions`, and `modifiers`. Evaluations report two additional metrics derived from the same data:
+  `strong_token_overlap` (share of critical lemmas preserved) and `dependency_arc_overlap` (matching
+  head/dependency triples). Both values surface in the probe summaries next to ROUGE/perplexity.
+- Configure the parsers via environment variables: `DBSLM_SPACY_MODEL` (default `en_core_web_sm`),
+  `DBSLM_DEP_LANG` (default `en` for Stanza), and `DBSLM_STANZA_PROCESSORS`
+  (default `tokenize,pos,lemma,depparse`). When neither backend is installed the trainer logs a
+  single warning and continues without the layer.
+- Remember to install at least one backend model before training: e.g.
+  `python -m spacy download en_core_web_sm` or `python -c "import stanza; stanza.download('en')"`. The
+  base `requirements.txt` already lists both libraries so `pip install -r requirements.txt` pulls the
+  Python packages automatically.
 
 Large batches can take a while to finish a single call to `train_from_text()`, so the trainer now
 prints progress lines for the vocabulary pass, every n-gram order, and the KN rebuilds. The logs

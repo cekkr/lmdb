@@ -45,9 +45,19 @@ change so the next agent inherits the latest context.
 - `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
   for the relational layout plus the KN materialization + decoding loops implemented in Python.
 - `requirements.txt` now installs `sentence-transformers` (external embedding baseline),
-  `language-tool-python` (grammar deltas for the quality gate), and Hugging Face `tokenizers`
-  (optional but enabled by default for the new tokenizer backend). Optional GPU acceleration is
-  auto-detected via PyTorch when present.
+  `language-tool-python` (grammar deltas for the quality gate), Hugging Face `tokenizers` (regex
+  replacement backend), plus spaCy **and** Stanza so at least one dependency-parser stack is ready for
+  the new training annotations. Optional GPU acceleration is auto-detected via PyTorch when present.
+- `src/train.py` passes every JSON/NDJSON prompt/response through the dependency parser (preferring
+  spaCy via `DBSLM_SPACY_MODEL`, falling back to Stanza via `DBSLM_DEP_LANG`/`DBSLM_STANZA_PROCESSORS`)
+  and appends a `DependencyLayer: {...}` JSON blob to the staged corpus text. The blob enumerates the
+  arcs plus a strong-token bucket list (subjects, objects, actions, modifiers, etc.) so the trainer
+  and quality gate can weight those terms without growing the n-gram order. When neither backend is
+  installed we emit a single warning and continue without the metadata.
+- Evaluation probes reuse the stored dependency layers to compute `strong_token_overlap` and
+  `dependency_arc_overlap` metrics for each generation. Both are logged next to ROUGE/perplexity and
+  folded into the metrics export so we can tell whether the decoder is preserving grammatical
+  structure vs. just matching surface tokens.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments.

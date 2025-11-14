@@ -4,12 +4,14 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import textwrap
 import uuid
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -24,10 +26,29 @@ from log_helpers import log
 
 
 @dataclass(frozen=True)
+class DependencyArc:
+    token: str
+    lemma: str
+    head: str
+    dep: str
+    pos: str
+
+
+@dataclass(frozen=True)
+class DependencyLayer:
+    backend: str
+    arcs: tuple[DependencyArc, ...]
+    strong_token_groups: dict[str, tuple[str, ...]]
+    token_count: int
+
+
+@dataclass(frozen=True)
 class EvaluationRecord:
     prompt: str
     response: str
     emotion: str = "unknown"
+    prompt_dependencies: DependencyLayer | None = None
+    response_dependencies: DependencyLayer | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +62,267 @@ class EvaluationSampleResult:
     metrics: dict[str, float | int | None]
     flagged: bool = False
     variant: int = 1
+
+
+_STRONG_DEP_GROUPS = {
+    "subjects": {"nsubj", "nsubjpass", "csubj", "csubjpass", "expl"},
+    "objects": {"dobj", "obj", "pobj", "iobj", "dative", "attr"},
+    "actions": {"ROOT", "ccomp", "xcomp", "advcl", "acl", "relcl"},
+    "modifiers": {"amod", "advmod", "acomp", "appos"},
+    "quantifiers": {"nummod", "quantmod"},
+    "auxiliaries": {"aux", "auxpass", "cop"},
+}
+_DEPENDENCY_PIPELINE_BACKEND: str | None = None
+_DEPENDENCY_PIPELINE: Any | None = None
+_DEPENDENCY_PIPELINE_ATTEMPTED = False
+_DEPENDENCY_DISABLED_NOTICE_EMITTED = False
+_DEPENDENCY_FAILURE_NOTICE_EMITTED = False
+
+
+def _get_dependency_pipeline() -> tuple[str | None, Any | None]:
+    global _DEPENDENCY_PIPELINE_ATTEMPTED, _DEPENDENCY_PIPELINE_BACKEND, _DEPENDENCY_PIPELINE
+    if _DEPENDENCY_PIPELINE is not None or _DEPENDENCY_PIPELINE_ATTEMPTED:
+        return _DEPENDENCY_PIPELINE_BACKEND, _DEPENDENCY_PIPELINE
+    backend, pipeline = _load_dependency_pipeline()
+    _DEPENDENCY_PIPELINE_ATTEMPTED = True
+    _DEPENDENCY_PIPELINE_BACKEND = backend
+    _DEPENDENCY_PIPELINE = pipeline
+    if backend and pipeline:
+        log(f"[deps] Enabled dependency parsing backend: {backend}.")
+    else:
+        _emit_dependency_disabled_notice()
+    return backend, pipeline
+
+
+def _load_dependency_pipeline() -> tuple[str | None, Any | None]:
+    loaders = (_load_spacy_pipeline, _load_stanza_pipeline)
+    for loader in loaders:
+        backend, pipeline = loader()
+        if backend and pipeline:
+            return backend, pipeline
+    return None, None
+
+
+def _load_spacy_pipeline() -> tuple[str | None, Any | None]:
+    model_name = os.environ.get("DBSLM_SPACY_MODEL", "en_core_web_sm")
+    try:
+        import spacy  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(f"[deps] spaCy unavailable: {exc}")
+        return None, None
+    try:
+        pipeline = spacy.load(model_name, disable=["ner", "textcat"])
+        return "spacy", pipeline
+    except Exception as exc:  # pragma: no cover - dynamic model loading
+        log(f"[deps] spaCy model '{model_name}' could not be loaded: {exc}")
+        return None, None
+
+
+def _load_stanza_pipeline() -> tuple[str | None, Any | None]:
+    try:
+        import stanza  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        log(f"[deps] Stanza unavailable: {exc}")
+        return None, None
+    lang = os.environ.get("DBSLM_DEP_LANG", "en")
+    processors = os.environ.get("DBSLM_STANZA_PROCESSORS", "tokenize,pos,lemma,depparse")
+    try:
+        pipeline = stanza.Pipeline(
+            lang=lang,
+            processors=processors,
+            tokenize_no_ssplit=True,
+            use_gpu=False,
+            verbose=False,
+        )
+        return "stanza", pipeline
+    except Exception as exc:  # pragma: no cover - download/runtime errors
+        log(f"[deps] Stanza pipeline error ({lang}): {exc}")
+        return None, None
+
+
+def _emit_dependency_disabled_notice() -> None:
+    global _DEPENDENCY_DISABLED_NOTICE_EMITTED
+    if _DEPENDENCY_DISABLED_NOTICE_EMITTED:
+        return
+    _DEPENDENCY_DISABLED_NOTICE_EMITTED = True
+    log(
+        "[deps] Dependency parsing layer disabled. Install spaCy with an English model "
+        "or Stanza to enable strong token grouping."
+    )
+
+
+@lru_cache(maxsize=512)
+def build_dependency_layer(text: str) -> DependencyLayer | None:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return None
+    backend, pipeline = _get_dependency_pipeline()
+    if not backend or pipeline is None:
+        return None
+    try:
+        if backend == "spacy":
+            return _dependency_layer_from_spacy(pipeline, normalized)
+        if backend == "stanza":
+            return _dependency_layer_from_stanza(pipeline, normalized)
+    except Exception as exc:
+        _emit_dependency_failure_notice(exc, backend)
+    return None
+
+
+def _dependency_layer_from_spacy(pipeline: Any, text: str) -> DependencyLayer:
+    doc = pipeline(text)
+    arcs: list[DependencyArc] = []
+    grouped: defaultdict[str, set[str]] = defaultdict(set)
+    for token in doc:
+        if getattr(token, "is_space", False):
+            continue
+        head_text = token.head.text if token.head is not token else "ROOT"
+        arcs.append(
+            DependencyArc(
+                token=token.text,
+                lemma=token.lemma_,
+                head=head_text,
+                dep=token.dep_,
+                pos=token.pos_,
+            )
+        )
+        _categorize_token(grouped, token.dep_, token.pos_, token.lemma_)
+    return DependencyLayer(
+        backend="spacy",
+        arcs=tuple(arcs),
+        strong_token_groups=_finalize_groups(grouped),
+        token_count=len(arcs),
+    )
+
+
+def _dependency_layer_from_stanza(pipeline: Any, text: str) -> DependencyLayer:
+    doc = pipeline(text)
+    arcs: list[DependencyArc] = []
+    grouped: defaultdict[str, set[str]] = defaultdict(set)
+    for sentence in getattr(doc, "sentences", []):
+        words = getattr(sentence, "words", [])
+        for word in words:
+            head = "ROOT"
+            head_index = getattr(word, "head", 0)
+            if isinstance(head_index, int) and 0 < head_index <= len(words):
+                head = words[head_index - 1].text
+            lemma = word.lemma if getattr(word, "lemma", None) else word.text
+            dep = word.deprel or ""
+            pos = word.upos or ""
+            arcs.append(
+                DependencyArc(
+                    token=word.text,
+                    lemma=lemma,
+                    head=head,
+                    dep=dep,
+                    pos=pos,
+                )
+            )
+            _categorize_token(grouped, dep, pos, lemma)
+    return DependencyLayer(
+        backend="stanza",
+        arcs=tuple(arcs),
+        strong_token_groups=_finalize_groups(grouped),
+        token_count=len(arcs),
+    )
+
+
+def _categorize_token(
+    grouped: defaultdict[str, set[str]],
+    dep_label: str | None,
+    pos_tag: str | None,
+    lemma: str | None,
+) -> None:
+    lemma_norm = (lemma or "").strip().lower()
+    if not lemma_norm:
+        return
+    dep_lower = (dep_label or "").lower()
+    for bucket, labels in _STRONG_DEP_GROUPS.items():
+        if dep_lower in labels:
+            grouped[bucket].add(lemma_norm)
+            return
+    pos_upper = (pos_tag or "").upper()
+    if pos_upper in {"VERB", "AUX"}:
+        grouped["actions"].add(lemma_norm)
+    elif pos_upper in {"NOUN", "PROPN", "PRON"}:
+        grouped.setdefault("entities", set()).add(lemma_norm)
+    elif pos_upper in {"ADV", "ADJ"}:
+        grouped.setdefault("modifiers", set()).add(lemma_norm)
+
+
+def _finalize_groups(grouped: defaultdict[str, set[str]]) -> dict[str, tuple[str, ...]]:
+    finalized: dict[str, tuple[str, ...]] = {}
+    for bucket, tokens in grouped.items():
+        if not tokens:
+            continue
+        finalized[bucket] = tuple(sorted(tokens))
+    return finalized
+
+
+def _flatten_strong_tokens(layer: DependencyLayer | None) -> set[str]:
+    if not layer or not layer.strong_token_groups:
+        return set()
+    tokens: set[str] = set()
+    for bucket_tokens in layer.strong_token_groups.values():
+        tokens.update(bucket_tokens)
+    return tokens
+
+
+def _dependency_arc_overlap(
+    reference_layer: DependencyLayer | None,
+    candidate_layer: DependencyLayer | None,
+) -> float | None:
+    if not reference_layer or not candidate_layer:
+        return None
+    ref_arcs = {
+        (arc.lemma.lower(), arc.dep.lower(), arc.head.lower())
+        for arc in reference_layer.arcs
+        if arc.lemma and arc.dep and arc.head
+    }
+    cand_arcs = {
+        (arc.lemma.lower(), arc.dep.lower(), arc.head.lower())
+        for arc in candidate_layer.arcs
+        if arc.lemma and arc.dep and arc.head
+    }
+    if not ref_arcs:
+        return 1.0 if not cand_arcs else 0.0
+    intersection = ref_arcs & cand_arcs
+    return len(intersection) / max(1, len(ref_arcs))
+
+
+def _emit_dependency_failure_notice(exc: Exception, backend: str | None) -> None:
+    global _DEPENDENCY_FAILURE_NOTICE_EMITTED
+    if _DEPENDENCY_FAILURE_NOTICE_EMITTED:
+        return
+    _DEPENDENCY_FAILURE_NOTICE_EMITTED = True
+    label = backend or "unknown"
+    log(f"[deps] Dependency parsing failed via {label}: {exc}")
+
+
+def _dependency_alignment_metrics(
+    reference_layer: DependencyLayer | None,
+    candidate_text: str,
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "strong_token_overlap": None,
+        "dependency_arc_overlap": None,
+    }
+    if not candidate_text.strip():
+        return metrics
+    candidate_layer = build_dependency_layer(candidate_text)
+    if not reference_layer or not candidate_layer:
+        return metrics
+    ref_tokens = _flatten_strong_tokens(reference_layer)
+    cand_tokens = _flatten_strong_tokens(candidate_layer)
+    if ref_tokens:
+        overlap = len(ref_tokens & cand_tokens) / max(1, len(ref_tokens))
+        metrics["strong_token_overlap"] = round(overlap, 4)
+    else:
+        metrics["strong_token_overlap"] = 1.0 if not cand_tokens else 0.0
+    arc_overlap = _dependency_arc_overlap(reference_layer, candidate_layer)
+    if arc_overlap is not None:
+        metrics["dependency_arc_overlap"] = round(arc_overlap, 4)
+    return metrics
 
 
 class VariantSeedPlanner:
@@ -217,7 +499,9 @@ class ResponseEvaluator:
         self.quality = SentenceQualityScorer(embedder_model=embedder_model, embedder=shared_embedder)
         self._recent_generations: deque[str] = deque(maxlen=_RECENT_GENERATION_LIMIT)
 
-    def evaluate(self, prompt: str, reference: str, candidate: str) -> dict[str, float | int | None]:
+    def evaluate(self, record: EvaluationRecord, candidate: str) -> dict[str, float | int | None]:
+        prompt = record.prompt
+        reference = record.response
         lexical = lexical_overlap(reference, candidate)
         rouge = rouge_l_score(reference, candidate)
         ppl_generated = self._perplexity(prompt, candidate)
@@ -231,6 +515,7 @@ class ResponseEvaluator:
         metrics["lexical_novelty"] = max(0.0, 1.0 - lexical)
         structure_metrics = _structure_metrics(reference, candidate)
         metrics.update(structure_metrics)
+        metrics.update(_dependency_alignment_metrics(record.response_dependencies, candidate))
         metrics.update(
             self.quality.combined_quality(
                 candidate,
@@ -329,6 +614,8 @@ def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, fl
         "unique_bigram_ratio_mean": "unique_bigram_ratio",
         "char_repeat_max_mean": "char_repeat_max",
         "char_repeat_avg_mean": "char_repeat_avg",
+        "strong_token_overlap_mean": "strong_token_overlap",
+        "dependency_arc_overlap_mean": "dependency_arc_overlap",
     }
     return {summary_name: _mean_metric(samples, metric_name) for summary_name, metric_name in summary_keys.items()}
 
@@ -403,7 +690,7 @@ def run_inference_records(
             decoder_cfg=active_decoder_cfg,
             rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
         )
-        metrics = evaluator.evaluate(record.prompt, record.response, generated)
+        metrics = evaluator.evaluate(record, generated)
         repeat_similarity = metrics.get("char_repeat_max")
         repeat_similarity_val = (
             float(repeat_similarity)
