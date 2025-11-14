@@ -156,7 +156,9 @@ class DBSLMEngine:
         user_message: str,
         decoder_cfg: DecoderConfig | None = None,
         min_response_words: int = 0,
+        rng_seed: int | None = None,
     ) -> str:
+        rng = random.Random(rng_seed) if rng_seed is not None else random.Random()
         self.memory.log_message(conversation_id, "user", user_message)
         user_ids = self.tokenizer.encode(user_message, add_special_tokens=False)
         if user_ids:
@@ -179,14 +181,20 @@ class DBSLMEngine:
 
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
         rolling = list(rolling_context)
-        decoded_ids = self.decoder.decode(conversation_id, rolling, decoder_cfg, bias_context)
+        decoded_ids = self.decoder.decode(
+            conversation_id,
+            rolling,
+            decoder_cfg,
+            bias_context,
+            rng=rng,
+        )
         decoded_text = self.tokenizer.decode(decoded_ids)
         if decoded_text:
             segments.append(decoded_text)
         response = " ".join(segment.strip() for segment in segments if segment.strip()).strip()
-        response = self._low_resource_helper.maybe_paraphrase(user_message, response)
+        response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
         response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
-        response = self._tag_formatter.wrap(user_message, response)
+        response = self._tag_formatter.wrap(user_message, response, rng=rng)
         self.memory.log_message(conversation_id, "assistant", response)
         return response
 
@@ -365,7 +373,13 @@ class LowResourceHelper:
             self.engine.memory.log_message(conversation_id, "assistant", assistant_msg)
         self._seeded.add(conversation_id)
 
-    def maybe_paraphrase(self, prompt: str, response: str) -> str:
+    def maybe_paraphrase(
+        self,
+        prompt: str,
+        response: str,
+        *,
+        rng: random.Random | None = None,
+    ) -> str:
         if not self.enabled or not response.strip():
             return response
         if self._paraphraser.should_guard(prompt):
@@ -374,7 +388,7 @@ class LowResourceHelper:
         threshold = self._paraphraser.threshold(prompt)
         if similarity < threshold:
             return response
-        return self._paraphraser.rephrase(prompt, response)
+        return self._paraphraser.rephrase(prompt, response, rng=rng)
 
 
 class SimpleParaphraser:
@@ -435,14 +449,20 @@ class SimpleParaphraser:
             return True
         return self._looks_multi_turn(normalized)
 
-    def rephrase(self, prompt: str, response: str) -> str:
+    def rephrase(
+        self,
+        prompt: str,
+        response: str,
+        rng: random.Random | None = None,
+    ) -> str:
+        rng = rng or random
         swapped = self._swap_terms(response).strip()
         if not swapped:
             return response
         original = response.strip()
         if original and swapped.lower() == original.lower():
-            swapped = self._synthesize_variation(prompt)
-        swapped = self._inject_random_opening(prompt, swapped)
+            swapped = self._synthesize_variation(prompt, rng)
+        swapped = self._inject_random_opening(prompt, swapped, rng)
         return swapped
 
     def _looks_multi_turn(self, normalized_prompt: str) -> bool:
@@ -452,22 +472,22 @@ class SimpleParaphraser:
             return True
         return normalized_prompt.count("\n") >= 2
 
-    def _synthesize_variation(self, prompt: str) -> str:
+    def _synthesize_variation(self, prompt: str, rng: random.Random) -> str:
         keywords = keyword_summary(prompt, limit=4)
         if not keywords:
             return "I'll expand on the request with new framing."
         tag_list = ", ".join(keywords)
-        template = random.choice(self._VARIATION_TEMPLATES)
+        template = rng.choice(self._VARIATION_TEMPLATES)
         return template.format(tag_list=tag_list)
 
-    def _inject_random_opening(self, prompt: str, text: str) -> str:
+    def _inject_random_opening(self, prompt: str, text: str, rng: random.Random) -> str:
         if not text.strip():
             return text
         keywords = keyword_summary(prompt, limit=4)
         if not keywords:
             return text
-        chosen_tag = random.choice(keywords)
-        opener = random.choice(self._OPENERS).format(tag=chosen_tag)
+        chosen_tag = rng.choice(keywords)
+        opener = rng.choice(self._OPENERS).format(tag=chosen_tag)
         if text.lower().startswith(opener.lower()):
             return text
         return f"{opener} {text}"
@@ -620,11 +640,12 @@ class TaggedResponseFormatter:
         "Focusing on {tag},",
     )
 
-    def wrap(self, prompt: str, generated: str) -> str:
+    def wrap(self, prompt: str, generated: str, rng: random.Random | None = None) -> str:
+        rng = rng or random
         prompt_clean = prompt.strip()
         response_clean = generated.strip()
         keywords = keyword_summary(prompt, limit=4)
-        response_tagged = self._randomize_opening(response_clean, keywords)
+        response_tagged = self._randomize_opening(response_clean, keywords, rng)
         lines: list[str] = []
         if prompt_clean:
             lines.append(f"|USER|: {prompt_clean}")
@@ -634,13 +655,18 @@ class TaggedResponseFormatter:
             lines.append(f"|TAGS|: {', '.join(keywords)}")
         return "\n".join(lines) if lines else ""
 
-    def _randomize_opening(self, response: str, keywords: list[str]) -> str:
+    def _randomize_opening(
+        self,
+        response: str,
+        keywords: list[str],
+        rng: random.Random,
+    ) -> str:
         if not response:
             return response
         if not keywords:
             return response
-        tag = random.choice(keywords)
-        opener = random.choice(self._OPENERS).format(tag=tag)
+        tag = rng.choice(keywords)
+        opener = rng.choice(self._OPENERS).format(tag=tag)
         if response.lower().startswith(opener.lower()):
             return response
         return f"{opener} {response}"

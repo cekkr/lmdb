@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
+import random
 
 from .db import DatabaseEnvironment
 from .context_dimensions import ContextDimension, ContextDimensionTracker
@@ -46,8 +46,11 @@ class Decoder:
         context_ids: List[int],
         config: DecoderConfig | None = None,
         context_snippet: str = "",
+        *,
+        rng: random.Random | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
+        rng = rng or random
         generated: List[int] = []
         profile = self.cache.decode_profile(config.profile)
         banned = self._load_bans(config.profile)
@@ -73,7 +76,7 @@ class Decoder:
             )
             if not adjusted:
                 break
-            next_token = self._sample(adjusted, profile["topp"])
+            next_token = self._sample(adjusted, profile["topp"], rng)
             if next_token is None:
                 break
             generated.append(next_token)
@@ -144,7 +147,12 @@ class Decoder:
             base[token_id] = base[token_id] / total
         return base
 
-    def _sample(self, probs: Dict[int, float], top_p: float) -> int | None:
+    def _sample(
+        self,
+        probs: Dict[int, float],
+        top_p: float,
+        rng: random.Random,
+    ) -> int | None:
         if not probs:
             return None
         sorted_items = sorted(probs.items(), key=lambda item: item[1], reverse=True)
@@ -159,7 +167,7 @@ class Decoder:
         total = sum(prob for _, prob in cutoff_items)
         if total <= 0:
             return None
-        choice = random.random() * total
+        choice = rng.random() * total
         running = 0.0
         for token_id, prob in cutoff_items:
             running += prob

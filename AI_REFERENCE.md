@@ -106,6 +106,12 @@ change so the next agent inherits the latest context.
   `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
   inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
   so future periodic probes always contain freshly sampled rows instead of the initial fixed set.
+- Randomness controls now live on the CLI: `--seed` pins Python's RNG for chunk sampling/hold-outs,
+  `--eval-seed` sets the base for evaluation randomness (auto-generating one per run when omitted),
+  and `--eval-variants` forces multiple generations per prompt even when context dimensions are off.
+  `VariantSeedPlanner` derives unique sub-seeds for every prompt/variant/attempt combination so
+  repeated probes explore different structures while remaining reproducible when the base seed is
+  provided.
 - Training-time probes now spin up seedless conversations so low-resource scaffolding never masks
   evaluation outputs; if you still need the canned turns (e.g., via `run.py`) the helper stays
   enabled for interactive sessions only.

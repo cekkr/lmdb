@@ -16,6 +16,7 @@ def issue_prompt(
     seed_history: bool = True,
     min_response_words: int = 0,
     decoder_cfg: DecoderConfig | None = None,
+    rng_seed: int | None = None,
 ) -> Tuple[str, str]:
     """
     Send a prompt through DBSLMEngine, starting a conversation when needed.
@@ -31,5 +32,6 @@ def issue_prompt(
         prompt,
         decoder_cfg=decoder_cfg,
         min_response_words=min_response_words,
+        rng_seed=rng_seed,
     )
     return convo_id, response

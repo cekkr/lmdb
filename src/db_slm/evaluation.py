@@ -42,6 +42,29 @@ class EvaluationSampleResult:
     variant: int = 1
 
 
+class VariantSeedPlanner:
+    """Derives deterministic-yet-unique seeds for evaluation variants."""
+
+    def __init__(self, base_seed: int | None = None) -> None:
+        if base_seed is None:
+            base_seed = random.SystemRandom().randrange(1, 2**63 - 1)
+        self.base_seed = base_seed
+        self._counter = 0
+        self._queue_rng = random.Random(base_seed ^ 0x9E3779B97F4A7C15)
+
+    @property
+    def queue_rng(self) -> random.Random:
+        return self._queue_rng
+
+    def seed_for(self, sample_index: int, variant: int, attempt: int) -> int:
+        self._counter += 1
+        digest = hash((self.base_seed, sample_index, variant, attempt, self._counter))
+        seed = abs(digest) % (2**31 - 1)
+        if seed == 0:
+            seed = 1
+        return seed
+
+
 _MAX_BATCH_ATTEMPTS = 2
 _MAX_FUTURE_BATCH_RETRIES = 3
 _flagged_retry_budget: dict[str, int] = {}
@@ -276,6 +299,7 @@ def run_inference_records(
     quality_gate: "QualityGate | None" = None,
     decoder_cfg: DecoderConfig | None = None,
     variants_per_prompt: int = 1,
+    seed_planner: VariantSeedPlanner | None = None,
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
@@ -286,6 +310,7 @@ def run_inference_records(
     )
     results: list[EvaluationSampleResult] = []
     pending: list[dict[str, Any]] = []
+    queue_rng = seed_planner.queue_rng if seed_planner else random
     for idx, record in enumerate(records, start=1):
         for variant in range(1, variant_runs + 1):
             record_key = f"{_record_signature(record)}@{variant}"
@@ -328,6 +353,7 @@ def run_inference_records(
             seed_history=False,
             min_response_words=min_words,
             decoder_cfg=decoder_cfg,
+            rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
         )
         metrics = evaluator.evaluate(record.prompt, record.response, generated)
         if quality_gate:
@@ -341,7 +367,7 @@ def run_inference_records(
                 f"[eval] {tag}: re-queueing flagged sample "
                 f"(attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS}) due to {joined}."
             )
-            insert_at = random.randint(0, len(pending))
+            insert_at = queue_rng.randint(0, len(pending))
             pending.insert(insert_at, entry)
             continue
         if flagged:

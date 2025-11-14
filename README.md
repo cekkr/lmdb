@@ -107,11 +107,19 @@ Validation helpers shipped with `train.py` make it easier to work with huge NDJS
 - `--json-chunk-size`: stream JSON/NDJSON rows in fixed-size batches so the process never loads the
   full file into memory.
 - `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
+- `--seed <int>`: seed Python's RNG so chunk sampling, hold-out selection, and paraphraser tweaks are
+  reproducible. Leave unset to derive a fresh seed from system entropy each run.
 - **Evaluation controls (all optional, 0 disables the feature):**
   - `--eval-interval <tokens>`: trigger periodic probes every N ingested tokens (default `0`, meaning
     disabled). Context-dimension runs automatically emit two generations per prompt to compare span
     penalties in real time.
   - `--eval-samples <count>`: number of held-out prompts per probe (minimum 2, default `3`).
+  - `--eval-variants <count>`: number of generations per evaluation prompt (default `2` whenever
+    context dimensions are enabled, otherwise `1`). Use this when you want multiple structures from
+    the same prompt every probe.
+  - `--eval-seed <int>`: base seed for evaluation-time randomness. Each prompt/variant derives a
+    unique sub-seed so outputs diverge even when the prompt repeats; supplying this flag makes the
+    entire evaluation stream reproducible.
   - `--eval-dataset <path>`: NDJSON file with `prompt`/`response` pairs; defaults to
     `DBSLM_DATASET_PATH` from `.env`.
   - `--eval-pool-size <count>`: cap (or unset for unlimited) on how many records remain in the rolling
@@ -205,7 +213,10 @@ lexical/ROUGE/perplexity values, so you can catch regressions that only manifest
 errors or semantic drift. Because `emotion_data.json` responses average ~347 words, the evaluator
 derives `min_response_words` from the reference length (capped at 512 words) to ensure the logged
 `|RESPONSE|` frame actually reaches the substantive part of the answer instead of truncating after
-128 words. When a sample is flagged for retraining it now re-enters the current batch at a random
+128 words. Each prompt/variant now receives a dedicated RNG seed derived from `--eval-seed` (or a
+per-run random base when the flag is omitted), so repeated prompts explore different structures
+without manually juggling randomness. When a sample is flagged for retraining it now re-enters the
+current batch at a random
 position (up to two total attempts) before being scheduled for future probes, so the decoder gets a
 fresh shot without holding up the rest of the evaluation.
 
