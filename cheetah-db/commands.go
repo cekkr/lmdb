@@ -36,6 +36,7 @@ func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
 	if _, err := vTable.WriteAt(value, offset); err != nil {
 		return "ERROR,value_write_failed", err
 	}
+	db.cachePayload(sizeField, location, value)
 
 	newKey := db.highestKey.Add(1)
 	entry := make([]byte, MainKeysEntrySize)
@@ -65,6 +66,10 @@ func (db *Database) Read(key uint64) (string, error) {
 	}
 	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
 
+	if cached, ok := db.getCachedPayload(valueSize, location); ok {
+		return fmt.Sprintf("SUCCESS,size=%d,value=%s", valueSize, string(cached)), nil
+	}
+
 	vTable, err := db.getValuesTable(valueSize, location.TableID)
 	if err != nil {
 		return "ERROR,cannot_load_values_table", err
@@ -74,6 +79,7 @@ func (db *Database) Read(key uint64) (string, error) {
 	if _, err := vTable.ReadAt(value, offset); err != nil {
 		return "ERROR,value_read_failed", err
 	}
+	db.cachePayload(valueSize, location, value)
 
 	return fmt.Sprintf("SUCCESS,size=%d,value=%s", valueSize, string(value)), nil
 }
@@ -100,6 +106,7 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 	if _, err := vTable.WriteAt(newValue, offset); err != nil {
 		return "ERROR,value_update_failed", err
 	}
+	db.cachePayload(valueSize, location, newValue)
 
 	return fmt.Sprintf("SUCCESS,key=%d_updated", key), nil
 }
@@ -121,6 +128,9 @@ func (db *Database) Delete(key uint64) (string, error) {
 	// Aggiungi l'indice alla tabella di riciclo
 	locationBytes := make([]byte, ValueLocationIndexSize)
 	copy(locationBytes, entry[ValueSizeBytes:])
+	location := DecodeValueLocationIndex(locationBytes)
+	db.invalidatePayload(valueSize, location)
+
 	rTable, err := db.getRecycleTable(valueSize)
 	if err != nil {
 		return "ERROR,cannot_load_recycle_table", err

@@ -39,8 +39,33 @@ cheetah-db`) for the DB-SLM stack.
     is available, allowing clients to page through arbitrarily large namespaces. Reducer payloads
     are streamed in chunks, eliminating the `internal_error:EOF` failures that previously appeared
     around ~60 KB payloads.
+- `database.go` also keeps a bounded payload cache keyed by `<value_size, table_id, entry_id>` so
+  hot `READ`/`PAIR_REDUCE` loops stay in RAM and we stop hammering the same
+  `values_<size>_<tableID>.table` sectors. The cache defaults to 16k entries (~64 MB) and can be
+  tuned via `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
+  `CHEETAH_PAYLOAD_CACHE_BYTES` (set any of them to `0` to disable caching entirely).
 - `server.go` accepts newline-delimited commands over TCP (same grammar as the CLI) so we can script
   adapters before we embed the engine directly.
+
+## Memory caching & SSD-wear guidelines
+
+- Start `cheetah-server` with enough RAM reserved for the payload cache when running repetitive
+  contexts (Level 1 counts, MKNS rebuilds, Top-K refreshes). `CHEETAH_PAYLOAD_CACHE_MB=128` (or
+  higher on 32+ GB hosts) keeps the hottest namespaces completely in memory and prevents repeated
+  `ReadAt` calls against the same table offsets.
+- The cache is populated on `INSERT`/`EDIT` and invalidated on `DELETE`, so following a batch ingest
+  immediately with `PAIR_REDUCE` or decoder lookups no longer reopens the underlying files. Keep the
+  server process alive between pipeline stages so the warm cache can be reused.
+- When RAM is constrained, lower `CHEETAH_PAYLOAD_CACHE_ENTRIES` (e.g., 4096) while leaving the byte
+  budget high; this keeps each entry whole instead of evicting in the middle of a scan. For
+  diagnostics that require raw disk traces, set either cache env var to `0` to disable the layer.
+- Before evaluation runs that rely on massive trie walks, prime the cache intentionally:
+  `PAIR_SCAN ctx: 0` (with cursors) or scripted `READ` loops will seed the relevant namespaces so
+  later workloads stay in RAM and SSD wear stays flat.
+- Recycle tables already spread new writes across the next unused slot, so pairing them with the
+  cache means recycled entries only hit the SSD once when they are reused. If you notice repeated
+  churn in `values_<size>_0.table`, consider bumping the cache size or spinning up an additional
+  value table (allowing `getAvailableLocation` to advance the `tableID`) before the next ingest.
 
 ## Adapter goals for DB-SLM
 

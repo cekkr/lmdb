@@ -24,6 +24,11 @@ change so the next agent inherits the latest context.
   emitting `.sqlite3` artifacts) and should never be treated as the long-term source of truth again.
   When in doubt: start/attach to the cheetah server first, keep `DBSLM_BACKEND=cheetah-db`, and only
   lean on SQLite when a workflow explicitly requires a transient file.
+- `cheetah-db` now keeps a bounded payload cache inside `database.go`, keyed by
+  `<value_size, table_id, entry_id>` so hot `READ`/`PAIR_REDUCE` loops remain in RAM instead of
+  pounding the same `values_<size>_<tableID>.table` sectors. It defaults to 16k entries (~64 MB) and
+  is tunable via `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
+  `CHEETAH_PAYLOAD_CACHE_BYTES` (set either to `0` to disable the cache when profiling raw disk I/O).
 - `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
   default or Hugging Face `tokenizers` when configured), hashed
   context registry, Modified Kneser–Ney smoother, quantized probability tables, and Top-K cache.
@@ -176,6 +181,24 @@ change so the next agent inherits the latest context.
 - `Makefile` now shells into `scripts/smoke_train.py`, which can iterate arbitrary scenario matrices,
   stream live metrics, and hand each scenario a dedicated SQLite + `DBSLM_CHEETAH_DATABASE`
   namespace so cheetah sessions can be paused and restarted independently.
+
+### cheetah-db caching & SSD-wear guideline
+
+- Launch `cheetah-server` with an explicit payload-cache budget whenever you expect repeated
+  namespace hits (ingest, MKNS rebuilds, held-out decoder runs). The defaults
+  (`CHEETAH_PAYLOAD_CACHE_ENTRIES=16384`, `CHEETAH_PAYLOAD_CACHE_MB=64`) cover average corpora, but
+  bump the byte budget to 128–256 MB on larger hosts to eliminate the last SSD reads against the
+  `values_*` tables.
+- Inserts/edits now seed the cache and deletes invalidate their slots, so you can chain
+  ingest → reducer → decoder without reopening the same offsets. Keep the server alive between
+  pipeline stages to retain the warm cache; restarting the process will cold-start the cache and
+  briefly spike SSD I/O on the next run.
+- After restarts, prime the cache by issuing low-limit `PAIR_SCAN ctx:` passes (with cursors) or
+  scripted `READ` loops over the namespaces the trainer/decoder will rely on. This shifts the
+  initial churn into RAM and prevents a fresh workload from hammering the same disk sectors.
+- When profiling raw disk I/O or working on RAM-starved systems, disable the cache by exporting
+  `CHEETAH_PAYLOAD_CACHE_ENTRIES=0` (or the MB/bytes variants). Re-enable it immediately afterward so
+  normal workloads keep leveraging RAM instead of falling back to repeated SSD seeks.
 
 ## Operational Notes
 

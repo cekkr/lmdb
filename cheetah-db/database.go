@@ -23,6 +23,7 @@ type Database struct {
 	valuesTables    sync.Map
 	recycleTables   sync.Map
 	pairTables      sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	payloadCache    *payloadCache
 	mu              sync.Mutex
 	pairDir         string // Path alla cartella /pairs
 	nextPairIDPath  string // Path al file che memorizza il contatore
@@ -125,6 +126,7 @@ func NewDatabase(path string) (*Database, error) {
 		pairDir:        pairDir,
 		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
 		mainKeys:       mkt,
+		payloadCache:   newPayloadCacheFromEnv(),
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -659,6 +661,9 @@ func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 		return nil, fmt.Errorf("key %d has no payload", key)
 	}
 	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
+	if payload, ok := db.getCachedPayload(valueSize, location); ok {
+		return payload, nil
+	}
 	table, err := db.getValuesTable(valueSize, location.TableID)
 	if err != nil {
 		return nil, err
@@ -668,6 +673,7 @@ func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 	if _, err := table.ReadAt(payload, offset); err != nil {
 		return nil, err
 	}
+	db.cachePayload(valueSize, location, payload)
 	return payload, nil
 }
 
@@ -731,4 +737,33 @@ func formatPairReduceResponse(results []PairReduceResult, mode string, nextCurso
 		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
 	}
 	return b.String()
+}
+
+func makePayloadCacheKey(size uint32, location ValueLocationIndex) payloadCacheKey {
+	return payloadCacheKey{
+		size:    size,
+		tableID: location.TableID,
+		entryID: location.EntryID,
+	}
+}
+
+func (db *Database) getCachedPayload(size uint32, location ValueLocationIndex) ([]byte, bool) {
+	if db.payloadCache == nil {
+		return nil, false
+	}
+	return db.payloadCache.Get(makePayloadCacheKey(size, location))
+}
+
+func (db *Database) cachePayload(size uint32, location ValueLocationIndex, payload []byte) {
+	if db.payloadCache == nil || len(payload) == 0 {
+		return
+	}
+	db.payloadCache.Add(makePayloadCacheKey(size, location), payload)
+}
+
+func (db *Database) invalidatePayload(size uint32, location ValueLocationIndex) {
+	if db.payloadCache == nil {
+		return
+	}
+	db.payloadCache.Invalidate(makePayloadCacheKey(size, location))
 }
