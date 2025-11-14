@@ -5,6 +5,8 @@
 #   bash build.sh --clean      (remove previous binary first)
 # The script keeps everything self-contained inside cheetah-db/.
 
+# Or just execute "go run ."
+
 set -euo pipefail
 
 SCRIPT_DIR=$(
