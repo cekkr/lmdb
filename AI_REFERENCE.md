@@ -28,7 +28,9 @@ change so the next agent inherits the latest context.
 - When training/decoding from inside WSL but pointing at a cheetah server running on Windows, the
   hot-path adapter auto-retries the Windows bridge IP discovered via `/etc/resolv.conf` whenever the
   configured `DBSLM_CHEETAH_HOST` resolves to loopback. Override `DBSLM_CHEETAH_HOST` with the exact
-  Windows/LAN address when cheetah lives elsewhere (container, remote host, etc.).
+  Windows/LAN address when cheetah lives elsewhere (container, remote host, etc.). If the server
+  advertises `0.0.0.0:4455`, keep the client pointed at a *real* address (127.0.0.1, LAN IP, etc.);
+  connecting to `0.0.0.0` is invalid, so the adapter now rewrites that case to loopback.
 - `cheetah-db` now keeps a bounded payload cache inside `database.go`, keyed by
   `<value_size, table_id, entry_id>` so hot `READ`/`PAIR_REDUCE` loops remain in RAM instead of
   pounding the same `values_<size>_<tableID>.table` sectors. It defaults to 16k entries (~64 MB) and

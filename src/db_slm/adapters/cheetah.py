@@ -81,6 +81,16 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _is_unspecified_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized in {"0.0.0.0", "::", "::0"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_unspecified
+    except ValueError:
+        return False
+
+
 _RUNNING_IN_WSL = _detect_wsl()
 _WSL_HOST_IP = _detect_wsl_host_ip() if _RUNNING_IN_WSL else None
 
@@ -107,6 +117,7 @@ class CheetahClient:
         self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
         self._host_candidates = self._build_host_candidates(host)
         self._active_host: str | None = None
+        self._last_errors: list[str] = []
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
 
@@ -117,7 +128,14 @@ class CheetahClient:
         return self._sock is not None
 
     def describe_targets(self) -> str:
+        if not self._host_candidates:
+            return "<none>"
         return ", ".join(f"{host}:{self.port}" for host in self._host_candidates)
+
+    def describe_failures(self) -> str:
+        if not self._last_errors:
+            return "no connection errors recorded"
+        return "; ".join(self._last_errors)
 
     def connect(self) -> bool:
         with self._lock:
@@ -224,12 +242,14 @@ class CheetahClient:
     def _ensure_connection(self) -> bool:
         if self._sock:
             return True
+        errors: list[str] = []
         for host in self._host_candidates:
             try:
                 sock = socket.create_connection((host, self.port), self.timeout)
                 sock.settimeout(self.timeout)
             except OSError as exc:
                 logger.debug("Unable to reach cheetah-db at %s:%s (%s)", host, self.port, exc)
+                errors.append(f"{host}:{self.port} -> {exc.__class__.__name__}: {exc}")
                 continue
             self._sock = sock
             self._active_host = host
@@ -240,9 +260,14 @@ class CheetahClient:
                         "Failed to switch cheetah database on %s:%s: %s", host, self.port, response
                     )
                     self._close_socket()
+                    errors.append(
+                        f"{host}:{self.port} -> DATABASE {self.database} failed ({response})"
+                    )
                     continue
+            self._last_errors = []
             return True
         logger.debug("Unable to reach cheetah-db hosts (%s)", self.describe_targets())
+        self._last_errors = errors or ["no cheetah hosts configured"]
         return False
 
     def _command_unlocked(self, text: str) -> str | None:
@@ -293,10 +318,17 @@ class CheetahClient:
         self._active_host = None
 
     def _build_host_candidates(self, host: str) -> list[str]:
-        hosts = [host]
-        if _RUNNING_IN_WSL and _is_loopback_host(host):
-            if _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
+        host = host.strip()
+        hosts: list[str] = []
+        if _is_unspecified_host(host):
+            hosts.append("127.0.0.1")
+            if _RUNNING_IN_WSL and _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
                 hosts.append(_WSL_HOST_IP)
+        else:
+            hosts.append(host)
+            if _RUNNING_IN_WSL and _is_loopback_host(host):
+                if _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
+                    hosts.append(_WSL_HOST_IP)
         return hosts
 
     @staticmethod
@@ -1176,7 +1208,9 @@ def build_cheetah_adapter(
     adapter = CheetahHotPathAdapter(client)
     if not client.connect():
         logger.warning(
-            "cheetah hot-path backend unreachable (tried %s)", client.describe_targets()
+            "cheetah hot-path backend unreachable (tried %s; last error: %s)",
+            client.describe_targets(),
+            client.describe_failures(),
         )  # there was: falling back to SQLite-only mode
         raise SystemExit(1)  # now exit if cheetah not found
     return adapter
