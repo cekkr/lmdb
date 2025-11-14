@@ -14,5 +14,5 @@ Example --context-dimension 4,8,4 (3 dimension, the first of 4 vectors, the seco
 
 # Step 2
 - Move any AI_REFERENCE.md directive and documentation exclusively about cheetah-db inside cheetah-db/ directory, but remember to @AI_REFERENCE.md to check cheetah-db/AI_REFERENCE.md when working with cheetah.
-- Update @README.md and @BEST_COMMANDS.md to document and show examples about CURRENTLY EFFECTIVELY VALID commands arguments, especially about @train.js (There was another thing but I forgot it)
-- Add support, in dataset samples preparation during first steps of a cycle, take advantages of Dependency Parsing to create an additional layer (and fast categorizations) of words to use as "strong tokens group reference" with additional context to the series of dependencies enumeration as array. This would help heavily training and evaluation process, helping to reduce also ngram-order number. You can use spaCy or Stanza
+- (x) Update @README.md and @BEST_COMMANDS.md to document and show examples about CURRENTLY EFFECTIVELY VALID commands arguments, especially about @train.js (There was another thing but I forgot it)
+- (x) Add support, in dataset samples preparation during first steps of a cycle, take advantages of Dependency Parsing to create an additional layer (and fast categorizations) of words to use as "strong tokens group reference" with additional context to the series of dependencies enumeration as array. This would help heavily training and evaluation process, helping to reduce also ngram-order number. You can use spaCy or Stanza

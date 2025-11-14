@@ -75,6 +75,11 @@ file is streamed into `DBSLMEngine.train_from_text()`, which updates hashed cont
 Modified Kneser–Ney statistics for every order up to the configured `--ngram-order`, refreshes
 continuation counts, and re-materializes quantized probability tables plus the Top-K head cache.
 
+
+### Example workflows
+
+**Plain-text directories**
+
 ```bash
 python src/train.py \
   data/corpus.txt docs/*.txt \
@@ -84,60 +89,58 @@ python src/train.py \
   --reset
 ```
 
-Key options:
+**Chunked NDJSON ingest with live evaluation**
 
-- `inputs`: One or more files or directories containing `.txt` files. Directories are scanned
-  recursively when `--recursive` is supplied.
-- `--db`: Destination SQLite file. The parent directory is created automatically. Use `--reset` when
-  you want to erase the previous database before ingesting.
-- `--ngram-order`: Controls the window length. Increase for more context, decrease for tiny corpora.
-- `--context-dimensions "<ranges>"`: Extends the repeat penalty across grouped token spans. Accepts
-  comma-separated ranges such as `1-2,3-5` (the default) to cover word- and sentence-length windows,
-  a single integer (e.g., `4`), or `off`/`none` to disable the extra grouping penalty. The selection
-  is persisted inside `tbl_metadata` so later CLI invocations inherit the same spans.
-- `--stdin`: Stream additional ad-hoc text directly from `STDIN`, e.g. `cat notes.txt | python src/train.py --stdin`.
-- `--encoding`: Override the default UTF-8 reader if your corpus uses a different encoding.
+```bash
+python src/train.py datasets/emotion_data.json \
+  --db var/db_slm.sqlite3 \
+  --ngram-order 4 \
+  --json-chunk-size 750 \
+  --chunk-eval-percent 12.5 \
+  --eval-interval 40000 \
+  --eval-samples 4 \
+  --eval-variants 3 \
+  --eval-dataset datasets/emotion_holdout.json \
+  --metrics-export var/eval_logs/train-emotion.json \
+  --decoder-presence-penalty 0.20 \
+  --decoder-frequency-penalty 0.05 \
+  --profile-ingest \
+  --seed 1337
+```
 
-The script reports per-file token counts plus the aggregate number of stored N-grams. If the provided
-corpora are shorter than the N-gram order they are automatically skipped.
+### Argument guide
 
-Validation helpers shipped with `train.py` make it easier to work with huge NDJSON datasets such as
-`datasets/emotion_data.json`:
+- **Core ingest + storage**
+  - `inputs`: Files or directories to ingest. Directories respect `--recursive` and only pull in `*.txt`.
+  - `--db`: Destination SQLite file. Parent directories are created automatically; use `:memory:` for scratch runs (cannot be combined with `--reset`). Keep the chosen path consistent with `run.py`.
+  - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
+  - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
+  - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
+  - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
+- **File reading helpers**
+  - `--recursive`: When scanning folders, include subdirectories (default is to read only the top level).
+  - `--encoding`: Override the UTF-8 reader if the corpus uses another encoding.
+  - `--stdin`: Stream additional ad-hoc text from `STDIN`, e.g. `cat notes.txt | python src/train.py --stdin`.
+- **JSON / NDJSON streaming + hold-outs**
+  - `--json-chunk-size`: Stream JSON/NDJSON rows in fixed-size batches so memory stays bounded.
+  - `--max-json-lines`: Limit how many JSON rows load per file when you just need a smoke test.
+  - `--chunk-eval-percent`: Reserve this percentage of every JSON chunk as an immediate evaluation set. Hold-outs run through the inference stack before the chunk trains and refresh the probe pool.
+  - `--seed`: Seed Python's RNG for deterministic chunk sampling, hold-outs, and paraphraser tweaks.
+- **Evaluation cadence + randomness**
+  - `--eval-interval <tokens>`: Trigger periodic probes every N ingested tokens (0 disables the loop).
+  - `--eval-samples <count>`: Held-out prompts per probe (minimum 2, default 3).
+  - `--eval-variants <count>`: Responses per prompt (defaults to 2 when context dimensions are enabled, otherwise 1) so you can compare structural diversity.
+  - `--eval-seed <int>`: Base seed for evaluation randomness. Each prompt/variant gets a deterministic sub-seed derived from this value.
+  - `--eval-dataset <path>`: NDJSON file containing `prompt`/`response` pairs; defaults to `DBSLM_DATASET_PATH` from `.env`.
+  - `--eval-pool-size <count>`: Maximum number of records kept in memory for the rolling evaluation pool (default 200, 0/None means unlimited).
+- **Profiling + logging**
+  - `--profile-ingest`: Print per-corpus latency and RSS metrics while ingesting so you can raise chunk sizes confidently.
+  - `--metrics-export <path>`: Write the rolling ROUGE/perplexity timeline plus profiling samples to JSON (`var/eval_logs/train-<timestamp>.json` by default). Use `--metrics-export -` to disable.
+- **Decoder penalty overrides (evaluation-only)**
+  - `--decoder-presence-penalty <float>`: Adds a one-time penalty when a token/span has already appeared in the generation. Typical sweeps cover `0.0-0.4`.
+  - `--decoder-frequency-penalty <float>`: Scales penalties by how often the token/span repeats. Values between `0.0` and `0.2` usually smooth repetition without collapsing the sampler.
 
-- `--json-chunk-size`: stream JSON/NDJSON rows in fixed-size batches so the process never loads the
-  full file into memory.
-- `--max-json-lines`: cap the number of JSON rows read per file when you only need a quick smoke test.
-- `--seed <int>`: seed Python's RNG so chunk sampling, hold-out selection, and paraphraser tweaks are
-  reproducible. Leave unset to derive a fresh seed from system entropy each run.
-- **Evaluation controls (all optional, 0 disables the feature):**
-  - `--eval-interval <tokens>`: trigger periodic probes every N ingested tokens (default `0`, meaning
-    disabled). Context-dimension runs automatically emit two generations per prompt to compare span
-    penalties in real time.
-  - `--eval-samples <count>`: number of held-out prompts per probe (minimum 2, default `3`).
-  - `--eval-variants <count>`: number of generations per evaluation prompt (default `2` whenever
-    context dimensions are enabled, otherwise `1`). Use this when you want multiple structures from
-    the same prompt every probe.
-  - `--eval-seed <int>`: base seed for evaluation-time randomness. Each prompt/variant derives a
-    unique sub-seed so outputs diverge even when the prompt repeats; supplying this flag makes the
-    entire evaluation stream reproducible.
-  - `--eval-dataset <path>`: NDJSON file with `prompt`/`response` pairs; defaults to
-    `DBSLM_DATASET_PATH` from `.env`.
-  - `--eval-pool-size <count>`: cap (or unset for unlimited) on how many records remain in the rolling
-    evaluation buffer.
-  - `--chunk-eval-percent <0-100>`: reserve this percent of every JSON chunk as an immediate
-    hold-out set; they run through the inference stack before the chunk trains and refresh the pool.
-- `--profile-ingest`: print per-corpus latency and resident-set-size metrics so you can keep raising
-  `--json-chunk-size` / `--max-json-lines` until memory pressure kicks in. On a 16 GB laptop, chunks
-  of ~2,000 rows (~4 MB) kept RSS under 2.5 GB; bigger batches introduced GC pauses, so we documented
-  that tipping point directly in the training logs.
-- `--metrics-export <path>`: write the rolling ROUGE/perplexity timeline plus profiling samples to a
-  JSON artifact. When omitted, `train.py` automatically drops `var/eval_logs/train-<timestamp>.json`
-  so you can compare runs without scraping stdout. Use `--metrics-export -` to disable the feed.
-- **Penalty overrides (per-probe sampling tweaks):**
-  - `--decoder-presence-penalty <float>=0+`: add a one-time penalty whenever a token (or grouped span)
-    has already appeared in the current generation. Typical sweep range is `0.0-0.4`.
-- `--decoder-frequency-penalty <float>=0+`: scales with how many times the token/span has appeared.
-    Values between `0.0` and `0.2` generally work best for conversational corpora.
+Every run reports per-file token counts, derived n-gram windows, and the evaluation log path. Inputs shorter than the configured order are skipped automatically and clearly labeled in the logs.
 
 #### Dependency parsing layer & strong token groups
 
@@ -284,26 +287,36 @@ you> :history   # prints the Level 2 context window
 you> :exit
 ```
 
-Single-shot inference:
+Single-shot inference (headless prompt):
 
 ```bash
-python src/run.py --db var/db_slm.sqlite3 --prompt "Remind me what we covered."
+python src/run.py --db var/db_slm.sqlite3 \
+  --prompt "Remind me what we covered." \
+  --context-dimensions off \
+  --user qa-demo \
+  --agent curator-bot
 ```
 
-After a limited validation run (like the example above) you can immediately inspect the model with:
+Scripted resumptions / limited-turn demos:
 
 ```bash
-python3 src/run.py --db var/db_slm.sqlite3 --prompt "Summarize the role of empathy in leadership."
+python src/run.py \
+  --db var/db_slm.sqlite3 \
+  --conversation 6f5080d1-... \
+  --context-dimensions "1-2,4-6" \
+  --max-turns 3
 ```
 
-Useful flags:
+Key arguments:
 
-- `--conversation`: Resume a previous conversation ID logged in `tbl_l2_conversations`. Omit to start a
-  fresh session (the ID is printed on startup).
-- `--user` / `--agent`: Override the identifiers written into Level 2 so you can distinguish sessions.
-- `--max-turns`: Cap the number of turns before the REPL exits automatically. Handy for scripted demos.
-- Commands inside the REPL: `:history` to print the current Level 2 context window, `:exit`/`:quit` (or
-  `Ctrl+D`) to leave.
+- `--db`: SQLite file produced by `train.py`. Paths are created on demand, but `:memory:` is rejected so runs always persist conversation history.
+- `--ngram-order`: Should match the value used during training; override only when you intentionally built a database with a different order.
+- `--context-dimensions`: Same parser as `train.py`. Override span ranges ("1-2,4-6", `off`, etc.) when you want to force different repeat penalties than the metadata stored alongside the database.
+- `--prompt`: Skip the REPL and emit a single response (great for CI hooks or quick sanity checks). When omitted, interactive mode starts.
+- `--conversation`: Resume a Level 2 conversation ID already stored in `tbl_l2_conversations`; omit to start a fresh session (the new ID is printed at startup).
+- `--user` / `--agent`: Customize the identifiers written to Level 2 so parallel sessions stay distinguishable in the logs.
+- `--max-turns`: Auto-exit after the specified number of user prompts. Useful when scripting deterministic walkthroughs.
+- REPL commands: `:history` prints the Level 2 context window, `:exit`/`:quit` (or `Ctrl+D`) leaves the session immediately.
 
 Because the CLI uses the exact same engine object, anything logged via `run.py` is immediately
 available to downstream tooling (correction logging, concept payload providers, etc.).
