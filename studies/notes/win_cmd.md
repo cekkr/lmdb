@@ -1,4 +1,4 @@
-DBSLM_BACKEND=cheetah-db python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive --reset --json-chunk-size 50 --eval-samples 2 --eval-pool-size 5000 --chunk-eval-percent 10.0 --eval-interval 5000 --profile-ingest --decoder-presence-penalty 0.75 --decoder-frequency-penalty 0.5 --context-dimensions 4,6,8
+DBSLM_BACKEND=cheetah-db python3.11 src/train.py datasets/emotion_data.json --ngram-order 5 --recursive --reset --json-chunk-size 50 --eval-samples 2 --eval-pool-size 5000 --chunk-eval-percent 10.0 --eval-interval 5000 --profile-ingest --decoder-presence-penalty 0.75 --decoder-frequency-penalty 0.5 --context-dimensions 8,6,6
 
 - Number of evaluation to do: --eval-interval 50
 
