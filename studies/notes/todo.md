@@ -1,3 +1,5 @@
+# Step 1
+
 - The tokenization is too arbitrary especially in punctuation splitting, in fact results use to have difficulties in puntactions writing while generating.
 - In @sentence_parts.py, there is another arbitrary forcing of words: _EMOTION_WORDS. Why having a dataset if you force the words? Remove any ARBITRARY reference.
 - Try to add the support to an external and well established tokenizator, to use overall during training and in-training evaluations.
@@ -9,3 +11,7 @@ The penalty parameters ar respected seen the too many repeatitions?
 
 Then, try to make context-dimension parameter better, with more dimensions instead of simple "word-sentence". It should be more "irrational" and with support of more dimension.
 Example --context-dimension 4,8,4 (3 dimension, the first of 4 vectors, the second 8 and the third 4)
+
+# Step 2
+- Move any AI_REFERENCE.md directive and documentation exclusively about cheetah-db inside cheetah-db/ directory, but remember to @AI_REFERENCE.md to check cheetah-db/AI_REFERENCE.md when working with cheetah.
+- There was another thing but I forgot it
