@@ -25,6 +25,7 @@ from db_slm.context_dimensions import (
     format_context_dimensions,
     parse_context_dimensions_arg,
 )
+from db_slm.dataset_config import load_dataset_config
 from db_slm.decoder import DecoderConfig
 from db_slm.evaluation import (
     EvalLogWriter,
@@ -454,6 +455,7 @@ def iter_json_chunks(
     max_lines: int,
     holdout_fraction: float,
 ) -> Iterable[CorpusChunk]:
+    dataset_cfg = load_dataset_config(path)
     chunk_size = max(1, chunk_size)
     entries: list[tuple[str, EvaluationRecord]] = []
     chunk_index = 0
@@ -469,23 +471,22 @@ def iter_json_chunks(
             except json.JSONDecodeError as exc:
                 log(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
                 continue
-            prompt = payload.get("prompt", "")
-            response = payload.get("response", "")
-            emotion = payload.get("emotion", "unknown")
+            prompt = dataset_cfg.extract_prompt(payload)
+            response = dataset_cfg.extract_response(payload)
+            context_values = list(dataset_cfg.iter_context_values(payload))
             if not response:
                 continue
             prompt_layer = build_dependency_layer(prompt or "")
             response_layer = build_dependency_layer(response)
-            segment_lines = list(
-                filter(
-                    None,
-                    [
-                        f"Prompt: {prompt.strip()}" if prompt else None,
-                        f"Emotion: {emotion}" if emotion else None,
-                        f"Response: {response.strip()}",
-                    ],
-                )
-            )
+            segment_lines: list[str] = []
+            if prompt:
+                segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt.strip()}")
+            for field, ctx_value in context_values:
+                if field.label:
+                    segment_lines.append(f"{field.label}: {ctx_value}")
+                normalized = field.normalized_token(ctx_value)
+                segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+            segment_lines.append(f"{dataset_cfg.response.label}: {response.strip()}")
             annotation = _dependency_layer_annotation(prompt_layer, response_layer)
             if annotation:
                 segment_lines.append(f"DependencyLayer: {annotation}")
@@ -493,7 +494,7 @@ def iter_json_chunks(
             record = EvaluationRecord(
                 prompt=prompt or "",
                 response=response,
-                emotion=emotion,
+                context_tokens=dataset_cfg.context_map(payload),
                 prompt_dependencies=prompt_layer,
                 response_dependencies=response_layer,
             )
@@ -545,6 +546,7 @@ def _sample_holdouts(total_entries: int, fraction: float) -> set[int]:
 def load_eval_dataset(path: Path, max_records: int | None = None) -> List[EvaluationRecord]:
     if not path.exists():
         raise FileNotFoundError(f"Evaluation dataset not found: {path}")
+    dataset_cfg = load_dataset_config(path)
     records: list[EvaluationRecord] = []
     limit = max_records if max_records is not None and max_records > 0 else None
     with path.open("r", encoding="utf-8") as handle:
@@ -557,8 +559,8 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
             except json.JSONDecodeError as exc:
                 log(f"[eval] Skipping line {line_no}: {exc}")
                 continue
-            prompt = payload.get("prompt")
-            response = payload.get("response")
+            prompt = dataset_cfg.extract_prompt(payload)
+            response = dataset_cfg.extract_response(payload)
             if not prompt or not response:
                 continue
             prompt_layer = build_dependency_layer(prompt)
@@ -567,7 +569,7 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
                 EvaluationRecord(
                     prompt=prompt,
                     response=response,
-                    emotion=payload.get("emotion", "unknown"),
+                    context_tokens=dataset_cfg.context_map(payload),
                     prompt_dependencies=prompt_layer,
                     response_dependencies=response_layer,
                 )

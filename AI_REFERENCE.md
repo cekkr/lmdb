@@ -66,11 +66,13 @@ change so the next agent inherits the latest context.
   the trainer is spending time.
 - Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; the smoke-train harness also mirrors cheetah latency/queue stats, tracks lingering subprocesses, and enforces 30-minute budgets before logging the same bundle to `var/cheetah_smoke_ingest.log`.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
-  segments, embedding signatures, and emotion keyword tokens so Level 1 learns efficient splits in
-  real time. Emotion tags are now derived solely from the segment keywords + embedder energy
-  (the `_EMOTION_WORDS` allowlist is gone), so corpora dictate which affective tokens show up. Configure
-  the embedding backbone with `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no
-  Hugging Face downloads) via `DBSLM_EMBEDDER_OFFLINE=1`.
+  segments, embedding signatures, and context keyword tokens so Level 1 learns efficient splits in
+  real time. Dataset metadata is now declared via `datasets/<name>.config.json`, which lets the
+  loader emit canonical `|CTX|:<token>:<value>` lines; the sentence-part embedder lifts those tags
+  into headers and supplements them with `|CTX_KEY|` keywords derived solely from the segment text +
+  embedder energy (the `_EMOTION_WORDS` allowlist is gone). Configure the embedding backbone with
+  `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no Hugging Face downloads) via
+  `DBSLM_EMBEDDER_OFFLINE=1`.
 - Tokenization now supports a Hugging Face-backed backend: set
   `DBSLM_TOKENIZER_BACKEND=huggingface`, point `DBSLM_TOKENIZER_JSON` at a tokenizer.json
   (usually exported from `tokenizers` or HF Hub), and optionally disable lower-casing with
@@ -231,6 +233,10 @@ change so the next agent inherits the latest context.
   with quantitative gains instead of relying on overlap logs only.
 - `datasets.md` now tracks basic stats for `emotion_data.json` (avg response 347 words, max 1,251) so
   chunk sizes, eval thresholds, and paraphraser guard rails stay grounded in the actual corpora.
+- Dataset-specific schema is declared beside each corpus as `datasets/<name>.config.json`
+  (see `datasets/emotion_data.config.json`). The loader uses it to map prompt/response fields,
+  expose optional context tokens, and emit canonical `|CTX|:<token>:<value>` headers so no code
+  change is required when swapping corpora.
 - Prefer `make smoke-train` for regressions: it now iterates both baseline + penalty scenarios,
   writes live stats to `var/smoke_train/benchmarks.json`, and exposes switches (see `SMOKE_*` vars in
   the `Makefile`) so you can resume or subset the matrix without editing the script.

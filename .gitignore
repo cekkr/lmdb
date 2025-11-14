@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 datasets/*
+!datasets/*.config.json
 var/*
 
 # C extensions

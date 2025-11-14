@@ -181,20 +181,24 @@ python3 src/train.py datasets/emotion_data.json \
   --eval-pool-size 20
 ```
 
-### Adaptive Tokenization + Emotional Embeddings
+### Adaptive Tokenization + Context Tags
 
 `DBSLMEngine` now performs a realtime corpus scan before every ingest to discover the most productive
 punctuation splits, slice long responses into manageable segments, and tag those fragments with
 device-aware embeddings from `sentence-transformers` (defaults to `all-MiniLM-L6-v2`, configurable
-via `DBSLM_EMBEDDER_MODEL`). Each segment is annotated with a compact embedding signature plus an
-`|EMO_KEY|` list that surfaces emotional keywords derived from both the dataset metadata (the
-`Emotion:` header) and the embedding energy. These annotations are injected ahead of the regex
-tokenizer, ensuring the vocabulary learns explicit emotional cues and higher quality boundary splits
-even while the underlying Level 1 tables remain purely relational. When the optional dependency is
-missing, the pipeline falls back to deterministic hashed vectors so tokenization still benefits from
-the dataset profiler. To avoid Hugging Face downloads entirely (e.g., in CI or air-gapped labs), set
-`DBSLM_EMBEDDER_OFFLINE=1` or choose `DBSLM_EMBEDDER_MODEL=hashed` and the hashed guidance path is
-used from the start.
+via `DBSLM_EMBEDDER_MODEL`). Dataset-specific metadata is described in
+`datasets/<name>.config.json` (for example `datasets/emotion_data.config.json`), which declares the
+prompt/response fields and any additional context columns that should be tokenized. The JSON loader
+uses that config to emit human-readable headers plus canonical `|CTX|:<token>:<value>` lines, and
+the embedding pipeline lifts those tags into a unified header before sequencing the text. Each
+segment keeps a compact embedding signature plus a `|CTX_KEY|` keyword list derived from both the
+dataset metadata and the embedding energy. These annotations are injected ahead of the regex
+tokenizer, ensuring the vocabulary learns explicit dataset context and higher quality boundary
+splits even while the underlying Level 1 tables remain purely relational. When the optional
+dependency is missing, the pipeline falls back to deterministic hashed vectors so tokenization still
+benefits from the dataset profiler. To avoid Hugging Face downloads entirely (e.g., in CI or
+air-gapped labs), set `DBSLM_EMBEDDER_OFFLINE=1` or choose `DBSLM_EMBEDDER_MODEL=hashed` and the
+hashed guidance path is used from the start.
 
 ### cheetah Streaming Archive
 

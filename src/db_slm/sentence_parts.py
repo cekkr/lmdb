@@ -14,7 +14,7 @@ from .settings import DBSLMSettings
 from log_helpers import log
 
 _DEFAULT_SPLITS = [".", "!", "?", ";", ":", ",", "\n"]
-_EMOTION_RE = re.compile(r"emotion\s*:\s*([A-Za-z0-9 _-]+)", re.IGNORECASE)
+_CONTEXT_TOKEN_PREFIX = "|CTX|"
 
 
 class RealtimeTokenizerProfiler:
@@ -229,7 +229,7 @@ class ExternalEmbedder:
 class SentencePartEmbeddingPipeline:
     """
     Performs punctuation-aware segmentation, optional embedding lookups,
-    and injects emotional keywords ahead of Level 1 tokenization.
+    and injects dataset-provided context hints ahead of Level 1 tokenization.
     """
 
     def __init__(self, settings: DBSLMSettings) -> None:
@@ -242,6 +242,7 @@ class SentencePartEmbeddingPipeline:
         payload = text.strip()
         if not payload:
             return text
+        payload, header_line = self._context_header(payload)
         self.profiler.observe(payload)
         # Restrict sentence breaking to periods to keep other punctuation attached
         # to the surrounding context; fall back to the profiler suggestion if no
@@ -257,17 +258,16 @@ class SentencePartEmbeddingPipeline:
             segments = [payload]
         vectors = self.embedder.embed(segments)
         lines: list[str] = []
-        header = self._emotion_header(payload)
-        if header:
-            lines.append(header)
+        if header_line:
+            lines.append(header_line)
         for idx, segment in enumerate(segments):
             vector = vectors[idx] if idx < len(vectors) else []
             signature = self.embedder.signature(vector)
             segment_line = f"|SEGMENT|#{idx + 1} {signature} {segment.strip()}"
             lines.append(segment_line)
-            emo_keywords = self._emotional_keywords(segment, vector)
-            if emo_keywords:
-                lines.append("|EMO_KEY| " + " ".join(emo_keywords))
+            ctx_keywords = self._contextual_keywords(segment, vector)
+            if ctx_keywords:
+                lines.append("|CTX_KEY| " + " ".join(ctx_keywords))
         lines.append("|RAW|")
         lines.append(payload)
 
@@ -285,19 +285,29 @@ class SentencePartEmbeddingPipeline:
             )
         return "\n".join(lines)
 
-    def _emotion_header(self, text: str) -> str | None:
-        matches = _EMOTION_RE.findall(text)
-        if not matches:
-            return None
-        tokens = []
-        for label in dict.fromkeys(match.strip().lower() for match in matches if match.strip()):
-            normalized = label.replace(" ", "_")
-            tokens.append(f"|EMOTION|:{normalized}")
+    def _context_header(self, text: str) -> tuple[str, str | None]:
+        if _CONTEXT_TOKEN_PREFIX not in text:
+            return text, None
+        tokens: list[str] = []
+        filtered_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(_CONTEXT_TOKEN_PREFIX):
+                parts = stripped.split(":", 2)
+                if len(parts) == 3:
+                    token_name = parts[1].strip()
+                    token_value = parts[2].strip()
+                    if token_name and token_value:
+                        canonical = f"{_CONTEXT_TOKEN_PREFIX}:{token_name}:{token_value}"
+                        if canonical not in tokens:
+                            tokens.append(canonical)
+                        continue
+            filtered_lines.append(line)
         if not tokens:
-            return None
-        return " ".join(tokens)
+            return text, None
+        return "\n".join(filtered_lines), " ".join(tokens)
 
-    def _emotional_keywords(self, segment: str, vector: Sequence[float]) -> List[str]:
+    def _contextual_keywords(self, segment: str, vector: Sequence[float]) -> List[str]:
         candidates = keyword_summary(segment, limit=6)
         if not candidates:
             return []

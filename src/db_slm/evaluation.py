@@ -10,7 +10,7 @@ import re
 import textwrap
 import uuid
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
@@ -46,7 +46,7 @@ class DependencyLayer:
 class EvaluationRecord:
     prompt: str
     response: str
-    emotion: str = "unknown"
+    context_tokens: dict[str, str] = field(default_factory=dict)
     prompt_dependencies: DependencyLayer | None = None
     response_dependencies: DependencyLayer | None = None
 
@@ -58,7 +58,7 @@ class EvaluationSampleResult:
     prompt: str
     reference: str
     generated: str
-    emotion: str
+    context_tokens: dict[str, str]
     metrics: dict[str, float | int | None]
     flagged: bool = False
     variant: int = 1
@@ -372,9 +372,19 @@ def _record_signature(record: EvaluationRecord) -> str:
     hasher.update(record.prompt.encode("utf-8", errors="ignore"))
     hasher.update(b"\x1f")
     hasher.update(record.response.encode("utf-8", errors="ignore"))
-    hasher.update(b"\x1f")
-    hasher.update(record.emotion.encode("utf-8", errors="ignore"))
+    for key in sorted(record.context_tokens):
+        hasher.update(b"\x1f")
+        hasher.update(key.encode("utf-8", errors="ignore"))
+        hasher.update(b"=")
+        hasher.update(record.context_tokens[key].encode("utf-8", errors="ignore"))
     return hasher.hexdigest()
+
+
+def _format_context_tokens(context: dict[str, str]) -> str:
+    if not context:
+        return "none"
+    parts = [f"{key}={value}" for key, value in context.items()]
+    return ", ".join(parts)
 
 
 def _consume_future_retry_budget(record_key: str) -> bool:
@@ -738,12 +748,13 @@ def run_inference_records(
             _schedule_future_retries(record_key)
         else:
             _clear_future_retries(record_key)
+        context_label = _format_context_tokens(record.context_tokens)
         log(
-            "[eval] {tag}: emotion={emotion} lexical={lex:.2f} rougeL={rouge:.2f} "
+            "[eval] {tag}: context={context} lexical={lex:.2f} rougeL={rouge:.2f} "
             "ppl(gen)={ppl_gen:.1f} ppl(ref)={ppl_ref:.1f} sim={sim:.2f} len_ratio={ratio:.2f} "
             "prompt='{prompt}' response='{response}'".format(
                 tag=tag,
-                emotion=record.emotion,
+                context=context_label,
                 lex=metrics["lexical"],
                 rouge=metrics["rougeL"],
                 ppl_gen=metrics["ppl_generated"],
@@ -761,7 +772,7 @@ def run_inference_records(
                 prompt=record.prompt,
                 reference=record.response,
                 generated=generated,
-                emotion=record.emotion,
+                context_tokens=dict(record.context_tokens),
                 metrics=metrics,
                 flagged=flagged,
                 variant=variant,
@@ -825,7 +836,7 @@ class EvalLogWriter:
                 {
                     "index": sample.index,
                     "variant": sample.variant,
-                    "emotion": sample.emotion,
+                    "context": sample.context_tokens,
                     "prompt": preview(sample.prompt, width=240),
                     "reference": preview(sample.reference, width=240),
                     "generated": preview(sample.generated, width=240),
@@ -939,7 +950,7 @@ class QualityGate:
             "prompt": record.prompt,
             "reference": record.response,
             "generated": candidate,
-            "emotion": record.emotion,
+            "context": record.context_tokens,
             "metrics": metrics,
             "reasons": reasons,
         }

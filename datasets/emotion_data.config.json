@@ -1,0 +1,16 @@
+{
+  "name": "emotion_data",
+  "description": "Configuration for the Kaggle Emotional Intelligence Booster Zephyr 7B dataset.",
+  "prompt_field": "prompt",
+  "prompt_label": "Prompt",
+  "response_field": "response",
+  "response_label": "Response",
+  "context_fields": [
+    {
+      "field": "emotion",
+      "label": "Emotion",
+      "token_name": "emotion",
+      "description": "Primary emotion label supplied with each prompt/response pair."
+    }
+  ]
+}
