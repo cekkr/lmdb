@@ -1101,7 +1101,8 @@ def build_cheetah_adapter(
     )
     adapter = CheetahHotPathAdapter(client)
     if not client.connect():
-        logger.warning("cheetah hot-path backend unreachable; falling back to SQLite-only mode")
+        logger.warning("cheetah hot-path backend unreachable") # there was: falling back to SQLite-only mode
+        exit(-1) # now exit if cheetah not found
         return NullHotPathAdapter()
     return adapter
 
