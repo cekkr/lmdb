@@ -22,3 +22,16 @@ Example --context-dimension 4,8,4 (3 dimension, the first of 4 vectors, the seco
 # Step 3
 - (x) Pre-check requirements before execution of @train.py: for example, after hours of execution, I discovered that I can't use python-language-tools due to the lack of Java. And these kind of error should be "exit" (blocking): are needed tools for a correct training, so if not installed train.py shouldn't run and explain why.
 - (x) During the composition of metrics json log during training, evaluate a complete sentence (not truncated to early) to add as reference of the cycle.
+
+# WebGPU in Python
+(No advantages because:)
+
+src/train.py itself delegates all heavy lifting to DBSLMEngine plus spaCy/Stanza preprocessing and the evaluation helpers. These workloads are either database/IO-bound (SQLite + cheetah RPCs inside db_slm modules) or rely on third-party CPU stacks. None expose hooks where a custom WebGPU kernel could be slotted in, so adding wgpu would mean rewriting big chunks of the existing engine rather than flipping an accelerator flag.
+
+The only tensor-heavy pieces imported by train.py live under src/db_slm/sentence_parts.py (lines 150-199) (SentenceTransformer embedder) and src/db_slm/quality.py (lines 80-214) (Hugging Face CoLA head). Both already ride on PyTorch and automatically use CUDA/MPS when present, so they already have GPU acceleration paths. WebGPU cannot be enabled there without reimplementing those models with a completely different backend, because PyTorch/transformers/sentence-transformers have no WebGPU execution provider.
+
+src/run.py plus its imports (db_slm.decoder, db_slm.level*, etc.) focus on orchestrating SQLite queries and the cheetah-db RPC adapter. The hot paths are SQL statements and Python control flow; there are no custom numeric kernels or vectorizable tensor ops to port to WebGPU.
+
+Other imported helpers (helpers/char_tree_similarity.py, helpers/resource_monitor.py, db_slm/metrics.py, etc.) are light-weight scalar computations and logging. Moving those to WebGPU would add significant complexity for negligible speedups.
+
+Given the current architecture, there isn’t a part of train.py, run.py, or their dependency graph that can practically “take advantage” of a WebGPU rewrite without overhauling core components or replacing mature third-party libraries that already provide CUDA/MPS acceleration.
