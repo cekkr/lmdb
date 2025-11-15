@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -76,23 +77,183 @@ def conversation_exists(engine: DBSLMEngine, conversation_id: str) -> bool:
     return bool(rows)
 
 
-def ensure_conversation(engine: DBSLMEngine, args: argparse.Namespace) -> str:
-    if args.conversation:
-        if not conversation_exists(engine, args.conversation):
-            raise ValueError(f"Conversation '{args.conversation}' does not exist in this database")
-        log_verbose(3, f"[run:v3] Resuming conversation {args.conversation}.")
-        return args.conversation
-    log_verbose(3, "[run:v3] Starting a new conversation.")
-    return engine.start_conversation(args.user, args.agent)
+class PromptWorker:
+    """Runs decoder work inside a child process to exploit multiple cores."""
+
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        ngram_order: int,
+        context_dimensions,
+        settings,
+        user: str,
+        agent: str,
+        conversation: str | None,
+    ) -> None:
+        self._ctx = multiprocessing.get_context("spawn")
+        self._requests = self._ctx.Queue()
+        self._responses = self._ctx.Queue()
+        self._next_id = 0
+        self._process = self._ctx.Process(
+            target=_decoder_worker,
+            args=(
+                self._requests,
+                self._responses,
+                db_path,
+                ngram_order,
+                context_dimensions,
+                settings,
+                user,
+                agent,
+                conversation,
+            ),
+        )
+        self._process.start()
+        ready = self._responses.get()
+        if ready.get("status") != "ready":
+            raise RuntimeError(ready.get("error", "decoder worker failed to start"))
+        self.conversation_id = ready.get("conversation_id", "")
+        self.context_label = ready.get("context_dimensions")
+
+    def request(self, prompt: str) -> str:
+        self._next_id += 1
+        message_id = self._next_id
+        self._requests.put({"type": "prompt", "prompt": prompt, "id": message_id})
+        while True:
+            msg = self._responses.get()
+            if msg.get("type") != "response" or msg.get("id") != message_id:
+                continue
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            response = msg.get("response", "")
+            self.conversation_id = msg.get("conversation_id", self.conversation_id)
+            return response
+
+    def history(self) -> str:
+        self._next_id += 1
+        message_id = self._next_id
+        self._requests.put({"type": "history", "id": message_id})
+        while True:
+            msg = self._responses.get()
+            if msg.get("type") != "history" or msg.get("id") != message_id:
+                continue
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            return msg.get("history", "")
+
+    def conversation_summary(self) -> dict[str, str]:
+        self._next_id += 1
+        message_id = self._next_id
+        self._requests.put({"type": "conversation", "id": message_id})
+        while True:
+            msg = self._responses.get()
+            if msg.get("type") != "conversation" or msg.get("id") != message_id:
+                continue
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            summary = msg.get("summary") or {}
+            conv_id = summary.get("conversation_id") or self.conversation_id
+            if conv_id:
+                self.conversation_id = conv_id
+            if "context_dimensions" in summary:
+                self.context_label = summary["context_dimensions"]
+            return summary
+
+    def close(self) -> None:
+        try:
+            self._requests.put({"type": "stop"})
+        except Exception:
+            pass
+        self._process.join(timeout=5)
+        if self._process.is_alive():
+            self._process.kill()
 
 
-def respond_once(engine: DBSLMEngine, conversation_id: str, prompt: str) -> None:
-    _, response = issue_prompt(engine, prompt, conversation_id)
+def _decoder_worker(
+    request_q: multiprocessing.Queue,
+    response_q: multiprocessing.Queue,
+    db_path: str,
+    ngram_order: int,
+    context_dimensions,
+    settings,
+    user: str,
+    agent: str,
+    conversation: str | None,
+) -> None:
+    engine: DBSLMEngine | None = None
+    try:
+        engine = DBSLMEngine(
+            db_path,
+            ngram_order=ngram_order,
+            context_dimensions=context_dimensions,
+            settings=settings,
+        )
+        conv_id = conversation
+        if conv_id:
+            if not conversation_exists(engine, conv_id):
+                raise ValueError(f"Conversation '{conv_id}' does not exist in this database")
+        else:
+            conv_id = engine.start_conversation(user, agent)
+        dims_label = format_context_dimensions(engine.context_dimensions)
+        response_q.put({"status": "ready", "conversation_id": conv_id, "context_dimensions": dims_label})
+        while True:
+            msg = request_q.get()
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "stop":
+                break
+            if msg.get("type") == "prompt":
+                prompt = msg.get("prompt", "")
+                msg_id = msg.get("id")
+                try:
+                    conv_id, response = issue_prompt(engine, prompt, conv_id)
+                    response_q.put(
+                        {
+                            "type": "response",
+                            "id": msg_id,
+                            "prompt": prompt,
+                            "conversation_id": conv_id,
+                            "response": response,
+                        }
+                    )
+                except Exception as exc:  # pragma: no cover - defensive barrier around child process
+                    response_q.put({"type": "response", "id": msg_id, "error": str(exc)})
+                continue
+            if msg.get("type") == "history":
+                msg_id = msg.get("id")
+                try:
+                    history = engine.memory.context_window(conv_id)
+                    response_q.put({"type": "history", "id": msg_id, "history": history or "(empty)"})
+                except Exception as exc:  # pragma: no cover - defensive barrier around child process
+                    response_q.put({"type": "history", "id": msg_id, "error": str(exc)})
+                continue
+            if msg.get("type") == "conversation":
+                msg_id = msg.get("id")
+                try:
+                    summary = {
+                        "conversation_id": conv_id,
+                        "context_dimensions": format_context_dimensions(engine.context_dimensions),
+                        "history": engine.memory.context_window(conv_id) or "(empty)",
+                    }
+                    response_q.put({"type": "conversation", "id": msg_id, "summary": summary})
+                except Exception as exc:  # pragma: no cover - defensive barrier around child process
+                    response_q.put({"type": "conversation", "id": msg_id, "error": str(exc)})
+                continue
+    except Exception as exc:  # pragma: no cover - startup failure
+        response_q.put({"status": "error", "error": str(exc)})
+    finally:
+        if engine is not None:
+            engine.db.close()
+
+
+def respond_once_worker(worker: PromptWorker, prompt: str) -> None:
+    response = worker.request(prompt)
     log(f"user> {prompt}")
     log(f"assistant> {response}")
 
 
-def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int | None) -> None:
+def interactive_loop(worker: PromptWorker, max_turns: int | None) -> None:
     log("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
     turns = 0
     while max_turns is None or turns < max_turns:
@@ -110,15 +271,33 @@ def interactive_loop(engine: DBSLMEngine, conversation_id: str, max_turns: int |
         if user_input in {":exit", ":quit"}:
             break
         if user_input == ":history":
-            history = engine.memory.context_window(conversation_id)
             log("--- conversation context ---")
+            try:
+                history = worker.history()
+            except Exception as exc:
+                history = f"(failed to fetch history: {exc})"
             log(history or "(empty)")
             log("----------------------------")
             continue
-        conversation_id, response = issue_prompt(engine, user_input, conversation_id)
+        if user_input in {":status", ":conversation"}:
+            try:
+                summary = worker.conversation_summary()
+            except Exception as exc:
+                log(f"[run] Unable to fetch conversation summary: {exc}")
+                continue
+            log(f"[run] Conversation summary -> id={summary.get('conversation_id', worker.conversation_id)}")
+            if "context_dimensions" in summary:
+                log(f"[run] Context dims: {summary['context_dimensions']}")
+            if "history" in summary:
+                preview = summary["history"].strip() or "(empty)"
+                if len(preview) > 200:
+                    preview = preview[:197] + "..."
+                log(f"[run] History preview: {preview}")
+            continue
+        response = worker.request(user_input)
         log(f"assistant> {response}")
         turns += 1
-    log(f"[run] Conversation {conversation_id} closed after {turns} turn(s).")
+    log(f"[run] Conversation {worker.conversation_id} closed after {turns} turn(s).")
 
 
 def main() -> None:
@@ -135,29 +314,30 @@ def main() -> None:
         f"[run:v3] Context dims argument '{args.context_dimensions}' resolved to "
         f"{format_context_dimensions(context_dimensions)}.",
     )
-
-    engine: DBSLMEngine | None = None
+    worker: PromptWorker | None = None
     try:
         db_path = resolve_db_path(args.db)
-        engine = DBSLMEngine(
+        worker = PromptWorker(
             db_path,
             ngram_order=args.ngram_order,
             context_dimensions=context_dimensions,
             settings=settings,
+            user=args.user,
+            agent=args.agent,
+            conversation=args.conversation,
         )
-        conversation_id = ensure_conversation(engine, args)
-        dims_label = format_context_dimensions(engine.context_dimensions)
-        log(f"[run] Using conversation: {conversation_id} (context dims: {dims_label})")
+        dims_label = worker.context_label or format_context_dimensions(context_dimensions)
+        log(f"[run] Using conversation: {worker.conversation_id} (context dims: {dims_label})")
 
         if args.prompt:
-            respond_once(engine, conversation_id, args.prompt)
+            respond_once_worker(worker, args.prompt)
         else:
-            interactive_loop(engine, conversation_id, args.max_turns)
+            interactive_loop(worker, args.max_turns)
     except ValueError as exc:
         parser.error(str(exc))
     finally:
-        if engine is not None:
-            engine.db.close()
+        if worker is not None:
+            worker.close()
 
 
 if __name__ == "__main__":

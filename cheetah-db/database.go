@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -501,99 +502,195 @@ func (db *Database) deletePairTable(tableID uint32) error {
 
 func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairScanResult, []byte, error) {
 	limit = normalizePairScanLimit(limit)
-	results := make([]PairScanResult, 0, limit)
-	state := &pairScanState{
-		cursor: append([]byte{}, cursor...),
-	}
-	if len(prefix) == 0 {
-		if _, err := db.collectPairEntries(0, nil, limit, &results, state); err != nil {
-			return nil, nil, err
-		}
-		return results, state.nextCursor(), nil
-	}
-
-	currentTableID := uint32(0)
-	for i, branchByte := range prefix {
-		table, err := db.getPairTable(currentTableID)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return results, state.nextCursor(), nil
+	acc := newPairScanAccumulator(limit, cursor)
+	startTable := uint32(0)
+	if len(prefix) > 0 {
+		currentTableID := uint32(0)
+		for i, branchByte := range prefix {
+			table, err := db.getPairTable(currentTableID)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return []PairScanResult{}, nil, nil
+				}
+				return nil, nil, err
 			}
-			return nil, nil, err
-		}
-		entry, err := table.ReadEntry(branchByte)
-		if err != nil {
-			return nil, nil, err
-		}
-		isLast := i == len(prefix)-1
-		if isLast {
-			if entryHasTerminal(entry) {
-				valueCopy := append([]byte{}, prefix...)
-				if state.include(valueCopy) {
-					results = append(results, PairScanResult{
-						Value: valueCopy,
-						Key:   decodeAbsoluteKey(entry),
-					})
-					state.record(valueCopy)
-					if limit > 0 && len(results) >= limit {
-						state.limitReached = true
-						return results, state.nextCursor(), nil
+			entry, err := table.ReadEntry(branchByte)
+			if err != nil {
+				return nil, nil, err
+			}
+			isLast := i == len(prefix)-1
+			if isLast {
+				if entryHasTerminal(entry) {
+					if acc.add(prefix, decodeAbsoluteKey(entry)) && limit > 0 {
+						results, nextCursor := acc.finalize(acc.limit)
+						return results, nextCursor, nil
 					}
 				}
+				if entryHasChild(entry) {
+					startTable = entryChildID(entry)
+				}
+				break
 			}
 			if !entryHasChild(entry) {
-				return results, state.nextCursor(), nil
+				return []PairScanResult{}, nil, nil
 			}
 			childID := entryChildID(entry)
 			if childID == 0 {
-				return results, state.nextCursor(), nil
+				return []PairScanResult{}, nil, nil
 			}
-			if _, err := db.collectPairEntries(childID, append([]byte{}, prefix...), limit, &results, state); err != nil {
-				return nil, nil, err
-			}
-			return results, state.nextCursor(), nil
+			currentTableID = childID
 		}
-		if !entryHasChild(entry) {
-			return results, state.nextCursor(), nil
+		if startTable == 0 {
+			results, nextCursor := acc.finalize(acc.limit)
+			return results, nextCursor, nil
 		}
-		childID := entryChildID(entry)
-		if childID == 0 {
-			return results, state.nextCursor(), nil
-		}
-		currentTableID = childID
 	}
-	return results, state.nextCursor(), nil
+	workerCount := 1
+	if db.resources != nil {
+		workerCount = db.resources.RecommendedWorkers(256)
+	}
+	if workerCount < 1 {
+		workerCount = runtime.NumCPU()
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if err := db.parallelCollectPairEntries(startTable, prefix, workerCount, acc); err != nil {
+		return nil, nil, err
+	}
+	results, nextCursor := acc.finalize(acc.limit)
+	return results, nextCursor, nil
 }
 
-func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int, acc *[]PairScanResult, state *pairScanState) (bool, error) {
-	if limit > 0 && len(*acc) >= limit {
-		state.limitReached = true
-		return true, nil
+type pairScanTask struct {
+	tableID uint32
+	prefix  []byte
+}
+
+type pairScanAccumulator struct {
+	cursor  []byte
+	limit   int
+	mu      sync.Mutex
+	results []PairScanResult
+	count   atomic.Int64
+}
+
+func newPairScanAccumulator(limit int, cursor []byte) *pairScanAccumulator {
+	return &pairScanAccumulator{
+		cursor: append([]byte{}, cursor...),
+		limit:  limit,
 	}
-	table, err := db.getPairTable(tableID)
+}
+
+func (a *pairScanAccumulator) add(value []byte, key uint64) bool {
+	if len(a.cursor) > 0 && bytes.Compare(value, a.cursor) <= 0 {
+		return a.shouldStop()
+	}
+	cp := append([]byte{}, value...)
+	a.mu.Lock()
+	a.results = append(a.results, PairScanResult{Value: cp, Key: key})
+	a.mu.Unlock()
+	a.count.Add(1)
+	return a.shouldStop()
+}
+
+func (a *pairScanAccumulator) shouldStop() bool {
+	if a.limit <= 0 {
+		return false
+	}
+	return int(a.count.Load()) >= a.limit
+}
+
+func (a *pairScanAccumulator) finalize(limit int) ([]PairScanResult, []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.results) == 0 {
+		return []PairScanResult{}, nil
+	}
+	sort.Slice(a.results, func(i, j int) bool {
+		return bytes.Compare(a.results[i].Value, a.results[j].Value) < 0
+	})
+	hasMore := limit > 0 && len(a.results) > limit
+	if limit > 0 && limit < len(a.results) {
+		a.results = a.results[:limit]
+	}
+	var nextCursor []byte
+	if hasMore && len(a.results) > 0 {
+		nextCursor = append([]byte{}, a.results[len(a.results)-1].Value...)
+	}
+	return a.results, nextCursor
+}
+
+func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, workers int, acc *pairScanAccumulator) error {
+	tasks := make(chan pairScanTask, workers*4)
+	var pending sync.WaitGroup
+	var workerWG sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	var abort atomic.Bool
+
+	pending.Add(1)
+	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...)}
+	go func() {
+		pending.Wait()
+		close(tasks)
+	}()
+
+	worker := func() {
+		defer workerWG.Done()
+		for task := range tasks {
+			if abort.Load() {
+				pending.Done()
+				continue
+			}
+			if err := db.walkPairTable(task, acc, &pending, tasks, &abort); err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					abort.Store(true)
+				})
+			}
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		workerWG.Add(1)
+		go worker()
+	}
+	workerWG.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
+func (db *Database) walkPairTable(
+	task pairScanTask,
+	acc *pairScanAccumulator,
+	pending *sync.WaitGroup,
+	tasks chan<- pairScanTask,
+	abort *atomic.Bool,
+) error {
+	defer pending.Done()
+	table, err := db.getPairTable(task.tableID)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return nil
 		}
-		return false, err
+		return err
 	}
 	for branch := 0; branch < 256; branch++ {
+		if abort != nil && abort.Load() {
+			return nil
+		}
 		entry, err := table.ReadEntry(byte(branch))
 		if err != nil {
-			return false, err
+			return err
 		}
+		value := append(append([]byte{}, task.prefix...), byte(branch))
 		if entryHasTerminal(entry) {
-			value := append(append([]byte{}, prefix...), byte(branch))
-			if state.include(value) {
-				*acc = append(*acc, PairScanResult{
-					Value: value,
-					Key:   decodeAbsoluteKey(entry),
-				})
-				state.record(value)
-				if limit > 0 && len(*acc) >= limit {
-					state.limitReached = true
-					return true, nil
-				}
+			if acc.add(value, decodeAbsoluteKey(entry)) && abort != nil && acc.limit > 0 {
+				abort.Store(true)
+				return nil
 			}
 		}
 		if entryHasChild(entry) {
@@ -601,49 +698,11 @@ func (db *Database) collectPairEntries(tableID uint32, prefix []byte, limit int,
 			if childID == 0 {
 				continue
 			}
-			nextPrefix := append(append([]byte{}, prefix...), byte(branch))
-			reached, err := db.collectPairEntries(childID, nextPrefix, limit, acc, state)
-			if err != nil {
-				return false, err
-			}
-			if reached {
-				return true, nil
-			}
+			pending.Add(1)
+			tasks <- pairScanTask{tableID: childID, prefix: append([]byte{}, value...)}
 		}
 	}
-	return false, nil
-}
-
-type pairScanState struct {
-	cursor          []byte
-	cursorSatisfied bool
-	lastValue       []byte
-	limitReached    bool
-}
-
-func (s *pairScanState) include(value []byte) bool {
-	if len(s.cursor) == 0 {
-		return true
-	}
-	if s.cursorSatisfied {
-		return true
-	}
-	if bytes.Compare(value, s.cursor) <= 0 {
-		return false
-	}
-	s.cursorSatisfied = true
-	return true
-}
-
-func (s *pairScanState) record(value []byte) {
-	s.lastValue = append([]byte{}, value...)
-}
-
-func (s *pairScanState) nextCursor() []byte {
-	if !s.limitReached || len(s.lastValue) == 0 {
-		return nil
-	}
-	return append([]byte{}, s.lastValue...)
+	return nil
 }
 
 func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {

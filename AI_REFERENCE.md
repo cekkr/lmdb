@@ -40,13 +40,19 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   arcs plus a strong-token bucket list (subjects, objects, actions, modifiers, etc.) so the trainer
   and quality gate can weight those terms without growing the n-gram order. When neither backend is
   installed we emit a single warning and continue without the metadata.
+- `src/train.py` parallelizes corpus staging (JSON chunking, dependency parsing, hold-out selection)
+  via the new `--prep-workers` (default: `max(1, cpu_count-1)`) and `--prep-prefetch` options so the
+  ingestion loop can stay CPU-bound on the DB/Smoother while workers feed ready-to-train chunks.
+  Std-in payloads are still staged synchronously to avoid buffering surprises.
 - Evaluation probes reuse the stored dependency layers to compute `strong_token_overlap` and
   `dependency_arc_overlap` metrics for each generation. Both are logged next to ROUGE/perplexity and
   folded into the metrics export so we can tell whether the decoder is preserving grammatical
   structure vs. just matching surface tokens.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
-  cache/bias adjustments.
+  cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input
+  stays responsive on multi-core hosts; `:history` and the new `:status` alias proxy through the
+  worker to fetch conversation windows/dim metadata.
 - Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
   large JSON chunks no longer look frozen; the logs include approximate line counts to show where
   the trainer is spending time.

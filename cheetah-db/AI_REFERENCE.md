@@ -44,6 +44,11 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
   `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
   `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
+- `PAIR_SCAN` traversal now fan-outs across the trie using a worker pool sized from
+  `ResourceMonitor.RecommendedWorkers(...)`: per-branch tasks stage into a channel, workers hydrate
+  pair-table pages concurrently, and results are deduplicated/ordered in a shared accumulator that
+  respects cursors + `limit` cut-offs. This keeps trie pagination multi-core aware and prevents a
+  single slow disk seek from blocking the entire scan.
 - cheetah-db now keeps persistent file handles per pair-trie node (RW locked), parallelizes reducer
   payload hydration with a bounded worker pool, and treats child pointers + terminal keys as
   independent flags so prefix-sharing namespaces (`ctx:*`, `ctxv:*`, `topk:*`, etc.) finally

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import itertools
 import json
+import multiprocessing
 import os
 import random
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +129,21 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Optional cap on the number of JSON/NDJSON lines to ingest per file (default: 0 = unlimited).",
+    )
+    parser.add_argument(
+        "--prep-workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of worker processes used to stage corpora (dependency parsing + chunking). "
+            "Defaults to cpu_count()-1 when <= 0."
+        ),
+    )
+    parser.add_argument(
+        "--prep-prefetch",
+        type=int,
+        default=4,
+        help="Maximum number of in-flight corpus staging jobs when --prep-workers > 1 (default: %(default)s).",
     )
     parser.add_argument(
         "--seed",
@@ -329,6 +347,16 @@ def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
     return files
 
 
+def _resolve_worker_count(requested: int | None) -> int:
+    if requested is None or requested == 1:
+        return 1
+    if requested is not None and requested > 1:
+        return requested
+    cpu_total = os.cpu_count() or 1
+    # Leave one core idle by default to avoid starving the OS / cheetah worker.
+    return max(1, cpu_total - 1)
+
+
 @dataclass
 class CorpusChunk:
     label: str
@@ -448,6 +476,79 @@ def iter_corpora(
         text = path.read_text(encoding=encoding)
         row_count = max(1, len([line for line in text.splitlines() if line.strip()]))
         yield CorpusChunk(str(path), text, [], total_rows=row_count, train_rows=row_count)
+
+
+def _prepare_corpus_chunks(
+    path_str: str,
+    encoding: str,
+    json_chunk_size: int,
+    max_json_lines: int,
+    chunk_eval_percent: float,
+) -> list[CorpusChunk]:
+    path = Path(path_str)
+    return list(iter_corpora([path], encoding, json_chunk_size, max_json_lines, chunk_eval_percent))
+
+
+def parallel_corpus_stream(
+    paths: Sequence[Path],
+    encoding: str,
+    json_chunk_size: int,
+    max_json_lines: int,
+    chunk_eval_percent: float,
+    workers: int,
+    prefetch: int = 4,
+) -> Iterable[CorpusChunk]:
+    if workers <= 1 or len(paths) <= 1:
+        yield from iter_corpora(paths, encoding, json_chunk_size, max_json_lines, chunk_eval_percent)
+        return
+    max_inflight = max(1, prefetch)
+    mp_ctx = multiprocessing.get_context("spawn")
+
+    def _generator() -> Iterable[CorpusChunk]:
+        pending: deque[tuple[str, concurrent.futures.Future[list[CorpusChunk]]]] = deque()
+        path_iter = iter(paths)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as pool:
+            while len(pending) < max_inflight:
+                try:
+                    path_obj = next(path_iter)
+                except StopIteration:
+                    break
+                future = pool.submit(
+                    _prepare_corpus_chunks,
+                    str(path_obj),
+                    encoding,
+                    json_chunk_size,
+                    max_json_lines,
+                    chunk_eval_percent,
+                )
+                pending.append((str(path_obj), future))
+            while pending:
+                path_label, future = pending.popleft()
+                try:
+                    for chunk in future.result():
+                        yield chunk
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to stage corpus {path_label}: {exc}") from exc
+                while len(pending) < max_inflight:
+                    try:
+                        next_path = next(path_iter)
+                    except StopIteration:
+                        break
+                    pending.append(
+                        (
+                            str(next_path),
+                            pool.submit(
+                                _prepare_corpus_chunks,
+                                str(next_path),
+                                encoding,
+                                json_chunk_size,
+                                max_json_lines,
+                                chunk_eval_percent,
+                            ),
+                        )
+                    )
+
+    yield from _generator()
 
 
 def iter_json_chunks(
@@ -835,12 +936,21 @@ def main() -> None:
 
     file_inputs = collect_files(args.inputs, args.recursive)
     log_verbose(3, f"[train:v3] Prepared {len(file_inputs)} file input(s) for ingestion.")
-    corpora_iter: Iterable[CorpusChunk] = iter_corpora(
+    prep_workers = _resolve_worker_count(args.prep_workers)
+    prep_prefetch = max(1, args.prep_prefetch)
+    if prep_workers > 1:
+        log(
+            f"[train] Staging corpora with {prep_workers} worker process(es) "
+            f"(prefetch={prep_prefetch}, chunk_size={args.json_chunk_size})."
+        )
+    corpora_iter: Iterable[CorpusChunk] = parallel_corpus_stream(
         file_inputs,
         args.encoding,
         args.json_chunk_size,
         args.max_json_lines,
         args.chunk_eval_percent,
+        workers=prep_workers,
+        prefetch=prep_prefetch,
     )
     if args.stdin:
         stdin_payload = sys.stdin.read()
