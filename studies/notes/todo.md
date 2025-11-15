@@ -21,3 +21,4 @@ Example --context-dimension 4,8,4 (3 dimension, the first of 4 vectors, the seco
 
 # Step 3
 - Pre-check requirements before execution of @train.py: for example, after hours of execution, I discovered that I can't use python-language-tools due to the lack of Java. And these kind of error should be "exit" (blocking): are needed tools for a correct training, so if not installed train.py shouldn't run and explain why.
+- During the composition of metrics json log during training, evaluate a complete sentence (not truncated to early) to add as reference of the cycle.
