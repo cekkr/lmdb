@@ -4,6 +4,7 @@
 - CLI inputs (selected): `inputs...`, `--db`, `--ngram-order`, `--context-dimensions`, `--recursive`, `--reset` (wipes cheetah caches), `--eval-interval/--eval-samples/--eval-dataset/--eval-pool-size`, `--json-chunk-size/--max-json-lines/--chunk-eval-percent`, `--profile-ingest`, `--decoder-* penalties`, `--backonsqlite`.
 - Bootstrap: load settings → parse/validate args and context dimensions → optional metrics writer → init `DBSLMEngine` (cheetah hot-path if reachable, SQLite otherwise) → log RNG seeds.
 - Input staging: `collect_files` + `iter_corpora` expand files (and JSON/NDJSON chunking) with per-chunk holdouts via `_sample_holdouts`; `IngestProfiler` can wrap ingest calls with resource snapshots.
+- Prefetch/parallel staging: `parallel_corpus_stream` uses a `ProcessPoolExecutor` (spawn) to run dataset parsing + dependency layers in parallel; `--prep-workers` defaults to `cpu_count()-1` and `--prep-prefetch` controls in-flight futures so ingest can stay busy even while long JSON chunks are processed.
 - Ingest loop: for each `CorpusChunk`, `engine.train_from_text` runs on the main thread with progress throttling via `TrainingProgressPrinter`; totals/windows tracked.
 - Evaluation: `InferenceMonitor` fires `run_inference_records` synchronously at token thresholds and for chunk hold-outs—ingest blocks while probes run. Dataset is rotated/refreshed to keep probe variety.
 - Completion: report totals/hit ratios, finalize metrics, close DB.
@@ -12,6 +13,7 @@
 ## Inference (`src/run.py`)
 - CLI inputs: `--db`, `--ngram-order`, `--context-dimensions`, `--user`, `--agent`, `--conversation`, `--prompt`, `--max-turns`.
 - Flow: load settings → parse dims → create `DBSLMEngine` → `ensure_conversation` (resume or start) → log context dims/conversation.
+- Execution now happens inside a spawned worker (`PromptWorker`) so decoding uses a separate process/CPU; CLI commands (`:history`, new `:status`/`:conversation`) bounce through the worker via a queue protocol that keeps the parent REPL I/O responsive.
 - Modes: single-prompt path (`issue_prompt`) vs interactive REPL (with `:history`, exit shortcuts). All work is synchronous on the main thread; DB is closed on exit.
 - Future concurrency hooks: prefetch next response while user types (thread) or pool decoder calls if conversation fan-out emerges; consider streaming/logging callbacks to avoid blocking UI.
 
