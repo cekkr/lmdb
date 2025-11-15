@@ -114,6 +114,64 @@ SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
   out to `top`/`iostat`.
 
+## Command Walkthroughs
+
+The CLI and TCP listener both speak newline-delimited commands, so anything you can type by hand can
+be scripted from tests or adapters. A quick ingestion session looks like:
+
+```text
+[cheetah_data/default]> INSERT:5 HELLO
+SUCCESS,key=1
+[cheetah_data/default]> READ 1
+SUCCESS,size=5,value=HELLO
+[cheetah_data/default]> EDIT 1 HELLO
+SUCCESS,key=1_updated
+[cheetah_data/default]> DELETE 1
+SUCCESS,key=1_deleted
+```
+
+- `INSERT:<declared_size>` validates that the payload length matches the colon-suffix (or infers it
+  when omitted), writes the bytes into the size-partitioned value table, and returns the absolute
+  key (`mainKeys` offset). `READ`, `EDIT`, and `DELETE` operate on that numeric key and either reuse
+  cache hits or fall back to deterministic `ReadAt` offsets inside the same value table file.
+- Pair namespaces bind human-readable prefixes to absolute keys. For ASCII prefixes you can type
+  them directly; binary prefixes use `x<hex>` (the same helper that `PAIR_SCAN` and `PAIR_REDUCE`
+  emit). Example:
+
+  ```text
+  [cheetah_data/default]> INSERT:18 ctx:BERLIN|CONTEXT
+  SUCCESS,key=42
+  [cheetah_data/default]> PAIR_SET ctx:BERLIN 42
+  SUCCESS,pair_set
+  [cheetah_data/default]> PAIR_GET ctx:BERLIN
+  SUCCESS,pair=ctx:BERLIN,key=42
+  ```
+
+- `PAIR_SCAN` walks the trie in lexical order. Limits and cursors keep the scan resumable:
+
+  ```text
+  [cheetah_data/default]> PAIR_SCAN ctx: 2
+  SUCCESS,count=2,next_cursor=x000104,items=6378743a4245524c494e:42;6378743a4e41584f53:77
+  [cheetah_data/default]> PAIR_SCAN ctx: 2 x000104
+  SUCCESS,count=2,items=6378743a4e45574f524c4c:81;6378743a5041524953:96
+  ```
+
+  Here each `items` entry is `<hex_prefix>:<abs_key>`. Passing `*` as the prefix or cursor makes the
+  server start from the root or continue from “wherever you left off,” respectively.
+- `PAIR_REDUCE` stays in the same namespace but executes a Go reducer before streaming rows back. A
+  counts example (base64 payload contains packed counters so the client can decode without `READ`):
+
+  ```text
+  [cheetah_data/default]> PAIR_REDUCE counts ctx: 1
+  SUCCESS,reducer=counts,count=1,next_cursor=x0000af,items=6378743a4245524c494e:42:AAEAAAABAAAD
+  ```
+
+  Reducers control the payload schema; if you extend `commands.go` with a new reducer you only need
+  to document how to decode its base64 block.
+- `SYSTEM_STATS` is a cheap heartbeat: call it between ingest/reduce loops to track CPU, memory, and
+  fd counts without spawning `top`. Because `database.go` formats it in CSV-like key/value pairs, it
+  can be parsed by shell scripts (`awk -F,`) or structured log scrapers.
+
 ## Streaming Helpers
 
 - `PAIR_SCAN <prefix> [limit]` favors namespace exhaustiveness: `PAIR_SCAN ctx: 100` walks the first
@@ -141,3 +199,36 @@ SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
 
 For deep operational checklists (tmux helpers, namespace triage, cache sizing matrices), see
 `AI_REFERENCE.md` in this directory.
+
+## Tree Indexing & Algorithmic Logic
+
+cheetah-db’s performance hinges on a deterministic, trie-backed index that treats every namespace or
+key prefix as a path through fixed-size `PairTable` nodes. Each node behaves like the `CharTreeNode`
+structure shown in `src/helpers/char_tree_similarity.py`: it has byte-indexed children, terminal
+flags, and in-memory counts that highlight “hot” substrings. While the helper library leans on that
+structure to compare strings (build a char tree, keep significant substrings, compute overlaps), the
+database applies the same idea to on-disk tables:
+
+- Every namespace (e.g., `ctx:BERLIN`) is stored as raw bytes. Walking those bytes selects a slot
+  inside the root pair table and either follows a child table ID or marks the node as terminal with
+  the absolute payload key. This mirrors the helper’s recursion where `CharTree` expands one
+  character at a time and records substring counts.
+- `PAIR_SCAN` snapshots each node and streams children in lexical order, so namespace enumeration only
+  touches the branches that exist. Because each node is a dense 256-entry array, the engine can seek
+  directly via `branchByte * PairEntrySize` with no heap allocations—the storage equivalent of how
+  `CharTree.from_text` iterates substrings without rebuilding prefixes.
+- `PAIR_REDUCE` executes reducers while it walks the trie. As soon as a branch is materialized, the
+  reducer can hydrate payloads (`readValuePayload`) and emit inline aggregates. This is conceptually
+  the same as weighting recurring substrings in `substring_multiset_similarity`: we take advantage of
+  prefix locality to amortize disk reads and to reuse cached payloads when sibling prefixes live in
+  the same tables.
+- Future performance work leverages this “tree indexing” foundation: we can precompute namespace
+  statistics (counts, rolling hashes, Top-K summaries) and branch-local caches the same way
+  `char_tree_similarity.py` keeps only significant substrings. Because the layout guarantees stable
+  offsets, prefetchers or GPU-backed reducers can schedule precise `ReadAt` calls without scanning.
+
+Treating namespace keys as traversable trees keeps INSERT/READ latency tied to fixed math instead of
+variable-length scans. It also gives future tooling (fuzzy namespace matching, char-tree-style
+similarity lookups, or trie-level compression) a solid footing because the invariants are identical
+to the pure-Python helper: branch per byte, attach metadata where a path terminates, and stream the
+structure without rebuilding it in memory.
