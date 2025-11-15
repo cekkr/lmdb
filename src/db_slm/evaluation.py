@@ -8,12 +8,13 @@ import os
 import random
 import re
 import textwrap
+import time
 import uuid
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from .decoder import DecoderConfig
 from .inference_shared import issue_prompt
@@ -21,6 +22,10 @@ from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
 from .quality import SentenceQualityScorer
 from helpers.char_tree_similarity import similarity_score
+from helpers.resource_monitor import ResourceMonitor
+
+if TYPE_CHECKING:
+    from helpers.resource_monitor import ResourceDelta
 
 from log_helpers import log
 
@@ -646,6 +651,12 @@ def run_inference_records(
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
+    resource_monitor = ResourceMonitor()
+    try:
+        telemetry_before = resource_monitor.snapshot()
+    except Exception:
+        telemetry_before = None
+    eval_start = time.perf_counter()
     variant_runs = max(1, variants_per_prompt)
     total_runs = len(records) * variant_runs
     log(
@@ -803,6 +814,34 @@ def run_inference_records(
             log(f"[eval] {label} averages -> {joined}")
     if logger:
         logger.log_eval_batch(label, results, summary)
+    duration = time.perf_counter() - eval_start
+    try:
+        telemetry_after = resource_monitor.snapshot()
+    except Exception:
+        telemetry_after = None
+    telemetry_delta: ResourceDelta | None = None
+    if telemetry_before and telemetry_after:
+        try:
+            telemetry_delta = resource_monitor.delta(telemetry_before, telemetry_after)
+        except Exception:
+            telemetry_delta = None
+    if telemetry_delta:
+        log(f"[eval] {label} resources -> {resource_monitor.describe(telemetry_delta)}")
+    rss_before = telemetry_before.rss_mb if telemetry_before else None
+    rss_after = telemetry_after.rss_mb if telemetry_after else None
+    rss_delta = (
+        rss_after - rss_before if rss_after is not None and rss_before is not None else None
+    )
+    if logger:
+        logger.log_profile(
+            f"{label} eval",
+            tokens=len(results),
+            duration=duration,
+            rss_before=rss_before,
+            rss_after=rss_after,
+            rss_delta=rss_delta,
+            resources=ResourceMonitor.to_event(telemetry_delta) if telemetry_delta else None,
+        )
     return results
 
 
@@ -857,6 +896,7 @@ class EvalLogWriter:
         rss_before: float | None,
         rss_after: float | None,
         rss_delta: float | None,
+        resources: dict[str, Any] | None = None,
     ) -> None:
         event: dict[str, Any] = {
             "ts": self._timestamp(),
@@ -871,6 +911,8 @@ class EvalLogWriter:
             event["rss_after_mb"] = round(rss_after, 3)
         if rss_delta is not None:
             event["rss_delta_mb"] = round(rss_delta, 3)
+        if resources:
+            event["resources"] = resources
         self.events.append(event)
 
     def finalize(

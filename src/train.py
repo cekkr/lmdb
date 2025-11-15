@@ -10,12 +10,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Sequence, Tuple
-
-try:  # resource is Unix-only but gives precise RSS readings when available.
-    import resource  # type: ignore
-except ImportError:  # pragma: no cover - Windows fallback
-    resource = None  # type: ignore
+from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Sequence, Tuple
 
 from db_slm import DBSLMEngine
 from db_slm.adapters.base import NullHotPathAdapter
@@ -39,6 +34,9 @@ from db_slm.evaluation import (
 )
 from db_slm.settings import DBSLMSettings, load_settings
 
+from helpers.resource_monitor import ResourceMonitor
+if TYPE_CHECKING:
+    from helpers.resource_monitor import ResourceDelta, ResourceSample
 from log_helpers import log
 
 
@@ -660,29 +658,33 @@ class InferenceMonitor:
 
 
 class IngestProfiler:
-    """Optional profiler that logs ingest latency and current RSS."""
+    """Optional profiler that logs ingest latency together with resource telemetry."""
 
     def __init__(self, enabled: bool, logger: EvalLogWriter | None = None) -> None:
         self.enabled = enabled
         self.logger = logger
+        self.monitor = ResourceMonitor() if enabled else None
 
     def measure(self, label: str, fn: Callable[[], int]) -> int:
         if not self.enabled:
             return fn()
-        rss_before = self._rss_mb()
+        before = self._snapshot()
         start = time.perf_counter()
         tokens = fn()
         duration = time.perf_counter() - start
-        rss_after = self._rss_mb()
-        rss_delta = (
-            rss_after - rss_before if rss_before is not None and rss_after is not None else None
-        )
+        after = self._snapshot()
+        delta = self._delta(before, after)
         suffix = ""
-        if rss_after is not None:
-            delta_str = f"{rss_delta:+.1f}MB" if rss_delta is not None else "n/a"
-            suffix = f" rss={rss_after:.1f}MB (Δ{delta_str})"
+        if delta and self.monitor:
+            suffix = f" {self.monitor.describe(delta)}"
         log(f"[profile] {label}: {tokens} tokens in {duration:.2f}s{suffix}")
         if self.logger:
+            rss_before = before.rss_mb if before else None
+            rss_after = after.rss_mb if after else None
+            rss_delta = (
+                rss_after - rss_before if rss_after is not None and rss_before is not None else None
+            )
+            resources = ResourceMonitor.to_event(delta) if delta else None
             self.logger.log_profile(
                 label,
                 tokens=tokens,
@@ -690,21 +692,25 @@ class IngestProfiler:
                 rss_before=rss_before,
                 rss_after=rss_after,
                 rss_delta=rss_delta,
+                resources=resources,
             )
         return tokens
 
-    @staticmethod
-    def _rss_mb() -> float | None:
-        if resource is None:  # pragma: no cover - platform without resource
+    def _snapshot(self) -> ResourceSample | None:
+        if not self.monitor:
             return None
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss = usage.ru_maxrss
-        # On macOS the value is in bytes, elsewhere it is kilobytes.
-        if sys.platform == "darwin":
-            rss_mb = rss / (1024 * 1024)
-        else:
-            rss_mb = rss / 1024
-        return float(rss_mb)
+        try:
+            return self.monitor.snapshot()
+        except Exception:
+            return None
+
+    def _delta(self, before: ResourceSample | None, after: ResourceSample | None) -> ResourceDelta | None:
+        if not self.monitor or before is None or after is None:
+            return None
+        try:
+            return self.monitor.delta(before, after)
+        except Exception:
+            return None
 
 
 def main() -> None:
