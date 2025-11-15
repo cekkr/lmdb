@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 )
@@ -28,7 +27,7 @@ func (s *TCPServer) Start() error {
 		return err
 	}
 	defer listener.Close()
-	log.Printf("CheetahDB TCP server listening on %s", s.listenAddr)
+	logInfof("CheetahDB TCP server listening on %s", s.listenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -41,7 +40,7 @@ func (s *TCPServer) Start() error {
 }
 
 func (s *TCPServer) handleConnection(conn net.Conn) {
-	log.Printf("INFO: New connection from %s", conn.RemoteAddr())
+	logInfof("New connection from %s", conn.RemoteAddr())
 	defer conn.Close()
 
 	currentDB, err := s.engine.GetDatabase(DefaultDbName)
@@ -56,7 +55,7 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("ERROR: Reading from %s: %v", conn.RemoteAddr(), err)
+				logErrorf("Reading from %s: %v", conn.RemoteAddr(), err)
 			}
 			break
 		}
@@ -85,9 +84,9 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		}
 
 		if _, err := io.WriteString(conn, response+"\n"); err != nil {
-			log.Printf("ERROR: Writing to %s: %v", conn.RemoteAddr(), err)
+			logErrorf("Writing to %s: %v", conn.RemoteAddr(), err)
 			break
 		}
 	}
-	log.Printf("INFO: Connection closed for %s", conn.RemoteAddr())
+	logInfof("Connection closed for %s", conn.RemoteAddr())
 }

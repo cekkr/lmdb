@@ -37,7 +37,7 @@ from db_slm.settings import DBSLMSettings, load_settings
 from helpers.resource_monitor import ResourceMonitor
 if TYPE_CHECKING:
     from helpers.resource_monitor import ResourceDelta, ResourceSample
-from log_helpers import log
+from log_helpers import log, log_verbose
 
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
@@ -214,6 +214,7 @@ def _purge_cheetah_namespace(
 ) -> int:
     """Remove all pair entries (and backing values) for the given namespace prefix."""
     namespace_label = prefix.decode("utf-8", "ignore").rstrip(":") or prefix.hex()
+    log_verbose(3, f"[train:v3] Starting cheetah purge for '{namespace_label}' (page_size={page_size}).")
     removed = 0
     scan_warned = False
     delete_warned = False
@@ -315,12 +316,14 @@ def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
         path = Path(entry).expanduser()
         if path.is_file():
             files.append(path)
+            log_verbose(3, f"[train:v3] Queued input file {path}")
             continue
         if path.is_dir():
             pattern = "**/*.txt" if recursive else "*.txt"
             for candidate in sorted(path.glob(pattern)):
                 if candidate.is_file():
                     files.append(candidate)
+                    log_verbose(3, f"[train:v3] Discovered input file {candidate}")
             continue
         raise FileNotFoundError(f"No such file or directory: {path}")
     return files
@@ -547,6 +550,10 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
     dataset_cfg = load_dataset_config(path)
     records: list[EvaluationRecord] = []
     limit = max_records if max_records is not None and max_records > 0 else None
+    log_verbose(
+        3,
+        f"[eval:v3] Loading evaluation dataset from {path} (limit={limit or 'all'} records).",
+    )
     with path.open("r", encoding="utf-8") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
@@ -576,6 +583,7 @@ def load_eval_dataset(path: Path, max_records: int | None = None) -> List[Evalua
                 break
     if limit is not None:
         random.shuffle(records)
+    log_verbose(3, f"[eval:v3] Loaded {len(records)} evaluation record(s) from {path}.")
     return records
 
 
@@ -609,6 +617,13 @@ class InferenceMonitor:
         self.decoder_cfg = decoder_cfg
         self.variants_per_prompt = max(1, variants_per_prompt)
         self.seed_planner = seed_planner
+        log_verbose(
+            3,
+            "[eval:v3] Inference monitor configured "
+            f"(interval={self.interval}, samples_per_cycle={self.samples}, "
+            f"variants_per_prompt={self.variants_per_prompt}, dataset_size={len(self.dataset)}, "
+            f"max_dataset_size={self.max_dataset_size or 'unbounded'}).",
+        )
 
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.dataset)
@@ -617,11 +632,21 @@ class InferenceMonitor:
         if not self.enabled() or total_tokens < self.next_threshold:
             return
         while total_tokens >= self.next_threshold:
+            log_verbose(
+                3,
+                f"[eval:v3] Triggering evaluation cycle at threshold={self.next_threshold} "
+                f"with dataset_size={len(self.dataset)} (total_tokens={total_tokens}).",
+            )
             self._run_cycle(self.next_threshold)
             self.next_threshold += self.interval
 
     def _run_cycle(self, threshold: int) -> None:
         sample_size = min(len(self.dataset), self.samples)
+        log_verbose(
+            3,
+            f"[eval:v3] Sampling {sample_size} record(s) for evaluation at {threshold} tokens "
+            f"(available={len(self.dataset)}).",
+        )
         selections = random.sample(self.dataset, sample_size)
         run_inference_records(
             self.engine,
@@ -717,6 +742,7 @@ def main() -> None:
     settings = load_settings()
     parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
+    log_verbose(3, f"[train:v3] Parsed CLI arguments: {vars(args)}")
 
     for field_name, cli_name in (
         ("decoder_presence_penalty", "--decoder-presence-penalty"),
@@ -743,6 +769,11 @@ def main() -> None:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    log_verbose(
+        3,
+        f"[train:v3] Context dims argument '{args.context_dimensions}' resolved to "
+        f"{format_context_dimensions(context_dimensions)}.",
+    )
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
     if args.reset:
@@ -803,6 +834,7 @@ def main() -> None:
         decoder_cfg_override = DecoderConfig(**decoder_overrides)
 
     file_inputs = collect_files(args.inputs, args.recursive)
+    log_verbose(3, f"[train:v3] Prepared {len(file_inputs)} file input(s) for ingestion.")
     corpora_iter: Iterable[CorpusChunk] = iter_corpora(
         file_inputs,
         args.encoding,
@@ -818,6 +850,7 @@ def main() -> None:
                 corpora_iter,
                 [CorpusChunk("<stdin>", stdin_payload, [], total_rows=stdin_rows, train_rows=stdin_rows)],
             )
+            log_verbose(3, f"[train:v3] STDIN payload appended ({stdin_rows} rows).")
 
     # We defer the "empty" validation until after attempting to iterate so JSON inputs
     # can stream chunks without pre-loading them into memory.
@@ -856,6 +889,11 @@ def main() -> None:
                 seed_planner=seed_planner,
             )
             log(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
+            log_verbose(
+                3,
+                f"[eval:v3] Evaluation pool seeded from {dataset_path} "
+                f"(pool_size={len(eval_records)}, max_pool={args.eval_pool_size or 'unbounded'}).",
+            )
         except FileNotFoundError as exc:
             log(f"[eval] Warning: {exc}. Disabling evaluation probes.")
             monitor = InferenceMonitor(
@@ -912,6 +950,11 @@ def main() -> None:
                     while len(eval_batch) < min_batch:
                         eval_batch.append(seed_records[idx % len(seed_records)])
                         idx += 1
+                log_verbose(
+                    3,
+                    f"[eval:v3] Running hold-out evaluation for {label} with "
+                    f"{len(eval_batch)} record(s) (borrowed_from_pool={len(eval_batch) - len(chunk.eval_records)}).",
+                )
                 run_inference_records(
                     engine,
                     evaluator,

@@ -253,164 +253,237 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 
 // ExecuteCommand analizza ed esegue un comando.
 func (db *Database) ExecuteCommand(line string) (string, error) {
-	parts := strings.SplitN(line, " ", 2)
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return "ERROR,empty_command", nil
+	}
+	parts := strings.SplitN(trimmed, " ", 2)
 	command := strings.ToUpper(parts[0])
+	args := ""
+	if len(parts) > 1 {
+		args = parts[1]
+	}
+
+	logVerbosef("Received command=%s args=%s", command, summarizeArg(args))
+
+	var response string
+	var err error
 
 	switch {
 	case strings.HasPrefix(command, "INSERT"):
-		if len(parts) < 2 {
-			return "ERROR,missing_value", nil
+		if args == "" {
+			response = "ERROR,missing_value"
+			break
 		}
-		value := []byte(parts[1])
+		value := []byte(args)
 		size := 0
-		var err error
 		if strings.Contains(command, ":") {
 			sizeStr := strings.Split(command, ":")[1]
 			size, err = strconv.Atoi(sizeStr)
 			if err != nil {
-				return "ERROR,invalid_size_in_command", nil
+				response = "ERROR,invalid_size_in_command"
+				err = nil
+				break
 			}
 		}
-		return db.Insert(value, size)
+		response, err = db.Insert(value, size)
 	case command == "READ":
-		if len(parts) < 2 {
-			return "ERROR,missing_key", nil
+		if args == "" {
+			response = "ERROR,missing_key"
+			break
 		}
-		key, err := strconv.ParseUint(parts[1], 10, 64)
+		var key uint64
+		key, err = strconv.ParseUint(args, 10, 64)
 		if err != nil {
-			return "ERROR,invalid_key_format", nil
+			response = "ERROR,invalid_key_format"
+			err = nil
+			break
 		}
-		return db.Read(key)
+		response, err = db.Read(key)
 	case command == "EDIT":
-		if len(parts) < 2 {
-			return "ERROR,missing_arguments", nil
+		if args == "" {
+			response = "ERROR,missing_arguments"
+			break
 		}
-		args := strings.SplitN(parts[1], " ", 2)
-		if len(args) < 2 {
-			return "ERROR,edit_requires_key_and_value", nil
+		editArgs := strings.SplitN(args, " ", 2)
+		if len(editArgs) < 2 {
+			response = "ERROR,edit_requires_key_and_value"
+			break
 		}
-		key, err := strconv.ParseUint(args[0], 10, 64)
+		var key uint64
+		key, err = strconv.ParseUint(editArgs[0], 10, 64)
 		if err != nil {
-			return "ERROR,invalid_key_format", nil
+			response = "ERROR,invalid_key_format"
+			err = nil
+			break
 		}
-		return db.Edit(key, []byte(args[1]))
+		response, err = db.Edit(key, []byte(editArgs[1]))
 	case command == "DELETE":
-		if len(parts) < 2 {
-			return "ERROR,missing_key", nil
+		if args == "" {
+			response = "ERROR,missing_key"
+			break
 		}
-		key, err := strconv.ParseUint(parts[1], 10, 64)
+		var key uint64
+		key, err = strconv.ParseUint(args, 10, 64)
 		if err != nil {
-			return "ERROR,invalid_key_format", nil
+			response = "ERROR,invalid_key_format"
+			err = nil
+			break
 		}
-		return db.Delete(key)
+		response, err = db.Delete(key)
 	case command == "PAIR_SET":
-		args := strings.SplitN(parts[1], " ", 2)
-		if len(args) < 2 {
-			return "ERROR,pair_set_requires_value_and_key", nil
+		setArgs := strings.SplitN(args, " ", 2)
+		if len(setArgs) < 2 {
+			response = "ERROR,pair_set_requires_value_and_key"
+			break
 		}
-		value, err := parseValue(args[0])
+		var value []byte
+		value, err = parseValue(setArgs[0])
 		if err != nil {
-			return err.Error(), nil
+			response = err.Error()
+			err = nil
+			break
 		}
-		absKey, err := strconv.ParseUint(args[1], 10, 64)
+		var absKey uint64
+		absKey, err = strconv.ParseUint(setArgs[1], 10, 64)
 		if err != nil {
-			return "ERROR,invalid_absolute_key_format", nil
+			response = "ERROR,invalid_absolute_key_format"
+			err = nil
+			break
 		}
-		return db.PairSet(value, absKey)
-
+		response, err = db.PairSet(value, absKey)
 	case command == "PAIR_GET":
-		value, err := parseValue(parts[1])
+		var value []byte
+		value, err = parseValue(args)
 		if err != nil {
-			return err.Error(), nil
+			response = err.Error()
+			err = nil
+			break
 		}
-		return db.PairGet(value)
-
+		response, err = db.PairGet(value)
 	case command == "PAIR_DEL":
-		value, err := parseValue(parts[1])
+		var value []byte
+		value, err = parseValue(args)
 		if err != nil {
-			return err.Error(), nil
+			response = err.Error()
+			err = nil
+			break
 		}
-		return db.PairDel(value)
+		response, err = db.PairDel(value)
 	case command == "PAIR_SCAN":
-		if len(parts) < 2 {
-			return "ERROR,pair_scan_requires_prefix", nil
+		if args == "" {
+			response = "ERROR,pair_scan_requires_prefix"
+			break
 		}
-		args := strings.Fields(parts[1])
-		if len(args) == 0 {
-			return "ERROR,pair_scan_requires_prefix", nil
+		fields := strings.Fields(args)
+		if len(fields) == 0 {
+			response = "ERROR,pair_scan_requires_prefix"
+			break
 		}
 		var prefix []byte
-		var err error
-		if args[0] != "*" {
-			prefix, err = parseValue(args[0])
+		if fields[0] != "*" {
+			prefix, err = parseValue(fields[0])
 			if err != nil {
-				return err.Error(), nil
+				response = err.Error()
+				err = nil
+				break
 			}
 		}
 		limit := 0
-		if len(args) > 1 {
-			limit, err = strconv.Atoi(args[1])
+		if len(fields) > 1 {
+			limit, err = strconv.Atoi(fields[1])
 			if err != nil {
-				return "ERROR,invalid_limit", nil
+				response = "ERROR,invalid_limit"
+				err = nil
+				break
 			}
 		}
 		var cursor []byte
-		if len(args) > 2 {
-			if args[2] != "*" {
-				cursor, err = parseValue(args[2])
+		if len(fields) > 2 {
+			if fields[2] != "*" {
+				cursor, err = parseValue(fields[2])
 				if err != nil {
-					return err.Error(), nil
+					response = err.Error()
+					err = nil
+					break
 				}
 			}
 		}
-		results, nextCursor, err := db.PairScan(prefix, limit, cursor)
+		var results []PairScanResult
+		var nextCursor []byte
+		results, nextCursor, err = db.PairScan(prefix, limit, cursor)
 		if err != nil {
-			return "", err
+			response = ""
+			break
 		}
-		return formatPairScanResponse(results, nextCursor), nil
+		response = formatPairScanResponse(results, nextCursor)
 	case command == "PAIR_REDUCE":
-		if len(parts) < 2 {
-			return "ERROR,pair_reduce_requires_args", nil
+		if args == "" {
+			response = "ERROR,pair_reduce_requires_args"
+			break
 		}
-		args := strings.Fields(parts[1])
-		if len(args) < 2 {
-			return "ERROR,pair_reduce_requires_mode_and_prefix", nil
+		fields := strings.Fields(args)
+		if len(fields) < 2 {
+			response = "ERROR,pair_reduce_requires_mode_and_prefix"
+			break
 		}
-		mode := strings.ToLower(args[0])
+		mode := strings.ToLower(fields[0])
 		var prefix []byte
-		var err error
-		if args[1] != "*" {
-			prefix, err = parseValue(args[1])
+		if fields[1] != "*" {
+			prefix, err = parseValue(fields[1])
 			if err != nil {
-				return err.Error(), nil
+				response = err.Error()
+				err = nil
+				break
 			}
 		}
 		limit := 0
-		if len(args) > 2 {
-			limit, err = strconv.Atoi(args[2])
+		if len(fields) > 2 {
+			limit, err = strconv.Atoi(fields[2])
 			if err != nil {
-				return "ERROR,invalid_limit", nil
+				response = "ERROR,invalid_limit"
+				err = nil
+				break
 			}
 		}
 		var cursor []byte
-		if len(args) > 3 {
-			if args[3] != "*" {
-				cursor, err = parseValue(args[3])
+		if len(fields) > 3 {
+			if fields[3] != "*" {
+				cursor, err = parseValue(fields[3])
 				if err != nil {
-					return err.Error(), nil
+					response = err.Error()
+					err = nil
+					break
 				}
 			}
 		}
-		response, err := db.handlePairReduce(mode, prefix, limit, cursor)
-		if err != nil {
-			return "", err
-		}
-		return response, nil
+		response, err = db.handlePairReduce(mode, prefix, limit, cursor)
 	case command == "SYSTEM_STATS":
-		return db.systemStatsResponse(), nil
+		response = db.systemStatsResponse()
+	case command == "LOG_FLUSH":
+		limit := 0
+		if trimmedArgs := strings.TrimSpace(args); trimmedArgs != "" {
+			limit, err = strconv.Atoi(trimmedArgs)
+			if err != nil {
+				response = "ERROR,invalid_limit"
+				err = nil
+				break
+			}
+			if limit < 0 {
+				limit = 0
+			}
+		}
+		response = formatLogFlushResponse(logSink.Flush(limit))
 	default:
-		return "ERROR,unknown_command", nil
+		response = "ERROR,unknown_command"
 	}
+
+	if err != nil {
+		logErrorf("Command %s failed: %v", command, err)
+	} else {
+		logVerbosef("Command %s completed -> %s", command, summarizeResponse(response))
+	}
+	return response, err
 }
 
 func (db *Database) deletePairTable(tableID uint32) error {
@@ -748,6 +821,33 @@ func formatPairReduceResponse(results []PairReduceResult, mode string, nextCurso
 		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
 	}
 	return b.String()
+}
+
+func formatLogFlushResponse(entries []string) string {
+	if len(entries) == 0 {
+		return "SUCCESS,count=0"
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("SUCCESS,count=%d", len(entries)))
+	for idx, entry := range entries {
+		b.WriteString(fmt.Sprintf("\n[%d] %s", idx+1, entry))
+	}
+	return b.String()
+}
+
+func summarizeArg(arg string) string {
+	trimmed := strings.TrimSpace(arg)
+	if len(trimmed) > 120 {
+		return trimmed[:117] + "..."
+	}
+	return trimmed
+}
+
+func summarizeResponse(resp string) string {
+	if len(resp) > 160 {
+		return resp[:157] + "..."
+	}
+	return resp
 }
 
 func (db *Database) systemStatsResponse() string {

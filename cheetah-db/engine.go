@@ -3,7 +3,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -42,7 +41,7 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 	}
 
 	e.databases[name] = db
-	log.Printf("INFO: Loaded database: %s", name)
+	logInfof("Loaded database: %s", name)
 	return db, nil
 }
 
@@ -50,12 +49,12 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 func (e *Engine) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	log.Println("INFO: Closing all databases...")
+	logInfof("Closing all databases...")
 	for name, db := range e.databases {
 		if err := db.Close(); err != nil {
-			log.Printf("ERROR: Failed to close database %s: %v", name, err)
+			logErrorf("Failed to close database %s: %v", name, err)
 		} else {
-			log.Printf("INFO: Database %s closed.", name)
+			logInfof("Database %s closed.", name)
 		}
 	}
 }
