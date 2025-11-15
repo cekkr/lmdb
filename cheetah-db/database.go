@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Database struct {
@@ -27,6 +28,7 @@ type Database struct {
 	mu              sync.Mutex
 	pairDir         string // Path alla cartella /pairs
 	nextPairIDPath  string // Path al file che memorizza il contatore
+	resources       *ResourceMonitor
 }
 
 const (
@@ -106,7 +108,7 @@ func clearEntryTerminal(entry []byte) {
 	}
 }
 
-func NewDatabase(path string) (*Database, error) {
+func NewDatabase(path string, monitor *ResourceMonitor) (*Database, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
 	}
@@ -127,6 +129,7 @@ func NewDatabase(path string) (*Database, error) {
 		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
 		mainKeys:       mkt,
 		payloadCache:   newPayloadCacheFromEnv(),
+		resources:      monitor,
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -403,6 +406,8 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			return "", err
 		}
 		return response, nil
+	case command == "SYSTEM_STATS":
+		return db.systemStatsResponse(), nil
 	default:
 		return "ERROR,unknown_command", nil
 	}
@@ -591,7 +596,13 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 	}
 
 	reduced := make([]PairReduceResult, len(scanResults))
-	workerCount := runtime.NumCPU() * 2
+	workerCount := len(scanResults)
+	if db.resources != nil {
+		workerCount = db.resources.RecommendedWorkers(len(scanResults))
+	}
+	if workerCount == 0 {
+		workerCount = runtime.NumCPU() * 2
+	}
 	if workerCount > len(scanResults) {
 		workerCount = len(scanResults)
 	}
@@ -737,6 +748,61 @@ func formatPairReduceResponse(results []PairReduceResult, mode string, nextCurso
 		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
 	}
 	return b.String()
+}
+
+func (db *Database) systemStatsResponse() string {
+	if db.resources == nil {
+		return "ERROR,resource_monitor_unavailable"
+	}
+	return formatSystemStatsResponse(db.resources.Snapshot())
+}
+
+func formatSystemStatsResponse(snap ResourceSnapshot) string {
+	var b strings.Builder
+	b.WriteString("SUCCESS,command=SYSTEM_STATS")
+	if !snap.Timestamp.IsZero() {
+		b.WriteString(fmt.Sprintf(",timestamp=%s", snap.Timestamp.UTC().Format(time.RFC3339)))
+	}
+	b.WriteString(fmt.Sprintf(",logical_cores=%d", snap.LogicalCores))
+	b.WriteString(fmt.Sprintf(",gomaxprocs=%d", snap.Gomaxprocs))
+	b.WriteString(fmt.Sprintf(",goroutines=%d", snap.Goroutines))
+	b.WriteString(fmt.Sprintf(",mem_alloc_bytes=%d", snap.MemAllocBytes))
+	b.WriteString(fmt.Sprintf(",mem_sys_bytes=%d", snap.MemSysBytes))
+	if snap.ProcessCPUSupported {
+		b.WriteString(fmt.Sprintf(",process_cpu_pct=%.2f", snap.ProcessCPUPercent))
+	} else {
+		b.WriteString(",process_cpu_pct=NA")
+	}
+	b.WriteString(fmt.Sprintf(",process_cpu_supported=%d", boolToInt(snap.ProcessCPUSupported)))
+	if snap.SystemCPUSupported {
+		b.WriteString(fmt.Sprintf(",system_cpu_pct=%.2f", snap.SystemCPUPercent))
+	} else {
+		b.WriteString(",system_cpu_pct=NA")
+	}
+	b.WriteString(fmt.Sprintf(",system_cpu_supported=%d", boolToInt(snap.SystemCPUSupported)))
+	b.WriteString(fmt.Sprintf(",io_supported=%d", boolToInt(snap.IOSupported)))
+	if snap.IOSupported {
+		b.WriteString(fmt.Sprintf(",io_read_bytes=%d", snap.IOReadBytes))
+		b.WriteString(fmt.Sprintf(",io_write_bytes=%d", snap.IOWriteBytes))
+		if snap.IOReadRate > 0 {
+			b.WriteString(fmt.Sprintf(",io_read_bytes_per_sec=%.2f", snap.IOReadRate))
+		} else {
+			b.WriteString(",io_read_bytes_per_sec=0")
+		}
+		if snap.IOWriteRate > 0 {
+			b.WriteString(fmt.Sprintf(",io_write_bytes_per_sec=%.2f", snap.IOWriteRate))
+		} else {
+			b.WriteString(",io_write_bytes_per_sec=0")
+		}
+	}
+	return b.String()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func makePayloadCacheKey(size uint32, location ValueLocationIndex) payloadCacheKey {

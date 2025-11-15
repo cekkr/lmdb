@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -18,8 +20,13 @@ const (
 )
 
 func main() {
+	monitor := NewResourceMonitor(2 * time.Second)
+	defer monitor.Stop()
+	coreSnapshot := monitor.Snapshot()
+	log.Printf("INFO: Detected %d logical CPU cores (GOMAXPROCS=%d)", coreSnapshot.LogicalCores, runtime.GOMAXPROCS(0))
+
 	// Inizializza l'engine del database
-	engine, err := NewEngine(DataDir)
+	engine, err := NewEngine(DataDir, monitor)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to start engine: %v", err)
 	}
@@ -34,7 +41,7 @@ func main() {
 	}()
 
 	// Gestisce la chiusura pulita su segnali come Ctrl+C
-	setupGracefulShutdown(engine)
+	setupGracefulShutdown(engine, monitor)
 
 	if os.Getenv("CHEETAH_HEADLESS") == "1" {
 		log.Println("CheetahDB headless mode active. CLI disabled; press Ctrl+C to stop the server.")
@@ -93,13 +100,16 @@ func runCLI(engine *Engine) {
 }
 
 // setupGracefulShutdown attende un segnale di interruzione per chiudere le risorse
-func setupGracefulShutdown(engine *Engine) {
+func setupGracefulShutdown(engine *Engine, monitor *ResourceMonitor) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
 		log.Println("Shutdown signal received. Closing resources...")
 		engine.Close()
+		if monitor != nil {
+			monitor.Stop()
+		}
 		os.Exit(0)
 	}()
 }

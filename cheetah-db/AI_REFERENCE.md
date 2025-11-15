@@ -54,6 +54,12 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).
+- cheetah-server now boots with a resource monitor: it detects logical cores, samples process vs
+  system CPU percentages, and polls `/proc/self/io` for disk churn. Reducer worker pools call
+  `RecommendedWorkers()` so hot `PAIR_REDUCE` bursts automatically back off when CPU or I/O pressure
+  spikes, keeping multi-connection workloads responsive. Issue `SYSTEM_STATS` via CLI/TCP to read
+  the latest snapshot (`logical_cores`, goroutines, CPU%, bytes/sec), and feed those numbers back
+  into ingest scripts when you need adaptive fan-out across multiple cheetah nodes.
 - `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of span ranges
   (e.g., `1-2,3-5`) or progressive lengths (e.g., `4,8,4`). Length specs auto-expand to contiguous
   spans starting at 1, and logs now append `(len=...)` so you can see the effective window widths.

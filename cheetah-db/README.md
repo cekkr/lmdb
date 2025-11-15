@@ -17,6 +17,9 @@ other dense analytical slices must be served with predictable latency.
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
   `CHEETAH_PAYLOAD_CACHE_BYTES`, or disable caching entirely by setting any of them to `0`.
+- **Resource-aware reducers.** The server detects available CPU cores at startup, samples live
+  CPU/I/O pressure, and scales reducer worker pools accordingly so concurrent connections avoid
+  exhausting compute or disk bandwidth.
 - **Multi-tenant databases.** `engine.go` multiplexes logical databases under `cheetah_data/<name>`
   and exposes them over both CLI and TCP, making it easy to isolate experiments or pilot rollouts.
 - **Reducer streaming.** Reducers stream inline payloads through a bounded worker pool, overlap disk
@@ -98,6 +101,7 @@ PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors suppo
 PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
 DELETE <abs_key>                # tombstone entry
 RECYCLE <value_size>            # report recycle stats per table
+SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
 ```
 
 - Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
@@ -106,6 +110,9 @@ RECYCLE <value_size>            # report recycle stats per table
   additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
+- `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
+  per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
+  out to `top`/`iostat`.
 
 ## Streaming Helpers
 

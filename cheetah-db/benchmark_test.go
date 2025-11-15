@@ -95,7 +95,7 @@ func runBenchmark(duration time.Duration, concurrency, valueSize int) (string, e
 		return "", fmt.Errorf("cleanup bench dir: %w", err)
 	}
 
-	engine, err := NewEngine(baseDir)
+	engine, err := NewEngine(baseDir, nil)
 	if err != nil {
 		return "", err
 	}
