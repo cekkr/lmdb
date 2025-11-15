@@ -9,7 +9,7 @@ from db_slm.context_dimensions import format_context_dimensions, parse_context_d
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 
-from log_helpers import log
+from log_helpers import log, log_verbose
 
 
 def build_parser(default_db_path: str) -> argparse.ArgumentParser:
@@ -80,7 +80,9 @@ def ensure_conversation(engine: DBSLMEngine, args: argparse.Namespace) -> str:
     if args.conversation:
         if not conversation_exists(engine, args.conversation):
             raise ValueError(f"Conversation '{args.conversation}' does not exist in this database")
+        log_verbose(3, f"[run:v3] Resuming conversation {args.conversation}.")
         return args.conversation
+    log_verbose(3, "[run:v3] Starting a new conversation.")
     return engine.start_conversation(args.user, args.agent)
 
 
@@ -123,10 +125,16 @@ def main() -> None:
     settings = load_settings()
     parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
+    log_verbose(3, f"[run:v3] Parsed CLI arguments: {vars(args)}")
     try:
         context_dimensions = parse_context_dimensions_arg(args.context_dimensions, default=None)
     except ValueError as exc:
         parser.error(str(exc))
+    log_verbose(
+        3,
+        f"[run:v3] Context dims argument '{args.context_dimensions}' resolved to "
+        f"{format_context_dimensions(context_dimensions)}.",
+    )
 
     engine: DBSLMEngine | None = None
     try:

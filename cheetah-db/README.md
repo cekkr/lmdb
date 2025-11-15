@@ -85,7 +85,7 @@ Environment variables:
 
 - `CHEETAH_DATA_DIR` — root directory for database folders (defaults to `cheetah_data`).
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
-- `CHEETAH_LOG_LEVEL` — set to `debug` for verbose reducer + trie traces.
+- `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
 The binary prints `[cheetah_data/default]>` when ready. Use `DATABASE <name>` (CLI) to switch between
 logical databases or send the same command over TCP.
@@ -102,6 +102,7 @@ PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/
 DELETE <abs_key>                # tombstone entry
 RECYCLE <value_size>            # report recycle stats per table
 SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
+LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (optionally capped)
 ```
 
 - Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
@@ -113,6 +114,9 @@ SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
 - `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
   out to `top`/`iostat`.
+- `LOG_FLUSH` returns the most recent log lines captured by the server (default ring buffer depth:
+  256 entries) and clears the buffer. Pass a numeric limit to trim the output without truncating the
+  stored log metadata.
 
 ## Command Walkthroughs
 

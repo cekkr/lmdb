@@ -23,7 +23,7 @@ func main() {
 	monitor := NewResourceMonitor(2 * time.Second)
 	defer monitor.Stop()
 	coreSnapshot := monitor.Snapshot()
-	log.Printf("INFO: Detected %d logical CPU cores (GOMAXPROCS=%d)", coreSnapshot.LogicalCores, runtime.GOMAXPROCS(0))
+	logInfof("Detected %d logical CPU cores (GOMAXPROCS=%d)", coreSnapshot.LogicalCores, runtime.GOMAXPROCS(0))
 
 	// Inizializza l'engine del database
 	engine, err := NewEngine(DataDir, monitor)
@@ -36,7 +36,7 @@ func main() {
 	server := NewTCPServer(ListenAddr, engine)
 	go func() {
 		if err := server.Start(); err != nil {
-			log.Printf("ERROR: TCP Server failed: %v", err)
+			logErrorf("TCP Server failed: %v", err)
 		}
 	}()
 
@@ -44,7 +44,7 @@ func main() {
 	setupGracefulShutdown(engine, monitor)
 
 	if os.Getenv("CHEETAH_HEADLESS") == "1" {
-		log.Println("CheetahDB headless mode active. CLI disabled; press Ctrl+C to stop the server.")
+		logInfof("CheetahDB headless mode active. CLI disabled; press Ctrl+C to stop the server.")
 		select {}
 	}
 
@@ -54,7 +54,7 @@ func main() {
 
 // runCLI gestisce l'input dal terminale per i comandi locali
 func runCLI(engine *Engine) {
-	log.Println("CheetahDB Console Interface is running. Type 'EXIT' to quit.")
+	logInfof("CheetahDB Console Interface is running. Type 'EXIT' to quit.")
 	currentDB, err := engine.GetDatabase(DefaultDbName)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to load default database for CLI: %v", err)
@@ -105,7 +105,7 @@ func setupGracefulShutdown(engine *Engine, monitor *ResourceMonitor) {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		log.Println("Shutdown signal received. Closing resources...")
+		logInfof("Shutdown signal received. Closing resources...")
 		engine.Close()
 		if monitor != nil {
 			monitor.Stop()
