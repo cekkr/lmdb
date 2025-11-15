@@ -99,6 +99,8 @@ EDIT:<size> <abs_key> <payload> # overwrite payload in-place
 PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
 PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors supported)
 PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
+PAIR_SUMMARY <prefix> [depth] [branch_limit]
+                                # aggregate namespace statistics (payload totals, branch fan-out)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
 RECYCLE <value_size>            # report recycle stats per table
@@ -112,6 +114,12 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
+- `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
+  sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
+  fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of
+  branch digests returned (default: 32). This is the entry point for data-centric statistics—e.g.,
+  estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
+  the tree-indexing section below.
 - `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
   out to `top`/`iostat`.
@@ -238,6 +246,11 @@ database applies the same idea to on-disk tables:
   statistics (counts, rolling hashes, Top-K summaries) and branch-local caches the same way
   `char_tree_similarity.py` keeps only significant substrings. Because the layout guarantees stable
   offsets, prefetchers or GPU-backed reducers can schedule precise `ReadAt` calls without scanning.
+- `PAIR_SUMMARY` is the first tooling pass for that roadmap: it reuses the same tree walk to report
+  per-namespace totals and per-branch counts without shipping every payload back to Python. Passing
+  `PAIR_SUMMARY ctx: 2 64`, for example, shows the hottest two-depth prefixes (capped at 64
+  branches) while also returning min/max payload sizes—perfect for prioritizing which contexts to
+  mirror into GPU reducers or char-tree similarity scans.
 
 Treating namespace keys as traversable trees keeps INSERT/READ latency tied to fixed math instead of
 variable-length scans. It also gives future tooling (fuzzy namespace matching, char-tree-style

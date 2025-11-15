@@ -1,9 +1,17 @@
 # TODO: High-performance Statistics Implementations
 
 ## Scope
-- Evaluate the cheetah-db features listed in `AI_REFERENCE.md` with a focus on high-throughput statistical workloads.
-- Describe how the Go implementation plus the Python `src/db_slm` adapters can be applied in other programs.
+- Evaluate the cheetah-db features listed in `AI_REFERENCE.md` with a focus on high-throughput statistical workloads **and** the data products that live inside each namespace (counts, rolling hashes, continuation totals, etc.).
+- Mirror the README guidance around tree indexing so data-centric statistics (e.g., `char_tree_similarity.py` style substring filters) can be reused by other runtimes.
+- Describe how the Go implementation plus the Python `src/db_slm` adapters should evolve (new commands, optional arguments) so typical statistical queries become one-shot server calls instead of bespoke loops.
 - Capture TODOs that keep the statistical path fast (counts, probabilities, continuations, Top-K slices, context relativism) when reused beyond this repo.
+
+## Priority statistical workloads
+- **Counts & continuations** — `src/db_slm/adapters/cheetah.py` already calls `pair_reduce counts|continuations` via `iter_counts`/`iter_continuations`; research needs bulk namespace totals (per-order sums, histogram bins) without walking every payload in Python.
+- **Probability tables & Top-K slices** — `publish_probabilities`, `fetch_topk`, and decoder biasing rely on dense `prob:*` payloads; future calculations include log-prob deltas, entropy, and quantile summaries per context.
+- **Context relativism** — `pipeline.context_relativism` composes tree-shaped queries (mirroring `AbsoluteVectorOrder`) and needs branch-local statistics to prune improbable nodes early.
+- **Similarity and rolling hashes** — `src/helpers/char_tree_similarity.py` keeps only significant substrings; the database equivalent is per-branch rolling hashes, substring counts, and bloom-like sketches per namespace to accelerate fuzzy matches and GPU reducers.
+- **Operational analytics** — ingestion resets, MKNS rebuilds, and cache-hit tracking in `train.py` want single-command reports (counts per namespace, unique followers, continuation coverage) tailored for automation.
 
 ## Feature Review & Reuse Guidance
 
@@ -37,6 +45,17 @@
 - Python can already hit this command through `CheetahClient.command`, but there is no helper; adding one would let analytics scripts dynamically slow down when the Go server is over-subscribed.
 - TODO: wire a `get_system_stats()` helper into the Python adapter plus a CLI example so future programs can throttle long-running statistical exports based on real server pressure.
 
+- **Tree-indexed namespace statistics**
+  - README outlines the next frontier: leverage the deterministic trie to precompute namespace statistics (counts, rolling hashes, Top-K digests) the same way `char_tree_similarity.py` filters substrings. Because each branch has a stable offset, reducers or GPU walkers can `ReadAt` exact payloads without scanning.
+  - TODOs below formalize the work: new commands that return branch-local summaries, optional reducer arguments that stream digests instead of full payloads, and helpers that emit rolling hashes for fuzzy namespace lookups. These should keep parity with the python helper semantics so statistical code can swap between in-memory and cheetah-backed char trees.
+
+## Command & argument roadmap for statistical acceleration
+- **`PAIR_SUMMARY <namespace> [options]` (new)** — emits aggregate statistics for a prefix: total contexts, follower sum, min/max counts, entropy estimates, rolling hashes. Options could include `--levels=2` (expand only `n` levels) or `--digest=topk|hashes`.
+- **`PAIR_REDUCE ... mode` extensions** — add optional flags such as `payload=stats` to request pre-aggregated digests, `topk_limit=N` to inline only leading entries, or `hash=rolling` to include the trie-level hash without touching the payload.
+- **`PAIR_SCAN ... with_counts` (optional argument)** — permit scanning namespaces while also returning child counts or payload sizes, enabling clients to build heat maps without separate reducer passes.
+- **Metadata mirroring** — extend the existing metadata namespace with entries like `stats:ctx:<hash>` to store last-known summaries that can be reused by Python when running offline analyses.
+- **Python adapter hooks** — add a `get_system_stats()` helper (consuming `recommended_workers`) plus dedicated `summary(namespace, depth)` and `iter_hashes(order)` methods so src/ code paths stop reimplementing reducers for simple statistics.
+
 ## Cross-program Usage Checklist (Python and beyond)
 - Keep `DBSLM_BACKEND=cheetah-db` and launch `cheetah-server` with `CHEETAH_HEADLESS=1` so the TCP service is always reachable before running high-throughput analytics.
 - Prefer namespace-aware reducers (`pair_reduce counts|probabilities|continuations`, `context_relativism`) instead of manual `READ`s; these paths already batch, parallelize, and cache payloads on the server.
@@ -46,6 +65,13 @@
 
 ## Open Tasks / Next Steps
 1. **Expose resource-aware hints to clients.** `SYSTEM_STATS` now emits queue-depth→worker-count hints derived from the resource monitor; follow-up: add Python adapter helpers that consume those hints and auto-tune reducer batch sizes.
+2. **Namespace summary commands.** ✅ `PAIR_SUMMARY <prefix> [depth] [branch_limit]` now streams aggregate counts, payload byte totals, and branch fan-out digests without hydrating every payload. Follow-up: add optional rolling hashes / Top-K digests alongside the structural stats.
+3. **Optional reducer digests.** Allow `PAIR_REDUCE` to return compact statistics (entropy, CDF bins, hash windows) alongside or instead of raw payloads to accelerate Python-side analytics.
+4. **Rolling hash / similarity mirrors.** Provide trie-level rolling hash metadata (per namespace and per depth) so fuzzy lookups and substring similarity heuristics have fast, server-side entry points.
+5. **Python ergonomics.** Add wrappers for `SYSTEM_STATS`, namespace summaries, cache hit telemetry, and context relativism helpers in `src/db_slm/adapters/cheetah.py` so analytics jobs can introspect cheetah without reaching into private methods.
+6. **Shared canonical vector helpers.** Publish a tiny library (Go or Python wheel) containing `AbsoluteVectorOrder` encoders/decoders for reuse in other projects or languages.
+7. **Binary/stateless protocol option.** Evaluate a Protobuf or msgpack framing to reduce base64 overhead for high-volume `PAIR_REDUCE` consumers (statistical crawlers, background jobs).
+8. **JSON/stat-typed responses.** Offer an opt-in JSON encoder for reducers so programs that do not embed the DB-SLM serializer can still decode counts/probabilities/continuations cheaply.
 2. **Shared canonical vector helpers.** Publish a tiny library (Go or Python wheel) containing `AbsoluteVectorOrder` encoders/decoders for reuse in other projects or languages.
 3. **Binary/stateless protocol option.** Evaluate a Protobuf or msgpack framing to reduce base64 overhead for high-volume `PAIR_REDUCE` consumers (statistical crawlers, background jobs).
 4. **JSON/stat-typed responses.** Offer an opt-in JSON encoder for reducers so programs that do not embed the DB-SLM serializer can still decode counts/probabilities/continuations cheaply.

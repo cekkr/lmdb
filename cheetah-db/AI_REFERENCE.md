@@ -71,6 +71,12 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   the latest snapshot (`logical_cores`, goroutines, CPU%, bytes/sec). The response now includes a
   `recommended_workers=` hint (queue-depth→worker-count pairs for 1, 32, 256, 4096 pending tasks)
   so Python and other clients can size reducer batches or pause when the server is saturated.
+- `PAIR_SUMMARY <prefix> [depth] [branch_limit]` is available for namespace analytics. It walks the
+  trie beneath `prefix`, counts terminal entries, sums payload bytes via `main_keys` metadata, keeps
+  min/max payload sizes and keys, and returns branch-level fan-out counts up to `depth` (default 1,
+  unlimited with `-1`). Use it to emulate the `char_tree_similarity.py` heuristics directly inside
+  the database: pick hot prefixes, stage rolling hashes, and decide which namespaces deserve GPU- or
+  cache-backed reducers without iterating every payload in Python.
 - `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of span ranges
   (e.g., `1-2,3-5`) or progressive lengths (e.g., `4,8,4`). Length specs auto-expand to contiguous
   spans starting at 1, and logs now append `(len=...)` so you can see the effective window widths.

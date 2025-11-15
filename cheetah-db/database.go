@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,13 +35,34 @@ type Database struct {
 }
 
 const (
-	pairScanDefaultLimit = 256
-	pairScanMaxLimit     = 4096
+	pairScanDefaultLimit          = 256
+	pairScanMaxLimit              = 4096
+	pairSummaryDefaultDepth       = 1
+	pairSummaryDefaultBranchLimit = 32
+	pairSummaryMaxBranchLimit     = 1024
 )
 
 type PairScanResult struct {
 	Value []byte
 	Key   uint64
+}
+
+type pairSummaryBranch struct {
+	Path  []byte
+	Count int64
+}
+
+type PairSummaryResult struct {
+	Prefix            []byte
+	TerminalCount     int64
+	TotalPayloadBytes int64
+	MinPayloadBytes   uint32
+	MaxPayloadBytes   uint32
+	MinKey            uint64
+	MaxKey            uint64
+	MaxDepth          int
+	SelfTerminal      bool
+	Branches          []pairSummaryBranch
 }
 
 type PairReduceResult struct {
@@ -503,6 +525,50 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			}
 		}
 		response, err = db.handlePairReduce(mode, prefix, limit, cursor)
+	case command == "PAIR_SUMMARY":
+		if args == "" {
+			response = "ERROR,pair_summary_requires_prefix"
+			break
+		}
+		fields := strings.Fields(args)
+		if len(fields) == 0 {
+			response = "ERROR,pair_summary_requires_prefix"
+			break
+		}
+		var prefix []byte
+		if fields[0] != "*" {
+			prefix, err = parseValue(fields[0])
+			if err != nil {
+				response = err.Error()
+				err = nil
+				break
+			}
+		}
+		depth := pairSummaryDefaultDepth
+		if len(fields) > 1 {
+			depth, err = strconv.Atoi(fields[1])
+			if err != nil {
+				response = "ERROR,invalid_depth"
+				err = nil
+				break
+			}
+		}
+		branchLimit := pairSummaryDefaultBranchLimit
+		if len(fields) > 2 {
+			branchLimit, err = strconv.Atoi(fields[2])
+			if err != nil {
+				response = "ERROR,invalid_branch_limit"
+				err = nil
+				break
+			}
+		}
+		var summary *PairSummaryResult
+		summary, err = db.PairSummary(prefix, depth, branchLimit)
+		if err != nil {
+			response = ""
+			break
+		}
+		response = formatPairSummaryResponse(summary)
 	case command == "SYSTEM_STATS":
 		response = db.systemStatsResponse()
 	case command == "LOG_FLUSH":
@@ -606,9 +672,100 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 	return results, nextCursor, nil
 }
 
+func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) (*PairSummaryResult, error) {
+	if depthLimit < 0 {
+		depthLimit = -1
+	}
+	if branchLimit < 0 {
+		branchLimit = 0
+	}
+	if branchLimit > pairSummaryMaxBranchLimit {
+		branchLimit = pairSummaryMaxBranchLimit
+	}
+	acc := newPairSummaryAccumulator(prefix, depthLimit, branchLimit)
+	startTable := uint32(0)
+	if len(prefix) > 0 {
+		currentTableID := uint32(0)
+		for i, branchByte := range prefix {
+			table, err := db.getPairTable(currentTableID)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return acc.finalize(), nil
+				}
+				return nil, err
+			}
+			entry, err := table.ReadEntry(branchByte)
+			if err != nil {
+				return nil, err
+			}
+			isLast := i == len(prefix)-1
+			if isLast {
+				if entryHasTerminal(entry) {
+					key := decodeAbsoluteKey(entry)
+					if key != 0 {
+						if err := db.recordSummaryTerminal(acc, append([]byte{}, prefix...), key); err != nil {
+							return nil, err
+						}
+					}
+				}
+				if entryHasChild(entry) {
+					startTable = entryChildID(entry)
+				}
+				break
+			}
+			if !entryHasChild(entry) {
+				return acc.finalize(), nil
+			}
+			childID := entryChildID(entry)
+			if childID == 0 {
+				return acc.finalize(), nil
+			}
+			currentTableID = childID
+		}
+		if startTable == 0 {
+			return acc.finalize(), nil
+		}
+	}
+	workerCount := 1
+	if db.resources != nil {
+		workerCount = db.resources.RecommendedWorkers(pairScanDefaultLimit)
+	}
+	if workerCount < 1 {
+		workerCount = runtime.NumCPU()
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if err := db.parallelSummarizePairEntries(startTable, prefix, workerCount, acc); err != nil {
+		return nil, err
+	}
+	return acc.finalize(), nil
+}
+
 type pairScanTask struct {
 	tableID uint32
 	prefix  []byte
+}
+
+type pairSummaryTask struct {
+	tableID uint32
+	path    []byte
+}
+
+type pairSummaryAccumulator struct {
+	prefix       []byte
+	depthLimit   int
+	branchLimit  int
+	mu           sync.Mutex
+	branches     map[string]*pairSummaryBranch
+	terminalCnt  int64
+	totalBytes   int64
+	minPayload   uint32
+	maxPayload   uint32
+	minKey       uint64
+	maxKey       uint64
+	maxDepth     int
+	selfTerminal bool
 }
 
 type pairScanAccumulator struct {
@@ -623,6 +780,87 @@ func newPairScanAccumulator(limit int, cursor []byte) *pairScanAccumulator {
 	return &pairScanAccumulator{
 		cursor: append([]byte{}, cursor...),
 		limit:  limit,
+	}
+}
+
+func newPairSummaryAccumulator(prefix []byte, depthLimit int, branchLimit int) *pairSummaryAccumulator {
+	return &pairSummaryAccumulator{
+		prefix:      append([]byte{}, prefix...),
+		depthLimit:  depthLimit,
+		branchLimit: branchLimit,
+		branches:    make(map[string]*pairSummaryBranch),
+	}
+}
+
+func (a *pairSummaryAccumulator) recordTerminal(path []byte, key uint64, payloadSize uint32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.terminalCnt++
+	a.totalBytes += int64(payloadSize)
+	if a.minPayload == 0 || payloadSize < a.minPayload {
+		a.minPayload = payloadSize
+	}
+	if payloadSize > a.maxPayload {
+		a.maxPayload = payloadSize
+	}
+	if a.minKey == 0 || key < a.minKey {
+		a.minKey = key
+	}
+	if key > a.maxKey {
+		a.maxKey = key
+	}
+	relDepth := len(path) - len(a.prefix)
+	if relDepth > a.maxDepth {
+		a.maxDepth = relDepth
+	}
+	if relDepth == 0 {
+		a.selfTerminal = true
+	}
+	if a.depthLimit == 0 || relDepth <= 0 {
+		return
+	}
+	depth := relDepth
+	if a.depthLimit > 0 && depth > a.depthLimit {
+		depth = a.depthLimit
+	}
+	if depth <= 0 {
+		return
+	}
+	relPath := path[len(a.prefix) : len(a.prefix)+depth]
+	keyStr := hex.EncodeToString(relPath)
+	bucket, ok := a.branches[keyStr]
+	if !ok {
+		bucket = &pairSummaryBranch{Path: append([]byte{}, relPath...)}
+		a.branches[keyStr] = bucket
+	}
+	bucket.Count++
+}
+
+func (a *pairSummaryAccumulator) finalize() *PairSummaryResult {
+	branches := make([]pairSummaryBranch, 0, len(a.branches))
+	for _, branch := range a.branches {
+		branches = append(branches, pairSummaryBranch{Path: branch.Path, Count: branch.Count})
+	}
+	sort.Slice(branches, func(i, j int) bool {
+		if branches[i].Count == branches[j].Count {
+			return bytes.Compare(branches[i].Path, branches[j].Path) < 0
+		}
+		return branches[i].Count > branches[j].Count
+	})
+	if a.branchLimit > 0 && len(branches) > a.branchLimit {
+		branches = branches[:a.branchLimit]
+	}
+	return &PairSummaryResult{
+		Prefix:            append([]byte{}, a.prefix...),
+		TerminalCount:     a.terminalCnt,
+		TotalPayloadBytes: a.totalBytes,
+		MinPayloadBytes:   a.minPayload,
+		MaxPayloadBytes:   a.maxPayload,
+		MinKey:            a.minKey,
+		MaxKey:            a.maxKey,
+		MaxDepth:          a.maxDepth,
+		SelfTerminal:      a.selfTerminal,
+		Branches:          branches,
 	}
 }
 
@@ -704,6 +942,104 @@ func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, wo
 	if firstErr != nil {
 		return firstErr
 	}
+	return nil
+}
+
+func (db *Database) parallelSummarizePairEntries(tableID uint32, prefix []byte, workers int, acc *pairSummaryAccumulator) error {
+	tasks := make(chan pairSummaryTask, workers*4)
+	var pending sync.WaitGroup
+	var workerWG sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	var abort atomic.Bool
+
+	pending.Add(1)
+	tasks <- pairSummaryTask{tableID: tableID, path: append([]byte{}, prefix...)}
+	go func() {
+		pending.Wait()
+		close(tasks)
+	}()
+
+	worker := func() {
+		defer workerWG.Done()
+		for task := range tasks {
+			if abort.Load() {
+				pending.Done()
+				continue
+			}
+			if err := db.walkPairSummary(task, acc, &pending, tasks, &abort); err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					abort.Store(true)
+				})
+			}
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		workerWG.Add(1)
+		go worker()
+	}
+	workerWG.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
+func (db *Database) walkPairSummary(
+	task pairSummaryTask,
+	acc *pairSummaryAccumulator,
+	pending *sync.WaitGroup,
+	tasks chan<- pairSummaryTask,
+	abort *atomic.Bool,
+) error {
+	defer pending.Done()
+	table, err := db.getPairTable(task.tableID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for branch := 0; branch < 256; branch++ {
+		if abort != nil && abort.Load() {
+			return nil
+		}
+		entry, err := table.ReadEntry(byte(branch))
+		if err != nil {
+			return err
+		}
+		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry)) {
+			continue
+		}
+		value := append(append([]byte{}, task.path...), byte(branch))
+		if entryHasTerminal(entry) {
+			key := decodeAbsoluteKey(entry)
+			if key != 0 {
+				if err := db.recordSummaryTerminal(acc, value, key); err != nil {
+					return err
+				}
+			}
+		}
+		if entryHasChild(entry) {
+			childID := entryChildID(entry)
+			if childID == 0 {
+				continue
+			}
+			pending.Add(1)
+			tasks <- pairSummaryTask{tableID: childID, path: value}
+		}
+	}
+	return nil
+}
+
+func (db *Database) recordSummaryTerminal(acc *pairSummaryAccumulator, path []byte, key uint64) error {
+	size, err := db.readValueSizeForKey(key)
+	if err != nil {
+		return err
+	}
+	acc.recordTerminal(path, key, size)
 	return nil
 }
 
@@ -864,6 +1200,18 @@ func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 	return payload, nil
 }
 
+func (db *Database) readValueSizeForKey(key uint64) (uint32, error) {
+	entry, err := db.mainKeys.ReadEntry(key)
+	if err != nil {
+		return 0, err
+	}
+	size := readValueSize(entry)
+	if size == 0 {
+		return 0, fmt.Errorf("key %d has no payload", key)
+	}
+	return size, nil
+}
+
 func normalizePairScanLimit(limit int) int {
 	switch {
 	case limit < 0:
@@ -922,6 +1270,38 @@ func formatPairReduceResponse(results []PairReduceResult, mode string, nextCurso
 		}
 		encoded := base64.StdEncoding.EncodeToString(res.Payload)
 		b.WriteString(fmt.Sprintf("%x:%d:%s", res.Value, res.Key, encoded))
+	}
+	return b.String()
+}
+
+func formatPairSummaryResponse(res *PairSummaryResult) string {
+	if res == nil {
+		return "ERROR,summary_unavailable"
+	}
+	var b strings.Builder
+	b.WriteString("SUCCESS,command=PAIR_SUMMARY")
+	b.WriteString(fmt.Sprintf(",count=%d", res.TerminalCount))
+	b.WriteString(fmt.Sprintf(",total_payload_bytes=%d", res.TotalPayloadBytes))
+	b.WriteString(fmt.Sprintf(",min_payload_bytes=%d", res.MinPayloadBytes))
+	b.WriteString(fmt.Sprintf(",max_payload_bytes=%d", res.MaxPayloadBytes))
+	if res.MinKey > 0 {
+		b.WriteString(fmt.Sprintf(",min_key=%d", res.MinKey))
+	}
+	if res.MaxKey > 0 {
+		b.WriteString(fmt.Sprintf(",max_key=%d", res.MaxKey))
+	}
+	b.WriteString(fmt.Sprintf(",max_depth=%d", res.MaxDepth))
+	b.WriteString(fmt.Sprintf(",self_terminal=%d", boolToInt(res.SelfTerminal)))
+	branchCount := len(res.Branches)
+	if branchCount > 0 {
+		parts := make([]string, 0, branchCount)
+		for i := 0; i < branchCount; i++ {
+			parts = append(parts, fmt.Sprintf("%x:%d", res.Branches[i].Path, res.Branches[i].Count))
+		}
+		b.WriteString(fmt.Sprintf(",branch_count=%d", branchCount))
+		b.WriteString(fmt.Sprintf(",branches=%s", strings.Join(parts, ";")))
+	} else {
+		b.WriteString(",branch_count=0")
 	}
 	return b.String()
 }
