@@ -72,6 +72,8 @@ from the database.
 - `PAIR_SCAN`/`PAIR_REDUCE` accept cursors and return `next_cursor=x...` when more data is available.
   The Python adapter follows these cursors automatically, so namespace walks and reducer projections
   can stream through arbitrary volumes of contexts without manual pagination.
+- For deeper backend documentation, read `cheetah-db/README.md` (architecture, commands) alongside
+  `cheetah-db/AI_REFERENCE.md` (operational checklists, cache budgets, tmux helpers).
 
 #### Example `.env` block
 
@@ -248,7 +250,8 @@ cheetah also gets an Absolute Vector Order signature (`ctxv:` namespace) so nest
 MKNS rebuilds mirror raw follower counts through the new `PAIR_REDUCE counts` RPC, so server-side
 reducers stream the context registry straight from Go and delete the last SQLite-only temporary
 tables. SQLite only keeps a scratch copy for bulk rebuilds, so there is no secondary database to
-drain—cheetah already holds the hot/archived copies in one place.
+drain—cheetah already holds the hot/archived copies in one place. For namespace triage, cache sizing
+tables, and tmux launch recipes, consult `cheetah-db/AI_REFERENCE.md`.
 
 ### Training-Time Metrics
 
