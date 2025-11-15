@@ -25,6 +25,11 @@ change so the next agent inherits the latest context.
   When in doubt: start/attach to the cheetah server first, keep `DBSLM_BACKEND=cheetah-db`, and only
   lean on SQLite when a workflow explicitly requires a transient file. The trainer now strictly exits
   if the cheetah TCP endpoint cannot be reached—there is no SQLite fallback path anymore.
+- `README.md` now reinforces this requirement: it includes a concrete `.env` block (host/port/database
+  knobs), documents the tmux helpers (`scripts/start_cheetah_server.sh`/`stop_cheetah_server.sh`),
+  and explains when `python src/train.py ... --reset` or the emergency `--backonsqlite` flag should
+  be used. Treat SQLite as a small/fast scratchpad only; all long-lived runs must keep
+  `DBSLM_BACKEND=cheetah-db`.
 - When training/decoding from inside WSL but pointing at a cheetah server running on Windows, the
   hot-path adapter auto-retries the Windows bridge IP discovered via `/etc/resolv.conf` whenever the
   configured `DBSLM_CHEETAH_HOST` resolves to loopback. Override `DBSLM_CHEETAH_HOST` with the exact

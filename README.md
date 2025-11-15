@@ -10,8 +10,9 @@ the spec end-to-end:
 
 - **Level 1 — Aria-style n-gram engine:** Byte-free (regex) tokenization backed by a relational
   vocabulary, hashed contexts, Modified Kneser–Ney smoothing, quantized log-prob tables, and a
-  Top-K materialization path for fast sampling. SQLite still persists the authoritative tables, but
-  every context/top-K slice is streamed into cheetah-db namespaces so hot reads bypass SQL entirely.
+  Top-K materialization path for fast sampling. cheetah-db now persists the canonical vocabulary and
+  probability tables; SQLite survives only as a scratch/export file for fast rebuilds while every
+  context/Top-K slice is streamed into cheetah namespaces so hot reads bypass SQL entirely.
 - **Level 2 — Episodic memory + biasing:** Conversation logging, correction digests, logit-bias
   materialization, and pointer-sentinel session caches that feed the decoder without tensors.
 - **Level 3 — Concept model:** Concept dictionaries, templates, and probability tables that can
@@ -41,32 +42,65 @@ from the database.
   source .venv/bin/activate
   pip install -r requirements.txt
   ```
-- The CLI utilities default to storing everything under `var/db_slm.sqlite3`. Feel free to point them
-  at any other SQLite path or even `:memory:` when using the programmatic API.
+- The CLI utilities still stage ingest output under `var/db_slm.sqlite3` so you can delete/reset runs
+  quickly. Treat this as a scratch file: keep `DBSLM_BACKEND=cheetah-db` for real training/decoding,
+  and only swap the SQLite path (`--db var/tmp.sqlite3`, `:memory:`, etc.) for small/fast exports.
 - `.env` now defaults `DBSLM_BACKEND=cheetah-db`, so Level 1 lookups hit the Go service out of the
   box. SQLite remains available for bulk ingest/experiments (`DBSLM_BACKEND=sqlite`), but there is no
-  longer a secondary MariaDB target to keep in sync.
+  longer a secondary relational target to keep in sync.
 
-### cheetah-db hot path (optional)
+### cheetah-db runtime (required)
 
-- `cheetah-db/` hosts the Go service that now acts as a low-latency mirror for Level 1 contexts.
-  Build it with `bash cheetah-db/build.sh` and launch `./cheetah-db/cheetah-server` before
-  running the Python tools.
+- `cheetah-db/` hosts the Go service that now acts as the sole hot path for Level 1 contexts.
+  Build it with `bash cheetah-db/build.sh` and keep `./cheetah-db/cheetah-server` running before
+  invoking any Python tooling.
 - Export `CHEETAH_HEADLESS=1` when launching the server (e.g.
   `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`)
-  to disable the interactive CLI and keep the TCP listener running in the background. Remember to
-  `screen -ls`/`screen -wipe` (or stop the Windows process) before rebuilding the binary.
-- Leave `DBSLM_BACKEND=cheetah-db` (the new default) when you want the trainer/decoder to fetch
-  Top-K slices from the Go engine. When you only need a sidecar cache (SQLite remains canonical),
-  switch the backend to `sqlite` and toggle `DBSLM_CHEETAH_MIRROR=1`.
-- The `DBSLM_CHEETAH_HOST/PORT/DATABASE` variables point the adapter at the right instance; the
-  default matches the server exposed by `cheetah-db/main.go`.
-- During ingest the Python pipeline now streams new context metadata and Top-K probability slices
-  into cheetah so the decoder can read them without re-querying SQLite, satisfying the first step of
-  the adapter roadmap outlined in `cheetah-db/README.md`.
-- `PAIR_SCAN`/`PAIR_REDUCE` now accept optional cursors and return `next_cursor=x...` when more data
-  is available. The Python adapter follows these cursors automatically, so namespace walks and
-  reducer projections can stream through arbitrary volumes of contexts without manual pagination.
+  to disable the interactive CLI and keep the TCP listener running in the background. Use the helper
+  scripts (`scripts/start_cheetah_server.sh`, `scripts/stop_cheetah_server.sh`) when you want tmux to
+  manage the process and log file rotation for you.
+- Leave `DBSLM_BACKEND=cheetah-db` (the baked-in default) so the trainer, decoder, and helpers fetch
+  everything from the Go engine. The only sanctioned downgrade is a short-lived SQLite export:
+  set `DBSLM_BACKEND=sqlite` plus `python src/train.py ... --backonsqlite` **only** when cheetah is
+  temporarily unreachable and you accept a reduced feature set.
+- The `DBSLM_CHEETAH_HOST/PORT/DATABASE/TIMEOUT_SECONDS` variables (see `.env.example`) point the
+  adapter at the right instance; the default matches the server exposed by `cheetah-db/main.go`. Use
+  a real address (127.0.0.1, LAN IP, Windows bridge IP inside WSL) rather than `0.0.0.0`.
+- During ingest the Python pipeline streams new context metadata and Top-K probability slices into
+  cheetah so the decoder can read them without re-querying SQLite, satisfying the adapter roadmap in
+  `cheetah-db/README.md`.
+- `PAIR_SCAN`/`PAIR_REDUCE` accept cursors and return `next_cursor=x...` when more data is available.
+  The Python adapter follows these cursors automatically, so namespace walks and reducer projections
+  can stream through arbitrary volumes of contexts without manual pagination.
+
+#### Example `.env` block
+
+```env
+DBSLM_BACKEND=cheetah-db
+DBSLM_SQLITE_PATH=var/db_slm.sqlite3
+DBSLM_CHEETAH_HOST=127.0.0.1
+DBSLM_CHEETAH_PORT=4455
+DBSLM_CHEETAH_TIMEOUT_SECONDS=1.0
+# Uncomment to select a named database/namespace on shared cheetah instances:
+# DBSLM_CHEETAH_DATABASE=default
+```
+
+Copy `.env.example` to `.env`, adjust the host/port/database per deployment, and commit to keeping
+`DBSLM_BACKEND=cheetah-db`. Override `DBSLM_CHEETAH_HOST` with the LAN/Windows bridge IP when the
+server runs outside WSL; the adapter auto-detects that scenario via `/etc/resolv.conf`.
+
+#### CLI + script knobs
+
+- `scripts/start_cheetah_server.sh` / `scripts/stop_cheetah_server.sh` respect `CHEETAH_SERVER_BIN`,
+  `CHEETAH_SERVER_SESSION`, and `CHEETAH_SERVER_LOG` so you can pin the binary, tmux name, and log
+  location. Example:\
+  `CHEETAH_SERVER_BIN=$PWD/cheetah-db/cheetah-server-linux CHEETAH_SERVER_SESSION=cheetah-dev scripts/start_cheetah_server.sh`
+- `scripts/run_cheetah_smoke.sh` spins up a short ingest/eval loop with cheetah as the backend; tune
+  `CHEETAH_SMOKE_DB`, `CHEETAH_SMOKE_TIMEOUT`, or `CHEETAH_SMOKE_METRICS` to redirect the scratch
+  SQLite file, timeout guard, and metrics export destination.
+- `python src/train.py ... --reset` clears the SQLite scratch file **and** purges cheetah namespaces
+  so cached Top-K slices never drift. Add `--backonsqlite` only if you accept a degraded run without
+  cheetah (e.g., CI sandboxes where the service is intentionally offline).
 
 ## Training CLI (`src/train.py`)
 
@@ -202,8 +236,8 @@ hashed guidance path is used from the start.
 
 ### cheetah Streaming Archive
 
-The cold-context flusher + MariaDB detour has been removed. Instead, the trainer streams every newly
-discovered context plus its Top-K probability slices into cheetah-db as part of the ingest loop.
+The trainer streams every newly discovered context plus its Top-K probability slices directly into
+cheetah-db as part of the ingest loop.
 `DBSLM_BACKEND=cheetah-db` keeps the decoder entirely on the Go engine, so Level 1 lookups never
 round-trip through SQLite. The adapter now tracks cache coverage
 (`DBSLMEngine.cheetah_topk_ratio()`) and exposes namespace scanners plus the new
@@ -213,8 +247,8 @@ cheetah also gets an Absolute Vector Order signature (`ctxv:` namespace) so nest
 `Decoder` now falls back to those relativistic slices whenever cheetah misses a direct Top-K entry.
 MKNS rebuilds mirror raw follower counts through the new `PAIR_REDUCE counts` RPC, so server-side
 reducers stream the context registry straight from Go and delete the last SQLite-only temporary
-tables. SQLite still persists the authoritative rows for bulk rebuilds, but there is no secondary
-database to drain—cheetah already holds the hot/archived copies in one place.
+tables. SQLite only keeps a scratch copy for bulk rebuilds, so there is no secondary database to
+drain—cheetah already holds the hot/archived copies in one place.
 
 ### Training-Time Metrics
 
@@ -367,13 +401,14 @@ Key flags:
 
 Use `make clean-smoke` to delete the per-scenario SQLite files and the `var/smoke_train` artifacts.
 
-## SQLite + cheetah Workflow
+## SQLite helpers
 
-SQLite still handles ingest/reset cycles because it is easy to ship, WAL keeps throughput high, and
-full rebuilds are a single file delete away. cheetah-db now mirrors every context and Top-K bucket,
-so once `DBSLM_BACKEND=cheetah-db` is active the decoder never touches SQLite. There is no migration
-step or MySQL target anymore—cheetah is both the hot path and the archival story. Run the Go server,
-point the env vars at it, and use helpers such as `engine.iter_hot_context_hashes()` or
+SQLite is now a convenience scratchpad: use it for fast ingest experiments, CI smoke runs, or quick
+exports where deleting the file to reset state is desirable. WAL keeps throughput high even for
+those short-lived runs, but cheetah-db mirrors every context and Top-K bucket, so once
+`DBSLM_BACKEND=cheetah-db` is active the decoder never touches SQLite. There is no migration step or
+MySQL target anymore—cheetah is both the hot path and the archival story. Run the Go server, point
+the env vars at it, and use helpers such as `engine.iter_hot_context_hashes()` or
 `engine.context_relativism(...)` when you need ordered scans or probabilistic tree walks over the
-stored contexts. When SQLite grows too large, simply reset or vacuum the file; cheetah already keeps
-the low-latency copy alive.
+stored contexts. When SQLite grows too large, simply delete/vacuum the scratch file; cheetah already
+keeps the low-latency copy alive.
