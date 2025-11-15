@@ -4,12 +4,17 @@ import argparse
 import multiprocessing
 import sys
 from pathlib import Path
+from typing import Sequence
 
 from db_slm import DBSLMEngine
 from db_slm.context_dimensions import format_context_dimensions, parse_context_dimensions_arg
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 
+from helpers.cheetah_cli import (
+    collect_namespace_summary_lines,
+    collect_system_stats_lines,
+)
 from log_helpers import log, log_verbose
 
 
@@ -59,6 +64,33 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=None,
         help="Optional limit for turns in interactive mode (default: unlimited).",
     )
+    parser.add_argument(
+        "--cheetah-summary",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "Namespace prefix to summarize via cheetah's PAIR_SUMMARY before the session starts "
+            "(e.g., 'ctx:', 'prob:2'). Repeat to request multiple summaries."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-summary-depth",
+        type=int,
+        default=1,
+        help="Relative depth for cheetah namespace summaries in run.py (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-summary-branches",
+        type=int,
+        default=32,
+        help="Maximum branch digests returned per summary (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-system-stats",
+        action="store_true",
+        help="Log cheetah SYSTEM_STATS before handling prompts.",
+    )
     return parser
 
 
@@ -90,6 +122,10 @@ class PromptWorker:
         user: str,
         agent: str,
         conversation: str | None,
+        cheetah_summary: Sequence[str],
+        cheetah_summary_depth: int,
+        cheetah_summary_branches: int,
+        cheetah_system_stats: bool,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
         self._requests = self._ctx.Queue()
@@ -107,12 +143,18 @@ class PromptWorker:
                 user,
                 agent,
                 conversation,
+                cheetah_summary,
+                cheetah_summary_depth,
+                cheetah_summary_branches,
+                cheetah_system_stats,
             ),
         )
         self._process.start()
         ready = self._responses.get()
         if ready.get("status") != "ready":
             raise RuntimeError(ready.get("error", "decoder worker failed to start"))
+        for line in ready.get("cheetah_logs") or []:
+            log(f"[run] {line}")
         self.conversation_id = ready.get("conversation_id", "")
         self.context_label = ready.get("context_dimensions")
 
@@ -180,6 +222,10 @@ def _decoder_worker(
     user: str,
     agent: str,
     conversation: str | None,
+    cheetah_summary: Sequence[str],
+    cheetah_summary_depth: int,
+    cheetah_summary_branches: int,
+    cheetah_system_stats: bool,
 ) -> None:
     engine: DBSLMEngine | None = None
     try:
@@ -196,7 +242,26 @@ def _decoder_worker(
         else:
             conv_id = engine.start_conversation(user, agent)
         dims_label = format_context_dimensions(engine.context_dimensions)
-        response_q.put({"status": "ready", "conversation_id": conv_id, "context_dimensions": dims_label})
+        cheetah_lines: list[str] = []
+        if cheetah_system_stats:
+            cheetah_lines.extend(collect_system_stats_lines(engine.hot_path))
+        if cheetah_summary:
+            cheetah_lines.extend(
+                collect_namespace_summary_lines(
+                    engine.hot_path,
+                    cheetah_summary,
+                    depth=cheetah_summary_depth,
+                    branch_limit=cheetah_summary_branches,
+                )
+            )
+        ready_payload = {
+            "status": "ready",
+            "conversation_id": conv_id,
+            "context_dimensions": dims_label,
+        }
+        if cheetah_lines:
+            ready_payload["cheetah_logs"] = cheetah_lines
+        response_q.put(ready_payload)
         while True:
             msg = request_q.get()
             if not isinstance(msg, dict):
@@ -325,6 +390,10 @@ def main() -> None:
             user=args.user,
             agent=args.agent,
             conversation=args.conversation,
+            cheetah_summary=args.cheetah_summary or [],
+            cheetah_summary_depth=args.cheetah_summary_depth,
+            cheetah_summary_branches=args.cheetah_summary_branches,
+            cheetah_system_stats=args.cheetah_system_stats,
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         log(f"[run] Using conversation: {worker.conversation_id} (context dims: {dims_label})")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Iterable, Protocol, Sequence, Tuple
 
 from ..cheetah_types import (
+    CheetahSystemStats,
+    NamespaceSummary,
     RawContinuationProjection,
     RawContextProjection,
     RawCountsProjection,
@@ -78,6 +80,18 @@ class HotPathAdapter(Protocol):
     def describe(self) -> str:
         """Return a human-readable description of the adapter for logging."""
 
+    def namespace_summary(
+        self,
+        prefix: bytes,
+        *,
+        depth: int = 1,
+        branch_limit: int = 32,
+    ) -> NamespaceSummary | None:
+        """Return aggregate stats for a namespace prefix (PAIR_SUMMARY)."""
+
+    def system_stats(self) -> CheetahSystemStats | None:
+        """Return the latest SYSTEM_STATS snapshot, when available."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -146,6 +160,18 @@ class NullHotPathAdapter:
 
     def describe(self) -> str:
         return "hot-path:disabled"
+
+    def namespace_summary(
+        self,
+        prefix: bytes,
+        *,
+        depth: int = 1,
+        branch_limit: int = 32,
+    ) -> NamespaceSummary | None:
+        return None
+
+    def system_stats(self) -> CheetahSystemStats | None:
+        return None
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

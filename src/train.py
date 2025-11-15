@@ -40,6 +40,10 @@ from db_slm.settings import DBSLMSettings, load_settings
 from db_slm.text_markers import append_end_marker
 
 from helpers.resource_monitor import ResourceMonitor
+from helpers.cheetah_cli import (
+    collect_namespace_summary_lines,
+    collect_system_stats_lines,
+)
 if TYPE_CHECKING:
     from helpers.resource_monitor import ResourceDelta, ResourceSample
 from log_helpers import log, log_verbose
@@ -199,6 +203,33 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
             "Permit a SQLite-only fallback when DBSLM_BACKEND=cheetah-db but the cheetah server is unavailable. "
             "Default behavior aborts instead of silently downgrading."
         ),
+    )
+    parser.add_argument(
+        "--cheetah-summary",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "Namespace prefix to summarize via cheetah's PAIR_SUMMARY command (e.g., 'ctx:', 'prob:2'). "
+            "Repeat to capture multiple namespaces. Prefixes starting with 'x' are interpreted as hex."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-summary-depth",
+        type=int,
+        default=1,
+        help="Relative depth for cheetah namespace summaries (default: %(default)s, use -1 for unlimited).",
+    )
+    parser.add_argument(
+        "--cheetah-summary-branches",
+        type=int,
+        default=32,
+        help="Maximum number of branch digests returned per cheetah summary (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-system-stats",
+        action="store_true",
+        help="Log cheetah SYSTEM_STATS before training (CPU/memory hints plus recommended workers).",
     )
     return parser
 
@@ -431,6 +462,23 @@ def reset_cheetah_store(settings: DBSLMSettings) -> None:
             log(f"[train] cheetah reset: removed {total_removed} cached mapping(s) total.")
     finally:
         client.close()
+
+
+def _emit_cheetah_reports(engine: DBSLMEngine, args: argparse.Namespace) -> None:
+    if getattr(args, "cheetah_system_stats", False):
+        for line in collect_system_stats_lines(engine.hot_path):
+            log(f"[train] {line}")
+    prefixes = getattr(args, "cheetah_summary", []) or []
+    if prefixes:
+        depth = getattr(args, "cheetah_summary_depth", 1)
+        branch_limit = getattr(args, "cheetah_summary_branches", 32)
+        for line in collect_namespace_summary_lines(
+            engine.hot_path,
+            prefixes,
+            depth=depth,
+            branch_limit=branch_limit,
+        ):
+            log(f"[train] {line}")
 
 
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
@@ -1071,6 +1119,7 @@ def main() -> None:
     log(f"[train] Context dimensions: {dims_label}")
     if run_metadata is not None:
         run_metadata["context_dimensions"] = dims_label
+    _emit_cheetah_reports(engine, args)
     if args.eval_variants is not None:
         if args.eval_variants < 1:
             parser.error("--eval-variants must be >= 1")

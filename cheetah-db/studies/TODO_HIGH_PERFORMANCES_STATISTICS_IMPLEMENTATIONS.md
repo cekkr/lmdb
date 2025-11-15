@@ -68,11 +68,7 @@
 2. **Namespace summary commands.** ✅ `PAIR_SUMMARY <prefix> [depth] [branch_limit]` now streams aggregate counts, payload byte totals, and branch fan-out digests without hydrating every payload. Follow-up: add optional rolling hashes / Top-K digests alongside the structural stats.
 3. **Optional reducer digests.** Allow `PAIR_REDUCE` to return compact statistics (entropy, CDF bins, hash windows) alongside or instead of raw payloads to accelerate Python-side analytics.
 4. **Rolling hash / similarity mirrors.** Provide trie-level rolling hash metadata (per namespace and per depth) so fuzzy lookups and substring similarity heuristics have fast, server-side entry points.
-5. **Python ergonomics.** Add wrappers for `SYSTEM_STATS`, namespace summaries, cache hit telemetry, and context relativism helpers in `src/db_slm/adapters/cheetah.py` so analytics jobs can introspect cheetah without reaching into private methods.
+5. **Python ergonomics.** ✅ Python CLI tools (`train.py`, `run.py`) now expose `--cheetah-system-stats` and `--cheetah-summary` hooks backed by adapter helpers, so analytics jobs can consume the new commands without bespoke socket calls.
 6. **Shared canonical vector helpers.** Publish a tiny library (Go or Python wheel) containing `AbsoluteVectorOrder` encoders/decoders for reuse in other projects or languages.
 7. **Binary/stateless protocol option.** Evaluate a Protobuf or msgpack framing to reduce base64 overhead for high-volume `PAIR_REDUCE` consumers (statistical crawlers, background jobs).
 8. **JSON/stat-typed responses.** Offer an opt-in JSON encoder for reducers so programs that do not embed the DB-SLM serializer can still decode counts/probabilities/continuations cheaply.
-2. **Shared canonical vector helpers.** Publish a tiny library (Go or Python wheel) containing `AbsoluteVectorOrder` encoders/decoders for reuse in other projects or languages.
-3. **Binary/stateless protocol option.** Evaluate a Protobuf or msgpack framing to reduce base64 overhead for high-volume `PAIR_REDUCE` consumers (statistical crawlers, background jobs).
-4. **JSON/stat-typed responses.** Offer an opt-in JSON encoder for reducers so programs that do not embed the DB-SLM serializer can still decode counts/probabilities/continuations cheaply.
-5. **Python ergonomics.** Add wrappers for `SYSTEM_STATS`, cache hit rate telemetry, and context relativism helpers in `src/db_slm/adapters/cheetah.py` so analytics jobs can introspect cheetah without reaching into private methods.

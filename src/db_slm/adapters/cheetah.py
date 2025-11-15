@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from ..cheetah_types import (
+    CheetahSystemStats,
+    NamespaceSummary,
     RawContinuationProjection,
     RawContextProjection,
     RawCountsProjection,
@@ -252,6 +254,30 @@ class CheetahClient:
                 break
         return removed, response
 
+    def pair_summary(
+        self,
+        prefix: bytes,
+        *,
+        depth: int = 1,
+        branch_limit: int = 32,
+    ) -> NamespaceSummary | None:
+        arg = "*" if not prefix else f"x{prefix.hex()}"
+        command = f"PAIR_SUMMARY {arg}"
+        if depth is not None:
+            command = f"{command} {depth}"
+        if branch_limit is not None:
+            command = f"{command} {branch_limit}"
+        response = self._command(command)
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_pair_summary_response(prefix, response)
+
+    def system_stats(self) -> CheetahSystemStats | None:
+        response = self._command("SYSTEM_STATS")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_system_stats_response(response)
+
     def reset_database(self, name: str | None = None) -> tuple[bool, str | None]:
         target = (name or self.database or "default").strip() or "default"
         response = self._command(f"RESET_DB {target}")
@@ -461,6 +487,133 @@ class CheetahClient:
                     except ValueError:
                         return None
         return None
+
+    @staticmethod
+    def _parse_pair_summary_response(prefix: bytes, response: str) -> NamespaceSummary | None:
+        fields = CheetahClient._split_response_fields(response)
+        if not fields:
+            return None
+        terminal_count = CheetahClient._parse_int(fields.get("count"), default=0)
+        total_payload = CheetahClient._parse_int(fields.get("total_payload_bytes"), default=0)
+        min_payload = CheetahClient._parse_int(fields.get("min_payload_bytes"), default=0)
+        max_payload = CheetahClient._parse_int(fields.get("max_payload_bytes"), default=0)
+        max_depth = CheetahClient._parse_int(fields.get("max_depth"), default=0)
+        min_key = CheetahClient._parse_optional_int(fields.get("min_key"))
+        max_key = CheetahClient._parse_optional_int(fields.get("max_key"))
+        self_terminal = CheetahClient._parse_bool(fields.get("self_terminal"))
+        branches: list[tuple[bytes, int]] = []
+        raw_branches = fields.get("branches")
+        if raw_branches:
+            for chunk in raw_branches.split(";"):
+                if not chunk:
+                    continue
+                try:
+                    path_hex, count_text = chunk.split(":", 1)
+                except ValueError:
+                    continue
+                try:
+                    branch_bytes = bytes.fromhex(path_hex)
+                except ValueError:
+                    branch_bytes = path_hex.encode("utf-8", errors="ignore")
+                branches.append(
+                    (branch_bytes, CheetahClient._parse_int(count_text, default=0))
+                )
+        return NamespaceSummary(
+            prefix=prefix,
+            terminal_count=terminal_count,
+            total_payload_bytes=total_payload,
+            min_payload_bytes=min_payload,
+            max_payload_bytes=max_payload,
+            min_key=min_key,
+            max_key=max_key,
+            max_depth=max_depth,
+            self_terminal=self_terminal,
+            branches=tuple(branches),
+        )
+
+    @staticmethod
+    def _parse_system_stats_response(response: str) -> CheetahSystemStats | None:
+        fields = CheetahClient._split_response_fields(response)
+        if not fields:
+            return None
+        raw_hints = fields.get("recommended_workers", "")
+        recommended: list[tuple[int, int]] = []
+        if raw_hints:
+            for item in raw_hints.split(";"):
+                if not item:
+                    continue
+                try:
+                    pending_text, worker_text = item.split(":", 1)
+                    recommended.append((int(pending_text), int(worker_text)))
+                except ValueError:
+                    continue
+        return CheetahSystemStats(
+            logical_cores=CheetahClient._parse_int(fields.get("logical_cores"), default=0),
+            gomaxprocs=CheetahClient._parse_int(fields.get("gomaxprocs"), default=0),
+            goroutines=CheetahClient._parse_int(fields.get("goroutines"), default=0),
+            mem_alloc_bytes=CheetahClient._parse_int(fields.get("mem_alloc_bytes"), default=0),
+            mem_sys_bytes=CheetahClient._parse_int(fields.get("mem_sys_bytes"), default=0),
+            process_cpu_pct=CheetahClient._parse_float(fields.get("process_cpu_pct")),
+            system_cpu_pct=CheetahClient._parse_float(fields.get("system_cpu_pct")),
+            process_cpu_supported=CheetahClient._parse_bool(
+                fields.get("process_cpu_supported")
+            ),
+            system_cpu_supported=CheetahClient._parse_bool(
+                fields.get("system_cpu_supported")
+            ),
+            io_supported=CheetahClient._parse_bool(fields.get("io_supported")),
+            io_read_bytes_per_sec=CheetahClient._parse_float(
+                fields.get("io_read_bytes_per_sec")
+            ),
+            io_write_bytes_per_sec=CheetahClient._parse_float(
+                fields.get("io_write_bytes_per_sec")
+            ),
+            timestamp=fields.get("timestamp"),
+            recommended_workers=tuple(recommended),
+        )
+
+    @staticmethod
+    def _split_response_fields(response: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for part in response.split(","):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            fields[key.strip()] = value.strip()
+        return fields
+
+    @staticmethod
+    def _parse_int(raw: str | None, *, default: int = 0) -> int:
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw, 10)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _parse_optional_int(raw: str | None) -> int | None:
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw, 10)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_float(raw: str | None) -> float | None:
+        if raw is None or raw.strip().upper() == "NA" or raw == "":
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_bool(raw: str | None) -> bool:
+        if raw is None:
+            return False
+        return raw.strip().lower() in {"1", "true", "yes"}
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1321,30 @@ class CheetahHotPathAdapter(HotPathAdapter):
 
     def describe(self) -> str:
         return self._description
+
+    def namespace_summary(
+        self,
+        prefix: bytes,
+        *,
+        depth: int = 1,
+        branch_limit: int = 32,
+    ) -> NamespaceSummary | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.pair_summary(prefix, depth=depth, branch_limit=branch_limit)
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def system_stats(self) -> CheetahSystemStats | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.system_stats()
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
 
     # ------------------------------------------------------------------ #
     # Internal helpers

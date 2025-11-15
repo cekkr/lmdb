@@ -1,6 +1,7 @@
 # Cheetah Reference
 
 Cheetah-specific directives and operational notes live here. Refer back to this file whenever you work with `cheetah-db`.
+Read and collect potential implementation to do in NEXT_STEPS.md
 
 - **Cheetah-db is now the authoritative database.** Every ingest run, decoder lookup, and evaluation
   must assume cheetah is the primary store for counts/probabilities/context metadata. SQLite survives
