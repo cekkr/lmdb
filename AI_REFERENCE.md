@@ -52,6 +52,7 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   the trainer is spending time.
 - Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the tmux helpers are detailed inside `cheetah-db/AI_REFERENCE.md`.
 - Realtime resource telemetry now flows through `src/helpers/resource_monitor.py`: during ingest profiles and every evaluation probe we record CPU %, RSS deltas, thread counts, and disk I/O (leveraging psutil with `resource` fallbacks) and push those samples both to the console and to the metrics export JSON.
+- `CheetahHotPathAdapter` now spins up a dedicated cheetah-db TCP client per thread (with a shared factory + warm connection) so ingest, evaluation, and background workers can exercise true multi-core concurrency without funneling through a single socket; custom clients can still be injected for tests, but the default path uses the thread-local pool.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and context keyword tokens so Level 1 learns efficient splits in
   real time. Dataset metadata is now declared via `datasets/<name>.config.json`, which lets the

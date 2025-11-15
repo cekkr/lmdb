@@ -12,7 +12,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from ..cheetah_types import (
     RawContinuationProjection,
@@ -619,17 +619,88 @@ class CheetahSerializer:
         return ContinuationPayload(token_id=token_id, num_contexts=num_contexts)
 
 
+class _ThreadLocalCheetahClientPool:
+    """Creates or reuses one cheetah-db client per thread."""
+
+    def __init__(
+        self,
+        factory: Callable[[], CheetahClient],
+        *,
+        warm_client: CheetahClient | None = None,
+        description: str | None = None,
+    ) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: list[CheetahClient] = []
+        self._description = description
+        if warm_client is not None:
+            self._local.client = warm_client
+            self._register_client(warm_client)
+
+    def acquire(self) -> CheetahClient:
+        client = getattr(self._local, "client", None)
+        if client is not None:
+            return client
+        client = self._factory()
+        connect_fn = getattr(client, "connect", None)
+        if callable(connect_fn):
+            connected = connect_fn()
+            if not connected:
+                target = getattr(client, "describe_targets", lambda: "<unknown>")()
+                raise CheetahError(f"cheetah hot-path connection failed ({target})")
+        self._local.client = client
+        self._register_client(client)
+        return client
+
+    def describe(self) -> str:
+        if self._description:
+            return self._description
+        with self._lock:
+            if self._clients:
+                client = self._clients[0]
+                return f"cheetah-db://{client.host}:{client.port}/{client.database}"
+        return "<unknown>"
+
+    def close_all(self) -> None:
+        with self._lock:
+            clients = list(self._clients)
+            self._clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                continue
+
+    def _register_client(self, client: CheetahClient) -> None:
+        with self._lock:
+            self._clients.append(client)
+            if not self._description:
+                self._description = f"cheetah-db://{client.host}:{client.port}/{client.database}"
+
+
 class CheetahHotPathAdapter(HotPathAdapter):
     """Mirrors context metadata + Top-K slices into cheetah-db for low-latency reads."""
 
     def __init__(
         self,
-        client: CheetahClient,
+        client: CheetahClient | None = None,
         *,
+        client_factory: Callable[[], CheetahClient] | None = None,
         cache_size: int = 50000,
         serializer: CheetahSerializer | None = None,
+        description: str | None = None,
     ) -> None:
-        self._client = client
+        if client_factory is None and client is None:
+            raise ValueError("Provide either client or client_factory.")
+        if client_factory is None and client is not None:
+            client_factory = lambda: client
+        assert client_factory is not None
+        self._client_pool = _ThreadLocalCheetahClientPool(
+            client_factory,
+            warm_client=client,
+            description=description,
+        )
         self._serializer = serializer or CheetahSerializer()
         self._vector_order = AbsoluteVectorOrder()
         self._key_cache: "OrderedDict[tuple[str, str], int]" = OrderedDict()
@@ -637,9 +708,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._enabled = True
         self._topk_total = 0
         self._topk_hits = 0
-        self._description = (
-            f"cheetah-db://{self._client.host}:{self._client.port}/{self._client.database}"
-        )
+        self._description = self._client_pool.describe()
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -1197,6 +1266,11 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if self._enabled:
             logger.warning("Disabling cheetah hot-path adapter: %s", exc)
             self._enabled = False
+            self._client_pool.close_all()
+
+    @property
+    def _client(self) -> CheetahClient:
+        return self._client_pool.acquire()
 
 
 def build_cheetah_adapter(
@@ -1207,21 +1281,40 @@ def build_cheetah_adapter(
     backend_active = settings.backend == "cheetah-db" or settings.cheetah_mirror
     if not backend_active:
         return NullHotPathAdapter()
-    client = client or CheetahClient(
-        settings.cheetah_host,
-        settings.cheetah_port,
-        database=settings.cheetah_database,
-        timeout=settings.cheetah_timeout_seconds,
+    description = (
+        f"cheetah-db://{settings.cheetah_host}:{settings.cheetah_port}/{settings.cheetah_database}"
     )
-    adapter = CheetahHotPathAdapter(client)
-    if not client.connect():
+    if client is not None:
+        if not client.connect():
+            logger.warning(
+                "cheetah hot-path backend unreachable (tried %s; last error: %s)",
+                client.describe_targets(),
+                client.describe_failures(),
+            )
+            raise SystemExit(1)
+        return CheetahHotPathAdapter(client, description=description)
+
+    def client_factory() -> CheetahClient:
+        return CheetahClient(
+            settings.cheetah_host,
+            settings.cheetah_port,
+            database=settings.cheetah_database,
+            timeout=settings.cheetah_timeout_seconds,
+        )
+
+    warm_client = client_factory()
+    if not warm_client.connect():
         logger.warning(
             "cheetah hot-path backend unreachable (tried %s; last error: %s)",
-            client.describe_targets(),
-            client.describe_failures(),
-        )  # there was: falling back to SQLite-only mode
-        raise SystemExit(1)  # now exit if cheetah not found
-    return adapter
+            warm_client.describe_targets(),
+            warm_client.describe_failures(),
+        )
+        raise SystemExit(1)
+    return CheetahHotPathAdapter(
+        warm_client,
+        client_factory=client_factory,
+        description=description,
+    )
 
 
 __all__ = [
