@@ -18,6 +18,7 @@ import (
 )
 
 type Database struct {
+	name            string
 	path            string
 	highestKey      atomic.Uint64
 	nextPairTableID atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
@@ -109,7 +110,7 @@ func clearEntryTerminal(entry []byte) {
 	}
 }
 
-func NewDatabase(path string, monitor *ResourceMonitor) (*Database, error) {
+func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
 	}
@@ -125,6 +126,7 @@ func NewDatabase(path string, monitor *ResourceMonitor) (*Database, error) {
 	}
 
 	db := &Database{
+		name:           name,
 		path:           path,
 		pairDir:        pairDir,
 		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
@@ -146,6 +148,7 @@ func NewDatabase(path string, monitor *ResourceMonitor) (*Database, error) {
 }
 
 func (db *Database) Path() string { return db.path }
+func (db *Database) Name() string { return db.name }
 
 // Close chiude tutte le tabelle aperte per questo database.
 func (db *Database) Close() error {
@@ -158,6 +161,12 @@ func (db *Database) Close() error {
 		return true
 	})
 	db.recycleTables.Range(func(key, value interface{}) bool {
+		if table, ok := value.(interface{ Close() }); ok {
+			table.Close()
+		}
+		return true
+	})
+	db.pairTables.Range(func(key, value interface{}) bool {
 		if table, ok := value.(interface{ Close() }); ok {
 			table.Close()
 		}

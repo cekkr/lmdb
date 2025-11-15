@@ -86,6 +86,10 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   trainer’s `--reset` flag issues `PAIR_PURGE` for the hot namespaces (ctx/ctxv/topk/cnt/prob/cont/meta)
   so caches are cleared in seconds. If a deploy is still running an older cheetah binary, the
   trainer automatically falls back to the legacy `PAIR_SCAN` + `DELETE` loop.
+- `RESET_DB [name]` removes every file under `cheetah_data/<name>` and reopens the database in-place.
+  `src/train.py --reset` now tries `RESET_DB <DBSLM_CHEETAH_DATABASE>` first so whole-database nukes
+  finish instantly; when the command is missing (older servers) it logs a downgrade note and returns
+  to the namespace purge logic described above.
 - `Makefile` now shells into `scripts/smoke_train.py`, which can iterate arbitrary scenario matrices,
   stream live metrics, and hand each scenario a dedicated SQLite + `DBSLM_CHEETAH_DATABASE`
   namespace so cheetah sessions can be paused and restarted independently.

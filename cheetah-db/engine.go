@@ -35,7 +35,7 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 	}
 
 	dbPath := filepath.Join(e.basePath, name)
-	db, err := NewDatabase(dbPath, e.monitor)
+	db, err := NewDatabase(name, dbPath, e.monitor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load database %s: %w", name, err)
 	}
@@ -43,6 +43,24 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 	e.databases[name] = db
 	logInfof("Loaded database: %s", name)
 	return db, nil
+}
+
+func (e *Engine) ResetDatabase(name string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if db, exists := e.databases[name]; exists {
+		if err := db.Close(); err != nil {
+			logErrorf("Failed to close database %s during reset: %v", name, err)
+		}
+		delete(e.databases, name)
+	}
+	dbPath := filepath.Join(e.basePath, name)
+	if err := os.RemoveAll(dbPath); err != nil {
+		return fmt.Errorf("failed to reset database %s: %w", name, err)
+	}
+	logInfof("Reset database: %s", name)
+	return nil
 }
 
 // Close chiude tutti i database gestiti dall'engine.

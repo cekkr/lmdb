@@ -99,6 +99,7 @@ EDIT:<size> <abs_key> <payload> # overwrite payload in-place
 PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
 PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors supported)
 PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
+RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
 RECYCLE <value_size>            # report recycle stats per table
 SYSTEM_STATS                    # snapshot of CPU/IO usage + concurrency hints
@@ -176,6 +177,9 @@ SUCCESS,key=1_deleted
   payload keys inside Go. Use `PAIR_PURGE ctx:` (or `*` to nuke the entire trie) when you need a hot
   reset before an ingest run—each batch clears up to 4096 entries so the purge finishes in seconds
   instead of hours of TCP round-trips.
+- `RESET_DB [name]` closes the target database, deletes `cheetah_data/<name>` on disk, and reopens it
+  empty so hot-path clients can wipe everything (pairs, value tables, metadata) with a single command.
+  Omitting the name resets whichever database is currently selected on the connection/CLI prompt.
 - `SYSTEM_STATS` is a cheap heartbeat: call it between ingest/reduce loops to track CPU, memory, and
   fd counts without spawning `top`. Because `database.go` formats it in CSV-like key/value pairs, it
   can be parsed by shell scripts (`awk -F,`) or structured log scrapers.

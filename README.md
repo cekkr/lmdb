@@ -100,9 +100,9 @@ server runs outside WSL; the adapter auto-detects that scenario via `/etc/resolv
 - `scripts/run_cheetah_smoke.sh` spins up a short ingest/eval loop with cheetah as the backend; tune
   `CHEETAH_SMOKE_DB`, `CHEETAH_SMOKE_TIMEOUT`, or `CHEETAH_SMOKE_METRICS` to redirect the scratch
   SQLite file, timeout guard, and metrics export destination.
-- `python src/train.py ... --reset` clears the SQLite scratch file **and** purges cheetah namespaces
-  via the server-side `PAIR_PURGE` command (falling back to incremental scans when running against
-  older binaries) so cached payloads disappear in seconds.
+- `python src/train.py ... --reset` clears the SQLite scratch file **and** purges cheetah namespaces.
+  The trainer now attempts `RESET_DB <DBSLM_CHEETAH_DATABASE>` first (instant file deletion), then
+  falls back to `PAIR_PURGE` or the incremental scanner when connecting to older cheetah binaries.
   so cached Top-K slices never drift. Add `--backonsqlite` only if you accept a degraded run without
   cheetah (e.g., CI sandboxes where the service is intentionally offline).
 

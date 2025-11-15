@@ -77,9 +77,14 @@ func runCLI(engine *Engine) {
 		}
 
 		var response string
-		// Logica per cambiare DB nella CLI
 		parts := strings.SplitN(line, " ", 2)
-		if strings.ToUpper(parts[0]) == "DATABASE" && len(parts) > 1 {
+		command := strings.ToUpper(parts[0])
+		switch command {
+		case "DATABASE":
+			if len(parts) < 2 {
+				response = "ERROR,missing_database_name"
+				break
+			}
 			dbName := strings.TrimSpace(parts[1])
 			newDB, err := engine.GetDatabase(dbName)
 			if err != nil {
@@ -88,8 +93,23 @@ func runCLI(engine *Engine) {
 				currentDB = newDB
 				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", dbName)
 			}
-		} else {
-			// Esegue tutti gli altri comandi sul DB corrente
+		case "RESET_DB":
+			target := currentDB.Name()
+			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+				target = strings.TrimSpace(parts[1])
+			}
+			if err := engine.ResetDatabase(target); err != nil {
+				response = fmt.Sprintf("ERROR,cannot_reset_db:%v", err)
+				break
+			}
+			newDB, err := engine.GetDatabase(target)
+			if err != nil {
+				response = fmt.Sprintf("ERROR,cannot_load_db:%v", err)
+			} else {
+				currentDB = newDB
+				response = fmt.Sprintf("SUCCESS,database_reset_to_%s", target)
+			}
+		default:
 			response, err = currentDB.ExecuteCommand(line)
 			if err != nil {
 				response = fmt.Sprintf("ERROR,internal_error:%v", err)

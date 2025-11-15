@@ -383,6 +383,19 @@ def reset_cheetah_store(settings: DBSLMSettings) -> None:
         )
         return
     try:
+        db_name = settings.cheetah_database or "default"
+        reset_success, reset_response = client.reset_database(db_name)
+        if reset_success:
+            log(f"[train] cheetah reset: RESET_DB cleared database '{db_name}'.")
+            return
+        if reset_response and "unknown_command" in reset_response.lower():
+            log(
+                "[train] cheetah reset: RESET_DB unsupported on the connected server; "
+                "falling back to namespace purge."
+            )
+        else:
+            detail = reset_response or "no response from server"
+            log(f"[train] Warning: RESET_DB '{db_name}' failed ({detail}); falling back to namespace purge.")
         total_removed = 0
         fast_disabled = False
         fast_notice_logged = False

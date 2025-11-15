@@ -252,6 +252,11 @@ class CheetahClient:
                 break
         return removed, response
 
+    def reset_database(self, name: str | None = None) -> tuple[bool, str | None]:
+        target = (name or self.database or "default").strip() or "default"
+        response = self._command(f"RESET_DB {target}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
     # ------------------------------------------------------------------ #
     # Low-level protocol management
     # ------------------------------------------------------------------ #
