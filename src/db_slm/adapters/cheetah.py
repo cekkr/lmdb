@@ -109,12 +109,16 @@ class CheetahClient:
         *,
         database: str = "default",
         timeout: float = 1.0,
+        idle_grace: float | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.database = database
         self.timeout = timeout
-        self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
+        if idle_grace is not None and idle_grace > 0:
+            self._readline_idle_grace = idle_grace
+        else:
+            self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
         self._host_candidates = self._build_host_candidates(host)
         self._active_host: str | None = None
         self._last_errors: list[str] = []
@@ -126,6 +130,11 @@ class CheetahClient:
     # ------------------------------------------------------------------ #
     def healthy(self) -> bool:
         return self._sock is not None
+
+    def set_idle_grace(self, seconds: float) -> None:
+        """Override the inactivity grace period used while reading responses."""
+        if seconds > 0:
+            self._readline_idle_grace = seconds
 
     def describe_targets(self) -> str:
         if not self._host_candidates:

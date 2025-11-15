@@ -224,6 +224,51 @@ _CHEETAH_PURGE_PREFIXES: tuple[bytes, ...] = (
     b"cont:",
     b"meta:",
 )
+_CHEETAH_PURGE_MIN_PAGE_SIZE = 64
+_CHEETAH_PURGE_MAX_SCAN_FAILURES = 3
+_CHEETAH_PURGE_RETRY_DELAY = 0.05
+
+
+def _retry_cheetah_delete(
+    client: CheetahClient,
+    key: int,
+    *,
+    attempts: int = 3,
+) -> tuple[bool, str | None]:
+    """Retry cheetah DELETE operations to absorb transient timeouts."""
+    last_response: str | None = None
+    for attempt in range(attempts):
+        success, response = client.delete(key)
+        last_response = response
+        if success:
+            return True, response
+        if response:
+            normalized = response.lower()
+            if "already_deleted" in normalized or "not_found" in normalized:
+                return True, response
+        if attempt < attempts - 1:
+            time.sleep(_CHEETAH_PURGE_RETRY_DELAY * (attempt + 1))
+    return False, last_response
+
+
+def _retry_cheetah_pair_del(
+    client: CheetahClient,
+    raw_value: bytes,
+    *,
+    attempts: int = 3,
+) -> tuple[bool, str | None]:
+    """Retry cheetah PAIR_DEL operations with transient error handling."""
+    last_response: str | None = None
+    for attempt in range(attempts):
+        success, response = client.pair_del(raw_value)
+        last_response = response
+        if success:
+            return True, response
+        if response and "not_found" in response.lower():
+            return True, response
+        if attempt < attempts - 1:
+            time.sleep(_CHEETAH_PURGE_RETRY_DELAY * (attempt + 1))
+    return False, last_response
 
 
 def _purge_cheetah_namespace(
@@ -242,18 +287,36 @@ def _purge_cheetah_namespace(
     cursor: bytes | None = None
     started = time.monotonic()
     progress_interval = max(page_size * 5, 5000)
+    current_page_size = max(page_size, _CHEETAH_PURGE_MIN_PAGE_SIZE)
+    scan_failures = 0
+    shrink_logged = False
     while True:
-        result = client.pair_scan(prefix=prefix, limit=page_size, cursor=cursor)
+        result = client.pair_scan(prefix=prefix, limit=current_page_size, cursor=cursor)
         if result is None:
+            scan_failures += 1
+            if current_page_size > _CHEETAH_PURGE_MIN_PAGE_SIZE:
+                current_page_size = max(_CHEETAH_PURGE_MIN_PAGE_SIZE, current_page_size // 2)
+                if not shrink_logged:
+                    log(
+                        f"[train] cheetah reset: reducing scan page size for "
+                        f"'{namespace_label}' to {current_page_size} after a timeout."
+                    )
+                    shrink_logged = True
+                continue
+            if scan_failures < _CHEETAH_PURGE_MAX_SCAN_FAILURES:
+                time.sleep(_CHEETAH_PURGE_RETRY_DELAY)
+                continue
             if not scan_warned:
                 log(f"[train] Warning: cheetah reset aborted while scanning '{namespace_label}'.")
                 scan_warned = True
             break
+        scan_failures = 0
+        shrink_logged = False
         entries, cursor = result
         if not entries:
             break
         for raw_value, key in entries:
-            deleted, response = client.delete(key)
+            deleted, response = _retry_cheetah_delete(client, key)
             if not deleted:
                 if not delete_warned:
                     log(
@@ -262,7 +325,7 @@ def _purge_cheetah_namespace(
                     delete_warned = True
                 continue
             removed += 1
-            success, response = client.pair_del(raw_value)
+            success, response = _retry_cheetah_pair_del(client, raw_value)
             if not success and not pair_warned:
                 identifier = raw_value.hex()
                 log(
@@ -293,6 +356,7 @@ def reset_cheetah_store(settings: DBSLMSettings) -> None:
         settings.cheetah_port,
         database=settings.cheetah_database,
         timeout=settings.cheetah_timeout_seconds,
+        idle_grace=max(settings.cheetah_timeout_seconds * 180.0, 60.0),
     )
     if not client.connect():
         log(

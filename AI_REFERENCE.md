@@ -20,6 +20,8 @@ change so the next agent inherits the latest context.
 
 Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REFERENCE.md`. Read that file before launching the Go service, touching cheetah namespaces, or editing env vars such as `DBSLM_CHEETAH_*`.
 
+- Trainer `--reset` now shrinks the cheetah namespace scan page size whenever `PAIR_SCAN` stalls and bumps the TCP idle-grace window to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)` seconds. Fresh databases therefore stop flooding the console with `cheetah response timed out after 30.0s of inactivity`, and slow disks can be accommodated by simply raising `DBSLM_CHEETAH_TIMEOUT_SECONDS`.
+
 ## Codebase State
 
 - `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
