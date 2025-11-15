@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from ..cheetah_types import (
+    CHEETAH_DEFAULT_REDUCE_PAGE_SIZE,
+    CHEETAH_PAIR_SCAN_MAX_LIMIT,
+    CHEETAH_PAIR_SCAN_MIN_LIMIT,
     CheetahSystemStats,
     NamespaceSummary,
     RawContinuationProjection,
@@ -30,8 +33,11 @@ from .base import HotPathAdapter, NullHotPathAdapter
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REDUCE_PAGE_SIZE = 1024
+DEFAULT_REDUCE_PAGE_SIZE = CHEETAH_DEFAULT_REDUCE_PAGE_SIZE
+PAIR_SCAN_MAX_LIMIT = CHEETAH_PAIR_SCAN_MAX_LIMIT
+PAIR_SCAN_MIN_LIMIT = CHEETAH_PAIR_SCAN_MIN_LIMIT
 READLINE_IDLE_GRACE_SECONDS = 30.0
+_REDUCE_LIMIT_CACHE_TTL_SECONDS = 30.0
 
 
 def _detect_wsl() -> bool:
@@ -570,6 +576,34 @@ class CheetahClient:
             ),
             timestamp=fields.get("timestamp"),
             recommended_workers=tuple(recommended),
+            payload_cache_enabled=CheetahClient._parse_bool(
+                fields.get("payload_cache_enabled")
+            ),
+            payload_cache_entries=CheetahClient._parse_int(
+                fields.get("payload_cache_entries"), default=0
+            ),
+            payload_cache_max_entries=CheetahClient._parse_int(
+                fields.get("payload_cache_max_entries"), default=0
+            ),
+            payload_cache_bytes=CheetahClient._parse_int(
+                fields.get("payload_cache_bytes"), default=0
+            ),
+            payload_cache_max_bytes=CheetahClient._parse_int(
+                fields.get("payload_cache_max_bytes"), default=0
+            ),
+            payload_cache_hits=CheetahClient._parse_int(fields.get("payload_cache_hits"), default=0),
+            payload_cache_misses=CheetahClient._parse_int(
+                fields.get("payload_cache_misses"), default=0
+            ),
+            payload_cache_evictions=CheetahClient._parse_int(
+                fields.get("payload_cache_evictions"), default=0
+            ),
+            payload_cache_hit_pct=CheetahClient._parse_float(
+                fields.get("payload_cache_hit_pct")
+            ),
+            payload_cache_advisory_bypass_bytes=CheetahClient._parse_optional_int(
+                fields.get("payload_cache_advisory_bypass_bytes")
+            ),
         )
 
     @staticmethod
@@ -898,6 +932,8 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._topk_total = 0
         self._topk_hits = 0
         self._description = self._client_pool.describe()
+        self._reduce_page_limit = DEFAULT_REDUCE_PAGE_SIZE
+        self._reduce_page_limit_deadline = 0.0
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -1142,11 +1178,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
         projections: list[RawCountsProjection] = []
         namespace_bytes = namespace.encode("utf-8") + b":"
         cursor: bytes | None = None
+        page_limit = self._recommended_reduce_page_size()
         while True:
             result = self._client.pair_reduce(
                 "counts",
                 namespace_bytes,
-                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                limit=page_limit,
                 cursor=cursor,
             )
             if result is None:
@@ -1191,11 +1228,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace_bytes = namespace.encode("utf-8") + b":"
         projections: list[RawProbabilityProjection] = []
         cursor: bytes | None = None
+        page_limit = self._recommended_reduce_page_size()
         while True:
             result = self._client.pair_reduce(
                 "probabilities",
                 namespace_bytes,
-                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                limit=page_limit,
                 cursor=cursor,
             )
             if result is None:
@@ -1238,11 +1276,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace_bytes = namespace.encode("utf-8") + b":"
         projections: list[RawContinuationProjection] = []
         cursor: bytes | None = None
+        page_limit = self._recommended_reduce_page_size()
         while True:
             result = self._client.pair_reduce(
                 "continuations",
                 namespace_bytes,
-                limit=DEFAULT_REDUCE_PAGE_SIZE,
+                limit=page_limit,
                 cursor=cursor,
             )
             if result is None:
@@ -1429,6 +1468,21 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._key_cache.move_to_end(cache_key)
         if len(self._key_cache) > self._cache_size:
             self._key_cache.popitem(last=False)
+
+    def _recommended_reduce_page_size(self) -> int:
+        now = time.monotonic()
+        if now < self._reduce_page_limit_deadline:
+            return self._reduce_page_limit
+        limit = DEFAULT_REDUCE_PAGE_SIZE
+        stats = self.system_stats()
+        if stats is not None:
+            derived = stats.derive_reduce_page_limit()
+            if derived is not None:
+                limit = derived
+        limit = max(PAIR_SCAN_MIN_LIMIT, min(PAIR_SCAN_MAX_LIMIT, limit))
+        self._reduce_page_limit = limit
+        self._reduce_page_limit_deadline = now + _REDUCE_LIMIT_CACHE_TTL_SECONDS
+        return limit
 
     def _cache_key(
         self,

@@ -31,6 +31,22 @@ type payloadCache struct {
 	order    *list.List
 	entries  map[payloadCacheKey]*list.Element
 	curBytes int64
+
+	hits      uint64
+	misses    uint64
+	evictions uint64
+}
+
+type payloadCacheStats struct {
+	Entries               int
+	MaxEntries            int
+	Bytes                 int64
+	MaxBytes              int64
+	Hits                  uint64
+	Misses                uint64
+	Evictions             uint64
+	AdvisoryBypassBytes   int64
+	CalculatedHitRatioPct float64
 }
 
 func newPayloadCache(maxEntries int, maxBytes int64) *payloadCache {
@@ -78,10 +94,12 @@ func (c *payloadCache) Get(key payloadCacheKey) ([]byte, bool) {
 	defer c.mu.Unlock()
 
 	if elem, ok := c.entries[key]; ok {
+		c.hits++
 		c.order.MoveToFront(elem)
 		entry := elem.Value.(*payloadCacheEntry)
 		return cloneBytes(entry.payload), true
 	}
+	c.misses++
 	return nil, false
 }
 
@@ -137,6 +155,51 @@ func (c *payloadCache) removeElement(elem *list.Element) {
 	c.curBytes -= int64(len(entry.payload))
 	delete(c.entries, entry.key)
 	c.order.Remove(elem)
+	c.evictions++
+}
+
+func (c *payloadCache) Stats() payloadCacheStats {
+	if c == nil {
+		return payloadCacheStats{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stats := payloadCacheStats{
+		Entries:             len(c.entries),
+		MaxEntries:          c.maxEntries,
+		Bytes:               c.curBytes,
+		MaxBytes:            c.maxBytes,
+		Hits:                c.hits,
+		Misses:              c.misses,
+		Evictions:           c.evictions,
+		AdvisoryBypassBytes: c.advisoryBypassBytesLocked(),
+	}
+	total := c.hits + c.misses
+	if total > 0 {
+		stats.CalculatedHitRatioPct = (float64(c.hits) / float64(total)) * 100
+	}
+	return stats
+}
+
+func (c *payloadCache) advisoryBypassBytesLocked() int64 {
+	if c.maxBytes <= 0 {
+		return 0
+	}
+	// Large payloads (multi-megabyte) churn the cache quickly, so offer a conservative
+	// threshold that callers can use to bypass caching altogether.
+	const minBypass = 256 << 10 // 256 KiB
+	advise := c.maxBytes / 64
+	if advise < minBypass {
+		advise = minBypass
+	}
+	half := c.maxBytes / 2
+	if half == 0 {
+		half = c.maxBytes
+	}
+	if advise > half {
+		advise = half
+	}
+	return advise
 }
 
 func cloneBytes(src []byte) []byte {

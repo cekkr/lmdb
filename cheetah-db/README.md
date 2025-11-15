@@ -122,7 +122,9 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   the tree-indexing section below.
 - `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
-  out to `top`/`iostat`.
+  out to `top`/`iostat`. The payload cache now reports `payload_cache_*` fields (entries/bytes,
+  hits/misses/evictions, hit % plus an advisory bypass threshold) in the same response so adapters
+  can auto-tune `CHEETAH_PAYLOAD_CACHE_*` or skip caching multi-megabyte payloads that would churn.
 - `LOG_FLUSH` returns the most recent log lines captured by the server (default ring buffer depth:
   256 entries) and clears the buffer. Pass a numeric limit to trim the output without truncating the
   stored log metadata.

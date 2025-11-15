@@ -71,7 +71,12 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   spikes, keeping multi-connection workloads responsive. Issue `SYSTEM_STATS` via CLI/TCP to read
   the latest snapshot (`logical_cores`, goroutines, CPU%, bytes/sec). The response now includes a
   `recommended_workers=` hint (queue-depth→worker-count pairs for 1, 32, 256, 4096 pending tasks)
-  so Python and other clients can size reducer batches or pause when the server is saturated.
+  so Python and other clients can size reducer batches or pause when the server is saturated. The
+  same response now adds `payload_cache_*` fields (entries, bytes, hits/misses, evictions, hit %,
+  and an advisory bypass threshold) so adapters can auto-tune `CHEETAH_PAYLOAD_CACHE_*` values and
+  skip caching multi-megabyte payloads. Python's hot-path adapter caches the stats for ~30s,
+  derives a reducer page hint (256–2048 entries depending on CPU pressure), and `helpers/cheetah_cli`
+  prints the suggested limit as `reducer_page_hint` for shell scripts.
 - `PAIR_SUMMARY <prefix> [depth] [branch_limit]` is available for namespace analytics. It walks the
   trie beneath `prefix`, counts terminal entries, sums payload bytes via `main_keys` metadata, keeps
   min/max payload sizes and keys, and returns branch-level fan-out counts up to `depth` (default 1,

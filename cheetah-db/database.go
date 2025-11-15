@@ -1337,10 +1337,15 @@ func (db *Database) systemStatsResponse() string {
 	if db.resources == nil {
 		return "ERROR,resource_monitor_unavailable"
 	}
-	return formatSystemStatsResponse(db.resources.Snapshot())
+	var cacheStats *payloadCacheStats
+	if db.payloadCache != nil {
+		stats := db.payloadCache.Stats()
+		cacheStats = &stats
+	}
+	return formatSystemStatsResponse(db.resources.Snapshot(), cacheStats)
 }
 
-func formatSystemStatsResponse(snap ResourceSnapshot) string {
+func formatSystemStatsResponse(snap ResourceSnapshot, cache *payloadCacheStats) string {
 	var b strings.Builder
 	b.WriteString("SUCCESS,command=SYSTEM_STATS")
 	if !snap.Timestamp.IsZero() {
@@ -1389,6 +1394,26 @@ func formatSystemStatsResponse(snap ResourceSnapshot) string {
 			parts = append(parts, fmt.Sprintf("%d:%d", pending, snap.WorkerHints[pending]))
 		}
 		b.WriteString(fmt.Sprintf(",recommended_workers=%s", strings.Join(parts, ";")))
+	}
+	if cache != nil {
+		b.WriteString(",payload_cache_enabled=1")
+		b.WriteString(fmt.Sprintf(",payload_cache_entries=%d", cache.Entries))
+		b.WriteString(fmt.Sprintf(",payload_cache_max_entries=%d", cache.MaxEntries))
+		b.WriteString(fmt.Sprintf(",payload_cache_bytes=%d", cache.Bytes))
+		b.WriteString(fmt.Sprintf(",payload_cache_max_bytes=%d", cache.MaxBytes))
+		b.WriteString(fmt.Sprintf(",payload_cache_hits=%d", cache.Hits))
+		b.WriteString(fmt.Sprintf(",payload_cache_misses=%d", cache.Misses))
+		b.WriteString(fmt.Sprintf(",payload_cache_evictions=%d", cache.Evictions))
+		if cache.CalculatedHitRatioPct > 0 {
+			b.WriteString(fmt.Sprintf(",payload_cache_hit_pct=%.2f", cache.CalculatedHitRatioPct))
+		} else {
+			b.WriteString(",payload_cache_hit_pct=0")
+		}
+		if cache.AdvisoryBypassBytes > 0 {
+			b.WriteString(fmt.Sprintf(",payload_cache_advisory_bypass_bytes=%d", cache.AdvisoryBypassBytes))
+		}
+	} else {
+		b.WriteString(",payload_cache_enabled=0")
 	}
 	return b.String()
 }

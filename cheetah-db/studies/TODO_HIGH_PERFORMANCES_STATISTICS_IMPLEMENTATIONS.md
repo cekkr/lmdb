@@ -18,7 +18,7 @@
 ### 1. Payload locality, cache, and inline reducers
 - `cheetah-db/cache.go` implements a size-aware LRU for `<value_size, table_id, entry_id>` tuples; `database.go:889-932` plugs it into `readValuePayload`. By copying payloads on Get/Add it remains thread-safe for arbitrary callers. Other programs can reuse the pattern by mirroring the 5-byte `ValueLocationIndex` and caching immediately after `READ`/`PAIR_REDUCE` without worrying about a shared backing slice.
 - Pair reducers (`database.go:735-873`) now return payload bytes inline in the TCP response (base64 encoded once). Python’s `CheetahClient.pair_reduce` consumes this directly (`src/db_slm/adapters/cheetah.py:213-414`). This eliminates one `READ` call per entry, which is critical for high-volume statistical scans (full-order `prob:*` namespaces).
-- TODO: expose cache hit metrics via `SYSTEM_STATS` so Python can tune `CHEETAH_PAYLOAD_CACHE_*` automatically; also surface an advisory buffer size so other runtimes can decide when to bypass the cache for multi-megabyte payloads.
+- `SYSTEM_STATS` now emits `payload_cache_*` metrics (entries, bytes, hits/misses, evictions, hit % plus an advisory bypass threshold) so Python/other runtimes can auto-tune `CHEETAH_PAYLOAD_CACHE_*` or skip caching multi-megabyte payloads when the cache would churn.
 
 ### 2. Parallel trie traversal bounded by live resource telemetry
 - `ResourceMonitor` (`cheetah-db/resource_monitor.go`) samples CPU, goroutine count, and /proc IO once per interval and serves the last snapshot. `Database.PairScan` (`database.go:538-666`) asks `RecommendedWorkers(...)` before spawning traversal goroutines. The work-queue pattern (`parallelCollectPairEntries`) feeds entire subtries to workers while respecting cursor ordering.
@@ -64,7 +64,7 @@
 - When extending the Python `HotPathAdapter`, reuse the provided serializers so statistical payloads remain byte-compatible with the Go cache (important for other consumers looking at the same namespace files).
 
 ## Open Tasks / Next Steps
-1. **Expose resource-aware hints to clients.** `SYSTEM_STATS` now emits queue-depth→worker-count hints derived from the resource monitor; follow-up: add Python adapter helpers that consume those hints and auto-tune reducer batch sizes.
+1. **Expose resource-aware hints to clients.** ✅ `SYSTEM_STATS` emits queue-depth→worker-count hints derived from the resource monitor, and the Python hot-path adapter caches those stats to auto-tune reducer batch sizes (roughly 256–2048 entries per page based on live CPU pressure). CLI helpers now print the derived limit (`reducer_page_hint`) so shell scripts can throttle long-running exports without bespoke socket plumbing.
 2. **Namespace summary commands.** ✅ `PAIR_SUMMARY <prefix> [depth] [branch_limit]` now streams aggregate counts, payload byte totals, and branch fan-out digests without hydrating every payload. Follow-up: add optional rolling hashes / Top-K digests alongside the structural stats.
 3. **Optional reducer digests.** Allow `PAIR_REDUCE` to return compact statistics (entropy, CDF bins, hash windows) alongside or instead of raw payloads to accelerate Python-side analytics.
 4. **Rolling hash / similarity mirrors.** Provide trie-level rolling hash metadata (per namespace and per depth) so fuzzy lookups and substring similarity heuristics have fast, server-side entry points.
@@ -72,3 +72,4 @@
 6. **Shared canonical vector helpers.** Publish a tiny library (Go or Python wheel) containing `AbsoluteVectorOrder` encoders/decoders for reuse in other projects or languages.
 7. **Binary/stateless protocol option.** Evaluate a Protobuf or msgpack framing to reduce base64 overhead for high-volume `PAIR_REDUCE` consumers (statistical crawlers, background jobs).
 8. **JSON/stat-typed responses.** Offer an opt-in JSON encoder for reducers so programs that do not embed the DB-SLM serializer can still decode counts/probabilities/continuations cheaply.
+- Consider extending the new summaries with rolling hash / Top-K digests; automated reducer batch sizing now rides on the SYSTEM_STATS worker hints inside the Python adapter + CLI helpers.

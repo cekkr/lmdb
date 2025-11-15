@@ -75,6 +75,26 @@ def format_system_stats(stats: CheetahSystemStats) -> list[str]:
     if stats.recommended_workers:
         hints = ", ".join(f"{pending}->{workers}" for pending, workers in stats.recommended_workers)
         lines.append(f"  recommended_workers: {hints}")
+    if stats.payload_cache_enabled:
+        hit_pct = (
+            "NA" if stats.payload_cache_hit_pct is None else f"{stats.payload_cache_hit_pct:.2f}%"
+        )
+        lines.append(
+            "  payload_cache: "
+            f"entries={stats.payload_cache_entries}/{stats.payload_cache_max_entries}, "
+            f"bytes={stats.payload_cache_bytes}/{stats.payload_cache_max_bytes}, "
+            f"hits={stats.payload_cache_hits}, misses={stats.payload_cache_misses}, "
+            f"evictions={stats.payload_cache_evictions}, hit_ratio={hit_pct}"
+        )
+        if stats.payload_cache_advisory_bypass_bytes:
+            lines.append(
+                f"    advisory_bypass_bytes>{stats.payload_cache_advisory_bypass_bytes}"
+            )
+    else:
+        lines.append("  payload_cache: disabled")
+    auto_limit = stats.derive_reduce_page_limit()
+    if auto_limit is not None:
+        lines.append(f"  reducer_page_hint: limit~{auto_limit}")
     return lines
 
 
