@@ -10,6 +10,7 @@ from typing import Iterable, List, Sequence
 
 from .metrics import keyword_summary
 from .settings import DBSLMSettings
+from helpers.torch_device import auto_device, device_available, requested_device
 
 from log_helpers import log
 
@@ -170,16 +171,12 @@ class ExternalEmbedder:
                 self._model = None
 
     def _select_device(self) -> str:
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                return "cuda"
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                return "mps"
-        except Exception:  # pragma: no cover - optional detection
-            pass
-        return "cpu"
+        requested = requested_device()
+        if requested and device_available(requested):
+            return requested
+        if requested:
+            log(f"[embedding] Requested DEVICE '{requested}' unavailable; falling back to auto-detect.")
+        return auto_device()
 
     def embed(self, segments: Sequence[str]) -> List[List[float]]:
         if not segments:

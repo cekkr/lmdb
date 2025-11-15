@@ -287,6 +287,11 @@ current batch at a random
 position (up to two total attempts) before being scheduled for future probes, so the decoder gets a
 fresh shot without holding up the rest of the evaluation.
 
+Set `DEVICE=cuda` or `DEVICE=mps` before launching `src/train.py` to force the sentence-transformer
+embedder and CoLA classifier used by the evaluation stack onto that accelerator whenever PyTorch
+reports it as available. Unsupported requests automatically fall back to CPU and emit a single
+notice so the run keeps going.
+
 Supplying `--decoder-presence-penalty` or `--decoder-frequency-penalty` only affects the inference
 path used by those probes (including chunk hold-outs); training statistics stay unchanged. The chosen
 values flow into the `DecoderConfig` passed to `issue_prompt()` and are emitted in the metadata block

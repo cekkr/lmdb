@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from .metrics import lexical_overlap
 from .sentence_parts import ExternalEmbedder
 from .system import AdaptiveLoadController
+from helpers.torch_device import device_available, requested_device
 
 from log_helpers import log
 
@@ -86,6 +87,8 @@ class _CoLAClassifier:
         self._tokenizer = None
         self._lock = threading.Lock()
         self._warned = False
+        self._device = "cpu"
+        self._device_notice_emitted = False
 
     def _ensure_model(self):
         if self._model is not None and self._tokenizer is not None:
@@ -96,9 +99,14 @@ class _CoLAClassifier:
             try:
                 from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
 
+                self._device = self._select_device()
                 self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-                log(f"[quality] Loaded CoLA classifier ({self.model_name}).")
+                if self._device != "cpu":
+                    self._model.to(self._device)
+                log(
+                    f"[quality] Loaded CoLA classifier ({self.model_name}) on {self._device}."
+                )
             except Exception as exc:  # pragma: no cover - optional dependency
                 if not self._warned:
                     log(f"[quality] Semantic acceptability model unavailable ({exc}).")
@@ -106,6 +114,15 @@ class _CoLAClassifier:
                 self._model = None
                 self._tokenizer = None
         return self._tokenizer, self._model
+
+    def _select_device(self) -> str:
+        requested = requested_device()
+        if requested and device_available(requested):
+            return requested
+        if requested and not self._device_notice_emitted:
+            log(f"[quality] Requested DEVICE '{requested}' unavailable; defaulting to CPU.")
+            self._device_notice_emitted = True
+        return "cpu"
 
     def score(self, text: str) -> float | None:
         if not text.strip():
@@ -117,6 +134,8 @@ class _CoLAClassifier:
             import torch  # type: ignore
 
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            if self._device != "cpu":
+                inputs = {key: value.to(self._device) for key, value in inputs.items()}
             with torch.no_grad():
                 logits = model(**inputs).logits
             probs = torch.nn.functional.softmax(logits, dim=1)

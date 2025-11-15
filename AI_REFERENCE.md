@@ -132,6 +132,9 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
   (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
   samples later.
+- Set `DEVICE=cuda` or `DEVICE=mps` before invoking `src/train.py` to run the sentence-transformer
+  embedder plus the CoLA acceptability head on that accelerator whenever PyTorch reports it as
+  available. Invalid requests log a single notice and the trainer falls back to CPU automatically.
 - Evaluation probes now emit structural-diversity metrics (`structure_variety`, `common_token_penalty`,
   `token_group_share`, `top_token_share`, opener diversity, punctuation balance) that explicitly devalue templated
   responses. `QualityGate` ingests the same metrics so over-repeated openings or punctuation abuse
