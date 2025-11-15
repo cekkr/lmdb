@@ -2,6 +2,9 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive -
 
 CheetahDB run: go run .
 
+python -m spacy download en_core_web_lg
+python -m spacy download en_core_web_sm
+
 - Number of evaluation to do: --eval-interval 50
 
 # How to execute through Ubuntu 24 WSL on Windows:
