@@ -227,6 +227,7 @@ _CHEETAH_PURGE_PREFIXES: tuple[bytes, ...] = (
 _CHEETAH_PURGE_MIN_PAGE_SIZE = 64
 _CHEETAH_PURGE_MAX_SCAN_FAILURES = 3
 _CHEETAH_PURGE_RETRY_DELAY = 0.05
+_CHEETAH_FAST_PURGE_PAGE_SIZE = 4096
 
 
 def _retry_cheetah_delete(
@@ -269,6 +270,23 @@ def _retry_cheetah_pair_del(
         if attempt < attempts - 1:
             time.sleep(_CHEETAH_PURGE_RETRY_DELAY * (attempt + 1))
     return False, last_response
+
+
+def _try_fast_cheetah_purge(
+    client: CheetahClient,
+    prefix: bytes,
+) -> tuple[int | None, bool, str | None]:
+    """Attempt to purge a namespace via cheetah's PAIR_PURGE command.
+
+    Returns a tuple of (removed_count, disable_fast_path, error_message).
+    """
+    removed, response = client.pair_purge(prefix, limit=_CHEETAH_FAST_PURGE_PAGE_SIZE)
+    if removed is not None:
+        return removed, False, None
+    message = response or "no response from server"
+    if response and "unknown_command" in response.lower():
+        return None, True, message
+    return None, False, message
 
 
 def _purge_cheetah_namespace(
@@ -366,11 +384,33 @@ def reset_cheetah_store(settings: DBSLMSettings) -> None:
         return
     try:
         total_removed = 0
+        fast_disabled = False
+        fast_notice_logged = False
         for prefix in _CHEETAH_PURGE_PREFIXES:
-            removed = _purge_cheetah_namespace(client, prefix)
+            label = prefix.decode("utf-8", "ignore").rstrip(":") or prefix.hex()
+            removed = 0
+            used_fast = False
+            if not fast_disabled:
+                fast_removed, disable_fast, fast_message = _try_fast_cheetah_purge(client, prefix)
+                if fast_removed is not None:
+                    removed = fast_removed
+                    used_fast = True
+                else:
+                    if disable_fast:
+                        fast_disabled = True
+                        if not fast_notice_logged:
+                            detail = f" ({fast_message})" if fast_message else ""
+                            log(
+                                "[train] cheetah reset: PAIR_PURGE unsupported on the connected server; "
+                                f"falling back to incremental deletes{detail}."
+                            )
+                            fast_notice_logged = True
+                    elif fast_message:
+                        log(f"[train] Warning: fast cheetah purge for '{label}' failed: {fast_message}")
+            if not used_fast:
+                removed = _purge_cheetah_namespace(client, prefix)
             total_removed += removed
             if removed:
-                label = prefix.decode("utf-8", "ignore").rstrip(":") or prefix.hex()
                 log(f"[train] cheetah reset: cleared {removed} '{label}' mapping(s).")
         if total_removed == 0:
             log("[train] cheetah reset: no cached namespaces required clearing.")

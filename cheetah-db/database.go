@@ -418,6 +418,41 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response = formatPairScanResponse(results, nextCursor)
+	case command == "PAIR_PURGE":
+		if args == "" {
+			response = "ERROR,pair_purge_requires_prefix"
+			break
+		}
+		fields := strings.Fields(args)
+		if len(fields) == 0 {
+			response = "ERROR,pair_purge_requires_prefix"
+			break
+		}
+		var prefix []byte
+		if fields[0] != "*" {
+			prefix, err = parseValue(fields[0])
+			if err != nil {
+				response = err.Error()
+				err = nil
+				break
+			}
+		}
+		limit := 0
+		if len(fields) > 1 {
+			limit, err = strconv.Atoi(fields[1])
+			if err != nil {
+				response = "ERROR,invalid_limit"
+				err = nil
+				break
+			}
+		}
+		var removed int
+		removed, err = db.PairPurge(prefix, limit)
+		if err != nil {
+			response = ""
+			break
+		}
+		response = fmt.Sprintf("SUCCESS,purged=%d", removed)
 	case command == "PAIR_REDUCE":
 		if args == "" {
 			response = "ERROR,pair_reduce_requires_args"

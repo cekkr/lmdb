@@ -82,6 +82,10 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   `var/db_slm.sqlite3`). It never renames or truncates the cheetah namespace. Pick a distinct
   `DBSLM_CHEETAH_DATABASE` per run (or run `cheetah-db` cleanup commands) when you need isolated
   hot-path data instead of relying on `--reset`.
+- `PAIR_PURGE <prefix> [page_size]` now handles namespace resets in one server-side command. The
+  trainer’s `--reset` flag issues `PAIR_PURGE` for the hot namespaces (ctx/ctxv/topk/cnt/prob/cont/meta)
+  so caches are cleared in seconds. If a deploy is still running an older cheetah binary, the
+  trainer automatically falls back to the legacy `PAIR_SCAN` + `DELETE` loop.
 - `Makefile` now shells into `scripts/smoke_train.py`, which can iterate arbitrary scenario matrices,
   stream live metrics, and hand each scenario a dedicated SQLite + `DBSLM_CHEETAH_DATABASE`
   namespace so cheetah sessions can be paused and restarted independently.

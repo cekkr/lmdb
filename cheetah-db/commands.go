@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const maxValueSize = int(^uint32(0))
@@ -352,4 +354,113 @@ func (db *Database) PairDel(value []byte) (string, error) {
 	// Gestito dal defer in cima alla fase 2
 
 	return "SUCCESS,pair_deleted", nil
+}
+
+// PairPurge removes every pair entry beneath the provided prefix and deletes the
+// associated payload keys in bulk. It returns the number of entries cleared.
+func (db *Database) PairPurge(prefix []byte, limit int) (int, error) {
+	if limit <= 0 {
+		limit = pairScanMaxLimit
+	} else {
+		limit = normalizePairScanLimit(limit)
+	}
+	var cursor []byte
+	totalRemoved := 0
+	for {
+		results, nextCursor, err := db.PairScan(prefix, limit, cursor)
+		if err != nil {
+			return totalRemoved, err
+		}
+		if len(results) == 0 {
+			break
+		}
+		removed, err := db.purgePairEntries(results)
+		totalRemoved += removed
+		if err != nil {
+			return totalRemoved, err
+		}
+		cursor = nextCursor
+		if cursor == nil && len(results) < limit {
+			break
+		}
+	}
+	return totalRemoved, nil
+}
+
+func (db *Database) purgePairEntries(results []PairScanResult) (int, error) {
+	if len(results) == 0 {
+		return 0, nil
+	}
+	workerCount := len(results)
+	if db.resources != nil {
+		if recommended := db.resources.RecommendedWorkers(len(results)); recommended > 0 {
+			workerCount = recommended
+		}
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+	var removed atomic.Int64
+	var firstErr error
+	var errOnce sync.Once
+
+	for _, res := range results {
+		value := append([]byte{}, res.Value...)
+		key := res.Key
+		wg.Add(1)
+		go func(val []byte, absKey uint64) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := db.purgePairEntry(val, absKey); err != nil {
+				errOnce.Do(func() { firstErr = err })
+				return
+			}
+			removed.Add(1)
+		}(value, key)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return int(removed.Load()), firstErr
+	}
+	return int(removed.Load()), nil
+}
+
+func (db *Database) purgePairEntry(value []byte, key uint64) error {
+	resp, err := db.Delete(key)
+	if err != nil {
+		if !isDeleteResponseIgnorable(resp) {
+			return fmt.Errorf("delete key %d failed: %w", key, err)
+		}
+	} else if !isDeleteResponseIgnorable(resp) {
+		return fmt.Errorf("delete key %d failed: %s", key, resp)
+	}
+
+	resp, err = db.PairDel(value)
+	if err != nil {
+		return fmt.Errorf("pair delete %x failed: %w", value, err)
+	}
+	if !isPairDelResponseIgnorable(resp) {
+		return fmt.Errorf("pair delete %x failed: %s", value, resp)
+	}
+	return nil
+}
+
+func isDeleteResponseIgnorable(resp string) bool {
+	if resp == "" || strings.HasPrefix(resp, "SUCCESS") {
+		return true
+	}
+	lower := strings.ToLower(resp)
+	return strings.Contains(lower, "already_deleted") || strings.Contains(lower, "key_not_found")
+}
+
+func isPairDelResponseIgnorable(resp string) bool {
+	if resp == "" || strings.HasPrefix(resp, "SUCCESS") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(resp), "not_found")
 }

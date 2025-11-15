@@ -230,6 +230,28 @@ class CheetahClient:
             return None
         return self._parse_pair_reduce_response(response)
 
+    def pair_purge(
+        self,
+        prefix: bytes = b"",
+        limit: int | None = None,
+    ) -> tuple[int | None, str | None]:
+        arg = "*" if not prefix else f"x{prefix.hex()}"
+        command = f"PAIR_PURGE {arg}"
+        if limit is not None and limit > 0:
+            command = f"{command} {limit}"
+        response = self._command(command)
+        if not response or not response.startswith("SUCCESS"):
+            return None, response
+        removed: int | None = None
+        for part in response.split(","):
+            if part.startswith("purged="):
+                try:
+                    removed = int(part.split("=", 1)[1])
+                except ValueError:
+                    removed = None
+                break
+        return removed, response
+
     # ------------------------------------------------------------------ #
     # Low-level protocol management
     # ------------------------------------------------------------------ #

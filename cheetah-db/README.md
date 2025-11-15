@@ -172,6 +172,10 @@ SUCCESS,key=1_deleted
 
   Reducers control the payload schema; if you extend `commands.go` with a new reducer you only need
   to document how to decode its base64 block.
+- `PAIR_PURGE <prefix> [page_size]` wipes every pair entry beneath the prefix and deletes the backing
+  payload keys inside Go. Use `PAIR_PURGE ctx:` (or `*` to nuke the entire trie) when you need a hot
+  reset before an ingest run—each batch clears up to 4096 entries so the purge finishes in seconds
+  instead of hours of TCP round-trips.
 - `SYSTEM_STATS` is a cheap heartbeat: call it between ingest/reduce loops to track CPU, memory, and
   fd counts without spawning `top`. Because `database.go` formats it in CSV-like key/value pairs, it
   can be parsed by shell scripts (`awk -F,`) or structured log scrapers.
