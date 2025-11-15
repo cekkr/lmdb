@@ -898,6 +898,14 @@ class IngestProfiler:
         except Exception:
             return None
 
+    def _delta(self, before: ResourceSample | None, after: ResourceSample | None) -> ResourceDelta | None:
+        if not self.monitor or before is None or after is None:
+            return None
+        try:
+            return self.monitor.delta(before, after)
+        except Exception:
+            return None
+
 
 def _collect_requirement_errors() -> list[str]:
     errors: list[str] = []
@@ -926,14 +934,6 @@ def _collect_requirement_errors() -> list[str]:
     except Exception:
         pass
     return errors
-
-    def _delta(self, before: ResourceSample | None, after: ResourceSample | None) -> ResourceDelta | None:
-        if not self.monitor or before is None or after is None:
-            return None
-        try:
-            return self.monitor.delta(before, after)
-        except Exception:
-            return None
 
 
 def main() -> None:
