@@ -68,8 +68,9 @@ Cheetah-specific directives and operational notes live here. Refer back to this 
   system CPU percentages, and polls `/proc/self/io` for disk churn. Reducer worker pools call
   `RecommendedWorkers()` so hot `PAIR_REDUCE` bursts automatically back off when CPU or I/O pressure
   spikes, keeping multi-connection workloads responsive. Issue `SYSTEM_STATS` via CLI/TCP to read
-  the latest snapshot (`logical_cores`, goroutines, CPU%, bytes/sec), and feed those numbers back
-  into ingest scripts when you need adaptive fan-out across multiple cheetah nodes.
+  the latest snapshot (`logical_cores`, goroutines, CPU%, bytes/sec). The response now includes a
+  `recommended_workers=` hint (queue-depth→worker-count pairs for 1, 32, 256, 4096 pending tasks)
+  so Python and other clients can size reducer batches or pause when the server is saturated.
 - `src/train.py` and `run.py` expose `--context-dimensions`, a comma-separated list of span ranges
   (e.g., `1-2,3-5`) or progressive lengths (e.g., `4,8,4`). Length specs auto-expand to contiguous
   spans starting at 1, and logs now append `(len=...)` so you can see the effective window widths.

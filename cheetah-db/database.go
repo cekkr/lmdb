@@ -998,6 +998,18 @@ func formatSystemStatsResponse(snap ResourceSnapshot) string {
 			b.WriteString(",io_write_bytes_per_sec=0")
 		}
 	}
+	if len(snap.WorkerHints) > 0 {
+		keys := make([]int, 0, len(snap.WorkerHints))
+		for pending := range snap.WorkerHints {
+			keys = append(keys, pending)
+		}
+		sort.Ints(keys)
+		parts := make([]string, 0, len(keys))
+		for _, pending := range keys {
+			parts = append(parts, fmt.Sprintf("%d:%d", pending, snap.WorkerHints[pending]))
+		}
+		b.WriteString(fmt.Sprintf(",recommended_workers=%s", strings.Join(parts, ";")))
+	}
 	return b.String()
 }
 

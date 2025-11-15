@@ -30,6 +30,7 @@ type ResourceSnapshot struct {
 	IOWriteRate         float64
 	MemAllocBytes       uint64
 	MemSysBytes         uint64
+	WorkerHints         map[int]int
 }
 
 type ResourceMonitor struct {
@@ -45,6 +46,8 @@ type ResourceMonitor struct {
 	lastIOSample    ioSample
 	hasIOSample     bool
 }
+
+var defaultWorkerHintPendings = []int{1, 32, pairScanDefaultLimit, pairScanMaxLimit}
 
 type systemCPUSample struct {
 	Idle  uint64
@@ -95,39 +98,8 @@ func (rm *ResourceMonitor) Snapshot() ResourceSnapshot {
 }
 
 func (rm *ResourceMonitor) RecommendedWorkers(pending int) int {
-	if pending <= 1 {
-		if pending == 0 {
-			return 0
-		}
-		return 1
-	}
-	rm.mu.RLock()
-	snap := rm.snapshot
-	rm.mu.RUnlock()
-
-	maxWorkers := snap.Gomaxprocs
-	if maxWorkers < 1 {
-		maxWorkers = runtime.GOMAXPROCS(0)
-	}
-	if maxWorkers < 1 {
-		maxWorkers = runtime.NumCPU()
-	}
-	if maxWorkers < 1 {
-		maxWorkers = 1
-	}
-
-	scale := 1.0
-	switch {
-	case snap.ProcessCPUPercent >= 80 || snap.SystemCPUPercent >= 85:
-		scale = 0.5
-	case snap.ProcessCPUPercent >= 60 || snap.SystemCPUPercent >= 70:
-		scale = 0.75
-	}
-	recommended := int(math.Max(1, math.Floor(float64(maxWorkers)*scale)))
-	if recommended > pending {
-		recommended = pending
-	}
-	return recommended
+	snap := rm.Snapshot()
+	return computeRecommendedWorkers(snap, pending)
 }
 
 func (rm *ResourceMonitor) takeSample(now time.Time) {
@@ -207,8 +179,54 @@ func (rm *ResourceMonitor) takeSample(now time.Time) {
 		rm.lastIOSample = ioSample
 		rm.hasIOSample = true
 	}
+	snapshot.WorkerHints = buildWorkerHints(snapshot)
 
 	rm.snapshot = snapshot
+}
+
+func buildWorkerHints(snapshot ResourceSnapshot) map[int]int {
+	if len(defaultWorkerHintPendings) == 0 {
+		return nil
+	}
+	hints := make(map[int]int, len(defaultWorkerHintPendings))
+	for _, pending := range defaultWorkerHintPendings {
+		if pending < 0 {
+			continue
+		}
+		hints[pending] = computeRecommendedWorkers(snapshot, pending)
+	}
+	return hints
+}
+
+func computeRecommendedWorkers(snap ResourceSnapshot, pending int) int {
+	if pending <= 1 {
+		if pending == 0 {
+			return 0
+		}
+		return 1
+	}
+	maxWorkers := snap.Gomaxprocs
+	if maxWorkers < 1 {
+		maxWorkers = runtime.GOMAXPROCS(0)
+	}
+	if maxWorkers < 1 {
+		maxWorkers = runtime.NumCPU()
+	}
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+	scale := 1.0
+	switch {
+	case snap.ProcessCPUPercent >= 80 || snap.SystemCPUPercent >= 85:
+		scale = 0.5
+	case snap.ProcessCPUPercent >= 60 || snap.SystemCPUPercent >= 70:
+		scale = 0.75
+	}
+	recommended := int(math.Max(1, math.Floor(float64(maxWorkers)*scale)))
+	if recommended > pending {
+		recommended = pending
+	}
+	return recommended
 }
 
 func getProcessCPUTime() (time.Duration, error) {
