@@ -21,6 +21,7 @@ from .inference_shared import issue_prompt
 from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
 from .quality import SentenceQualityScorer
+from .text_markers import extract_complete_sentence
 from helpers.char_tree_similarity import similarity_score
 from helpers.resource_monitor import ResourceMonitor
 
@@ -885,6 +886,9 @@ class EvalLogWriter:
                 for sample in samples
             ],
         }
+        cycle_reference = self._cycle_reference(samples)
+        if cycle_reference:
+            event["cycle_reference"] = cycle_reference
         self.events.append(event)
 
     def log_profile(
@@ -953,6 +957,22 @@ class EvalLogWriter:
     @staticmethod
     def _timestamp() -> str:
         return dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    def _cycle_reference(self, samples: Sequence[EvaluationSampleResult]) -> dict[str, Any] | None:
+        for sample in samples:
+            reference_sentence = extract_complete_sentence(sample.reference)
+            generated_sentence = extract_complete_sentence(sample.generated)
+            if not reference_sentence and not generated_sentence:
+                continue
+            return {
+                "index": sample.index,
+                "variant": sample.variant,
+                "prompt": sample.prompt,
+                "reference_sentence": reference_sentence,
+                "generated_sentence": generated_sentence,
+                "flagged": sample.flagged,
+            }
+        return None
 
 
 class QualityGate:

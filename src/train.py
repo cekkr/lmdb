@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import random
+import shutil
 import sys
 import time
 from collections import deque
@@ -36,6 +37,7 @@ from db_slm.evaluation import (
     run_inference_records,
 )
 from db_slm.settings import DBSLMSettings, load_settings
+from db_slm.text_markers import append_end_marker
 
 from helpers.resource_monitor import ResourceMonitor
 if TYPE_CHECKING:
@@ -588,7 +590,9 @@ def iter_json_chunks(
                     segment_lines.append(f"{field.label}: {ctx_value}")
                 normalized = field.normalized_token(ctx_value)
                 segment_lines.append(f"|CTX|:{field.token}:{normalized}")
-            segment_lines.append(f"{dataset_cfg.response.label}: {response.strip()}")
+            response_line = f"{dataset_cfg.response.label}: {response.strip()}"
+            response_line = append_end_marker(response_line)
+            segment_lines.append(response_line)
             annotation = _dependency_layer_annotation(prompt_layer, response_layer)
             if annotation:
                 segment_lines.append(f"DependencyLayer: {annotation}")
@@ -830,6 +834,35 @@ class IngestProfiler:
         except Exception:
             return None
 
+
+def _collect_requirement_errors() -> list[str]:
+    errors: list[str] = []
+    try:
+        import language_tool_python  # type: ignore
+    except Exception as exc:
+        errors.append(
+            "language_tool_python is not installed or cannot be imported "
+            f"(pip install language-tool-python): {exc}"
+        )
+        return errors
+    java_path = shutil.which("java")
+    if not java_path:
+        errors.append("Java runtime (java) is required by language_tool_python but was not found on PATH.")
+        return errors
+    try:
+        tool = language_tool_python.LanguageTool("en-US")
+    except Exception as exc:  # pragma: no cover - optional dependency probe
+        errors.append(
+            "language_tool_python failed to initialize (verify Java installation and JAVA_HOME): "
+            f"{exc}"
+        )
+        return errors
+    try:
+        tool.close()
+    except Exception:
+        pass
+    return errors
+
     def _delta(self, before: ResourceSample | None, after: ResourceSample | None) -> ResourceDelta | None:
         if not self.monitor or before is None or after is None:
             return None
@@ -875,6 +908,10 @@ def main() -> None:
         f"[train:v3] Context dims argument '{args.context_dimensions}' resolved to "
         f"{format_context_dimensions(context_dimensions)}.",
     )
+    requirement_errors = _collect_requirement_errors()
+    if requirement_errors:
+        formatted = "\n".join(f"- {message}" for message in requirement_errors)
+        parser.error(f"Missing training requirements:\n{formatted}")
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
     if args.reset:

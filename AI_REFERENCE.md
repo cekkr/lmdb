@@ -48,6 +48,13 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   `dependency_arc_overlap` metrics for each generation. Both are logged next to ROUGE/perplexity and
   folded into the metrics export so we can tell whether the decoder is preserving grammatical
   structure vs. just matching surface tokens.
+- Trainer start-up now hard-fails when `language_tool_python` or a local `java` runtime are missing,
+  so we no longer discover hours later that grammar metrics could not run. Install Java and
+  `language-tool-python` before invoking `src/train.py`.
+- Every staged response line now includes a trailing `|END|` tag. The decoder strips this token
+  before responses hit the REPL/logs, and `EvalLogWriter` records a `cycle_reference` entry with the
+  first full reference/generated sentence for each evaluation batch so the JSON timeline always
+  captures a non-truncated exemplar for the cycle.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input

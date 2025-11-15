@@ -28,6 +28,7 @@ from .level2 import BiasEngine, ConversationMemory, SessionCache
 from .level3 import ConceptDefinition, ConceptEngine, ConceptExecution
 from .sentence_parts import SentencePartEmbeddingPipeline
 from .settings import DBSLMSettings, load_settings
+from .text_markers import strip_end_marker
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,7 @@ class DBSLMEngine:
         response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
         response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
         response = self._tag_formatter.wrap(user_message, response, rng=rng)
+        response, _ = strip_end_marker(response)
         self.memory.log_message(conversation_id, "assistant", response)
         return response
 
