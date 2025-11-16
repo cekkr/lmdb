@@ -158,6 +158,8 @@ class DBSLMEngine:
         decoder_cfg: DecoderConfig | None = None,
         min_response_words: int = 0,
         rng_seed: int | None = None,
+        *,
+        scaffold_response: bool = True,
     ) -> str:
         rng = random.Random(rng_seed) if rng_seed is not None else random.Random()
         self.memory.log_message(conversation_id, "user", user_message)
@@ -194,8 +196,9 @@ class DBSLMEngine:
             segments.append(decoded_text)
         response = " ".join(segment.strip() for segment in segments if segment.strip()).strip()
         response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
-        response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
-        response = self._tag_formatter.wrap(user_message, response, rng=rng)
+        if scaffold_response:
+            response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
+            response = self._tag_formatter.wrap(user_message, response, rng=rng)
         response, _ = strip_end_marker(response)
         self.memory.log_message(conversation_id, "assistant", response)
         return response

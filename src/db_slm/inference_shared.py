@@ -17,6 +17,7 @@ def issue_prompt(
     min_response_words: int = 0,
     decoder_cfg: DecoderConfig | None = None,
     rng_seed: int | None = None,
+    scaffold_response: bool = True,
 ) -> Tuple[str, str]:
     """
     Send a prompt through DBSLMEngine, starting a conversation when needed.
@@ -33,5 +34,6 @@ def issue_prompt(
         decoder_cfg=decoder_cfg,
         min_response_words=min_response_words,
         rng_seed=rng_seed,
+        scaffold_response=scaffold_response,
     )
     return convo_id, response

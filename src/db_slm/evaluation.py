@@ -697,8 +697,6 @@ def run_inference_records(
         tag = f"#{idx}.{variant}" if variant_runs > 1 else f"#{idx}"
         generated = ""
         metrics: dict[str, float | int | None] = {}
-        ref_words = max(1, len(record.response.split()))
-        min_words = max(20, min(512, int(ref_words * 0.85)))
         flagged = False
         flag_reasons: list[str] = []
         active_decoder_cfg = entry.get("decoder_cfg_override") or decoder_cfg
@@ -708,9 +706,10 @@ def run_inference_records(
             user_id=user_id,
             agent_name=agent_name,
             seed_history=False,
-            min_response_words=min_words,
+            min_response_words=0,
             decoder_cfg=active_decoder_cfg,
             rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
+            scaffold_response=False,
         )
         metrics = evaluator.evaluate(record, generated)
         repeat_similarity = metrics.get("char_repeat_max")

@@ -528,6 +528,42 @@ def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
     return files
 
 
+_JSON_SUFFIXES = {".json", ".ndjson"}
+
+
+def resolve_eval_dataset_path(
+    args: argparse.Namespace,
+    settings: DBSLMSettings,
+    file_inputs: Sequence[Path],
+) -> str | None:
+    """Infer the dataset used to seed evaluation probes."""
+    default_path = args.eval_dataset or settings.dataset_path
+    if args.eval_interval <= 0:
+        return default_path
+    if args.eval_dataset:
+        return args.eval_dataset
+    json_inputs = [path for path in file_inputs if path.suffix.lower() in _JSON_SUFFIXES]
+    if json_inputs:
+        chosen = str(json_inputs[0])
+        notice = (
+            "[eval] No --eval-dataset provided; defaulting evaluation pool to training input "
+            f"{chosen}."
+        )
+        if len(json_inputs) > 1:
+            notice += f" Additional JSON inputs detected: {len(json_inputs) - 1}."
+        log(notice)
+        return chosen
+    if default_path:
+        log_verbose(
+            3,
+            "[eval:v3] No JSON inputs supplied; falling back to DBSLM_DATASET_PATH "
+            f"{default_path} for evaluation.",
+        )
+    else:
+        log("[eval] Warning: evaluation enabled but no dataset could be inferred from inputs.")
+    return default_path
+
+
 def _resolve_worker_count(requested: int | None) -> int:
     if requested is None or requested == 1:
         return 1
@@ -1297,7 +1333,7 @@ def main() -> None:
     # We defer the "empty" validation until after attempting to iterate so JSON inputs
     # can stream chunks without pre-loading them into memory.
 
-    eval_dataset_path = args.eval_dataset or settings.dataset_path
+    eval_dataset_path = resolve_eval_dataset_path(args, settings, file_inputs)
     evaluator = ResponseEvaluator(engine)
     eval_records: list[EvaluationRecord] = []
     monitor = InferenceMonitor(
