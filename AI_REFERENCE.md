@@ -72,6 +72,12 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   `--response-label` for interactive sessions. This is a high-priority invariant: without the
   terminal `|RESPONSE|:` (or override) the model continues the `|USER|:` frame instead of producing a
   reply, corrupting both training chunks and eval probes.
+- Dataset configs now advertise every `|TAG|:` prefix (prompt/response labels plus any context
+  `canonical_tag` entry such as `|CTX|`), and `train.py` registers those sequences as atomic tokens
+  so the regex tokenizer never splits them into stray pipes/colons. That guarantees stable vocab IDs
+  for tags like `|USER|:` / `|INSTRUCTION|:` and lets each corpus opt-in to canonical context headers
+  by setting `canonical_tag`; datasets that skip the field no longer receive automatic `|CTX|:`
+  prefixes.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input
@@ -86,7 +92,7 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
   segments, embedding signatures, and context keyword tokens so Level 1 learns efficient splits in
   real time. Dataset metadata is now declared via `datasets/<name>.config.json`, which lets the
-  loader emit canonical `|CTX|:<token>:<value>` lines; the sentence-part embedder lifts those tags
+  loader emit canonical `|CTX|:<token>:<value>` lines whenever a context field sets `canonical_tag`; the sentence-part embedder lifts those tags
   into headers and supplements them with `|CTX_KEY|` keywords derived solely from the segment text +
   embedder energy (the `_EMOTION_WORDS` allowlist is gone). Configure the embedding backbone with
   `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no Hugging Face downloads) via
@@ -99,6 +105,9 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
 - Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
   via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
   truncated generations.
+- `run_inference_records()` now retries with a fresh RNG seed whenever the decoder emits a prompt tag
+  (|USER|, |INSTRUCTION|, |RESPONSE|, etc.) so evaluation logs capture actual completions instead of
+  scaffolding tokens; retries still consume the `_MAX_BATCH_ATTEMPTS` budget to keep probes bounded.
 - Evaluation now tracks cross-sample repetition via `helpers/char_tree_similarity.py`, exposes
   `char_repeat_max/avg` metrics, feeds them into `QualityGate`, and automatically re-queues variants
   with stronger presence/frequency penalties whenever the generated text matches earlier prompts too
@@ -200,8 +209,7 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   chunk sizes, eval thresholds, and paraphraser guard rails stay grounded in the actual corpora.
 - Dataset-specific schema is declared beside each corpus as `datasets/<name>.config.json`
   (see `datasets/emotion_data.config.json`). The loader uses it to map prompt/response fields,
-  expose optional context tokens, and emit canonical `|CTX|:<token>:<value>` headers so no code
-  change is required when swapping corpora.
+  expose optional context tokens, and emit canonical headers such as `|CTX|:<token>:<value>` whenever a context field sets `canonical_tag`, so no code change is required when swapping corpora.
 - Prefer `make smoke-train` for regressions: it now iterates both baseline + penalty scenarios,
   writes live stats to `var/smoke_train/benchmarks.json`, and exposes switches (see `SMOKE_*` vars in
   the `Makefile`) so you can resume or subset the matrix without editing the script.

@@ -28,6 +28,7 @@ class ContextFieldConfig:
     label: str
     token: str
     placement: str = "after_prompt"
+    canonical_tag: str | None = None
 
     def normalized_token(self, value: str) -> str:
         lowered = value.strip().lower()
@@ -87,6 +88,29 @@ class DatasetConfig:
             else:
                 post.append((field, value))
         return preface, post
+
+    def prompt_tag_labels(self) -> Tuple[str, ...]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for candidate in (
+            _normalize_pipe_tag(self.prompt.label),
+            _normalize_pipe_tag(self.response.label),
+        ):
+            if candidate and candidate not in seen:
+                labels.append(candidate)
+                seen.add(candidate)
+        for field in self.context_fields:
+            for candidate in (
+                _normalize_pipe_tag(field.label),
+                _normalize_pipe_tag(field.canonical_tag),
+            ):
+                if candidate and candidate not in seen:
+                    labels.append(candidate)
+                    seen.add(candidate)
+        return tuple(labels)
+
+    def prompt_tag_tokens(self) -> Tuple[str, ...]:
+        return tuple(f"{label}:" for label in self.prompt_tag_labels())
 
     def compose_prompt(
         self,
@@ -167,7 +191,10 @@ def _parse_dataset_config(path: Path) -> DatasetConfig:
         token_name = _stringify(entry.get("token_name") or field_key).strip() or field_key
         label = _stringify(entry.get("label") or token_name).strip() or token_name
         placement = _normalize_context_placement(entry.get("placement"))
-        context_fields.append(ContextFieldConfig(field_key, label, token_name, placement))
+        canonical_tag = _normalize_pipe_tag(entry.get("canonical_tag"))
+        context_fields.append(
+            ContextFieldConfig(field_key, label, token_name, placement, canonical_tag)
+        )
 
     return DatasetConfig(
         name=name,
@@ -185,3 +212,15 @@ def _normalize_context_placement(raw: Any) -> str:
     if normalized in {"before", "pre", "preface", "before_prompt", "prompt_preface"}:
         return "before_prompt"
     return "after_prompt"
+
+
+def _normalize_pipe_tag(value: Any) -> str | None:
+    candidate = _stringify(value).strip()
+    if (
+        candidate
+        and candidate.startswith("|")
+        and candidate.endswith("|")
+        and len(candidate) > 2
+    ):
+        return candidate
+    return None

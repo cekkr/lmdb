@@ -27,11 +27,32 @@ class _TokenizerBackend:
 
 
 class RegexTokenizerBackend(_TokenizerBackend):
-    def __init__(self, lowercase: bool) -> None:
+    def __init__(self, lowercase: bool, special_tokens: Sequence[str] | None = None) -> None:
         self.lowercase = lowercase
+        self._pattern = TOKEN_PATTERN
+        self._special_tokens: tuple[str, ...] = tuple()
+        self.set_special_tokens(special_tokens or [])
+
+    def set_special_tokens(self, tokens: Sequence[str]) -> None:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            normalized = (token or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        deduped.sort(key=len, reverse=True)
+        self._special_tokens = tuple(deduped)
+        if deduped:
+            escaped = "|".join(re.escape(token) for token in deduped)
+            pattern = f"(?:{escaped})|\\w+|[^\\w\\s]"
+            self._pattern = re.compile(pattern, re.UNICODE)
+        else:
+            self._pattern = TOKEN_PATTERN
 
     def tokenize(self, text: str) -> List[str]:
-        tokens = [match.group(0) for match in TOKEN_PATTERN.finditer(text)]
+        tokens = [match.group(0) for match in self._pattern.finditer(text)]
         if self.lowercase:
             return [token.lower() for token in tokens]
         return tokens
@@ -139,6 +160,9 @@ class Tokenizer:
         lowercase_tokens: bool = True,
     ) -> None:
         self.vocab = vocab
+        self._special_tokens: list[str] = []
+        self._special_token_set: set[str] = set()
+        self._special_backend_warned = False
         self._backend = self._init_backend(backend, tokenizer_path, lowercase_tokens)
 
     def _init_backend(
@@ -157,6 +181,32 @@ class Tokenizer:
                 except Exception as exc:  # pragma: no cover - backend optional
                     log(f"[tokenizer] Falling back to regex backend ({exc}).")
         return RegexTokenizerBackend(lowercase_tokens)
+
+    def register_special_tokens(self, tokens: Sequence[str] | None) -> None:
+        if not tokens:
+            return
+        updated = False
+        for token in tokens:
+            normalized = (token or "").strip()
+            if not normalized or normalized in self._special_token_set:
+                continue
+            self._special_token_set.add(normalized)
+            self._special_tokens.append(normalized)
+            self.vocab.get_or_create(normalized)
+            updated = True
+        if not updated:
+            return
+        setter = getattr(self._backend, "set_special_tokens", None)
+        if callable(setter):
+            ordered = sorted(self._special_tokens, key=len, reverse=True)
+            setter(ordered)
+            return
+        if not self._special_backend_warned:
+            log(
+                "[tokenizer] Active tokenizer backend cannot honor custom prompt tags; "
+                "falling back to literal character-level splits."
+            )
+            self._special_backend_warned = True
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
         tokens = self._backend.tokenize(text)

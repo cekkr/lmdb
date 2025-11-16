@@ -90,6 +90,12 @@ class DBSLMEngine:
         self._response_backstop = ResponseBackstop()
         self._tag_formatter = TaggedResponseFormatter()
 
+    def register_prompt_tags(self, tag_tokens: Sequence[str]) -> None:
+        """Allow callers to seed tokenizer/vocabulary with structured prompt tags."""
+        if not tag_tokens:
+            return
+        self.tokenizer.register_special_tokens(tag_tokens)
+
     def _init_context_dimensions(
         self, requested: Sequence[ContextDimension] | None
     ) -> list[ContextDimension]:

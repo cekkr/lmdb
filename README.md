@@ -231,8 +231,9 @@ python3 src/train.py datasets/emotion_data.json \
 (`datasets/emotion_data.json` by default). When you pass any `.json`/`.ndjson` corpus to
 `src/train.py`, the loader automatically searches for `<dataset>.config.json` (next to the data) or
 the config supplied via `--dataset-config`/`DBSLM_DATASET_CONFIG_PATH`. That file declares the
-prompt/response labels and optional context fields so the trainer can generate the `|CTX|:` tags and
-structural headers for you. Because the lookup runs per file, you can mix multiple JSON corpora in a
+prompt/response labels and optional context fields so the trainer can preserve each `|TAG|:` prefix
+as an atomic token and, when a context field sets `canonical_tag`, emit the canonical `|CTX|:` (or
+custom) headers for you. Because the lookup runs per file, you can mix multiple JSON corpora in a
 single command—each will read its sibling `.config.json` unless you explicitly override the path.
 Plain `.txt` inputs continue to work for already-tagged corpora—they skip config discovery entirely
 and stage the text as-is.
@@ -249,8 +250,9 @@ device-aware embeddings from `sentence-transformers` (defaults to `all-MiniLM-L6
 via `DBSLM_EMBEDDER_MODEL`). Dataset-specific metadata is described in
 `datasets/<name>.config.json` (for example `datasets/emotion_data.config.json`), which declares the
 prompt/response fields and any additional context columns that should be tokenized. The JSON loader
-uses that config to emit human-readable headers plus canonical `|CTX|:<token>:<value>` lines, and
-the embedding pipeline lifts those tags into a unified header before sequencing the text. Each
+uses that config to emit human-readable headers plus canonical `|CTX|:<token>:<value>` (or other
+`canonical_tag`) lines whenever a context field requests them, and the embedding pipeline lifts
+those tags into a unified header before sequencing the text. Each
 segment keeps a compact embedding signature plus a `|CTX_KEY|` keyword list derived from both the
 dataset metadata and the embedding energy. These annotations are injected ahead of the regex
 tokenizer, ensuring the vocabulary learns explicit dataset context and higher quality boundary

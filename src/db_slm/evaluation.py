@@ -57,6 +57,7 @@ class EvaluationRecord:
     prompt_dependencies: DependencyLayer | None = None
     response_dependencies: DependencyLayer | None = None
     response_label: str = "|RESPONSE|"
+    prompt_tags: tuple[str, ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -361,6 +362,22 @@ _MAX_FUTURE_BATCH_RETRIES = 3
 _CHAR_REPEAT_ALERT = 0.92
 _RECENT_GENERATION_LIMIT = 64
 _flagged_retry_budget: dict[str, int] = {}
+
+
+def _detected_prompt_tag(text: str, prompt_tags: Sequence[str]) -> str | None:
+    if not prompt_tags:
+        return None
+    snippet = (text or "").strip()
+    if not snippet:
+        return None
+    head = snippet.split()[0]
+    candidate = head.split(":", 1)[0].strip()
+    if not candidate:
+        return None
+    for tag in prompt_tags:
+        if candidate == tag:
+            return tag
+    return None
 
 
 def _boost_decoder_penalties(
@@ -721,6 +738,20 @@ def run_inference_records(
             rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
             scaffold_response=False,
         )
+        prompt_tag = _detected_prompt_tag(generated, getattr(record, "prompt_tags", ()))
+        if prompt_tag and attempts < _MAX_BATCH_ATTEMPTS:
+            log(
+                f"[eval] {tag}: generated prompt tag '{prompt_tag}'. "
+                f"Retrying with a new seed (attempt {attempts + 1}/{_MAX_BATCH_ATTEMPTS})."
+            )
+            insert_at = queue_rng.randint(0, len(pending))
+            pending.insert(insert_at, entry)
+            continue
+        if prompt_tag:
+            log(
+                f"[eval] {tag}: prompt tag '{prompt_tag}' persisted after {attempts} attempt(s); "
+                "using latest response."
+            )
         metrics = evaluator.evaluate(record, generated)
         repeat_similarity = metrics.get("char_repeat_max")
         repeat_similarity_val = (

@@ -24,7 +24,7 @@ from db_slm.context_dimensions import (
     format_context_dimensions,
     parse_context_dimensions_arg,
 )
-from db_slm.dataset_config import load_dataset_config
+from db_slm.dataset_config import DatasetConfig, load_dataset_config
 from db_slm.decoder import DecoderConfig
 from db_slm.evaluation import (
     EvalLogWriter,
@@ -544,6 +544,24 @@ def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
 _JSON_SUFFIXES = {".json", ".ndjson"}
 
 
+def collect_prompt_tag_tokens(paths: Sequence[Path], dataset_config_override: str | None) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in DatasetConfig.default().prompt_tag_tokens():
+        if token and token not in seen:
+            tokens.append(token)
+            seen.add(token)
+    for path in paths:
+        if path.suffix.lower() not in _JSON_SUFFIXES:
+            continue
+        cfg = load_dataset_config(path, override=dataset_config_override)
+        for token in cfg.prompt_tag_tokens():
+            if token and token not in seen:
+                tokens.append(token)
+                seen.add(token)
+    return tokens
+
+
 def resolve_eval_dataset_path(
     args: argparse.Namespace,
     settings: DBSLMSettings,
@@ -914,18 +932,24 @@ def iter_json_chunks(
         prompt_layer = build_dependency_layer(framed_prompt or prompt_value or "")
         response_layer = build_dependency_layer(response)
         segment_lines: list[str] = []
+        prompt_tags = dataset_cfg.prompt_tag_labels()
+        canonical_tag_prefix = lambda field: f"{field.canonical_tag}:" if field.canonical_tag else None
         for field, ctx_value in preface_contexts:
             if field.label:
                 segment_lines.append(f"{field.label}: {ctx_value}")
             normalized = field.normalized_token(ctx_value)
-            segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+            prefix = canonical_tag_prefix(field)
+            if prefix:
+                segment_lines.append(f"{prefix}{field.token}:{normalized}")
         if prompt_value:
             segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt_value.strip()}")
         for field, ctx_value in trailing_contexts:
             if field.label:
                 segment_lines.append(f"{field.label}: {ctx_value}")
             normalized = field.normalized_token(ctx_value)
-            segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+            prefix = canonical_tag_prefix(field)
+            if prefix:
+                segment_lines.append(f"{prefix}{field.token}:{normalized}")
         response_line = f"{dataset_cfg.response.label}: {response.strip()}"
         response_line = append_end_marker(response_line)
         segment_lines.append(response_line)
@@ -944,6 +968,7 @@ def iter_json_chunks(
             prompt_dependencies=prompt_layer,
             response_dependencies=response_layer,
             response_label=dataset_cfg.response.label,
+            prompt_tags=prompt_tags,
         )
 
         log_prompt = evaluation_prompt
@@ -1034,6 +1059,7 @@ def load_eval_dataset(
                 prompt_dependencies=prompt_layer,
                 response_dependencies=response_layer,
                 response_label=dataset_cfg.response.label,
+                prompt_tags=dataset_cfg.prompt_tag_labels(),
             )
         )
         if limit is not None and len(records) >= limit:
@@ -1326,6 +1352,7 @@ def main() -> None:
 
     file_inputs = collect_files(args.inputs, args.recursive)
     log_verbose(3, f"[train:v3] Prepared {len(file_inputs)} file input(s) for ingestion.")
+    prompt_tag_tokens = collect_prompt_tag_tokens(file_inputs, args.dataset_config)
     prep_workers = _resolve_worker_count(args.prep_workers)
     prep_prefetch = max(1, args.prep_prefetch)
     if prep_workers > 1:
@@ -1365,6 +1392,18 @@ def main() -> None:
     # can stream chunks without pre-loading them into memory.
 
     eval_dataset_path = resolve_eval_dataset_path(args, settings, file_inputs)
+    if eval_dataset_path:
+        eval_tag_tokens = collect_prompt_tag_tokens(
+            [Path(eval_dataset_path).expanduser()],
+            args.eval_dataset_config or args.dataset_config,
+        )
+        for token in eval_tag_tokens:
+            if token not in prompt_tag_tokens:
+                prompt_tag_tokens.append(token)
+    if prompt_tag_tokens:
+        unique_tokens = list(dict.fromkeys(prompt_tag_tokens))
+        engine.register_prompt_tags(unique_tokens)
+        log(f"[train] Registered prompt tags -> {', '.join(unique_tokens)}")
     evaluator = ResponseEvaluator(engine)
     eval_records: list[EvaluationRecord] = []
     monitor = InferenceMonitor(

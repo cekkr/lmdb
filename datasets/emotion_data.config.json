@@ -10,7 +10,8 @@
       "field": "emotion",
       "label": "Emotion",
       "token_name": "emotion",
-      "description": "Primary emotion label supplied with each prompt/response pair."
+      "description": "Primary emotion label supplied with each prompt/response pair.",
+      "canonical_tag": "|CTX|"
     }
   ]
 }

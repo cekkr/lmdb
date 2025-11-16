@@ -11,7 +11,7 @@
 - Because responses are long-form, `train.py` now derives `min_response_words` from the reference length (capped at 512 words) so evaluation probes can cover most of the answer before logging metrics.
 - The quality gate under `var/eval_logs/quality_retrain_queue.jsonl` captures low-quality generations (grammar errors ≥3, CoLA acceptability <0.45, semantic similarity <0.55, or length mismatch >40%) for targeted retraining slices.
 - When profiling the dataset, prefer chunk sizes ≥2,000 rows so the sentence-part embedder can observe enough punctuation statistics to avoid aggressive truncation.
-- Field mapping + additional context tokens are declared in `datasets/emotion_data.config.json`. `train.py` reads this to emit the `Emotion` header along with the canonical `|CTX|:emotion:<value>` tags so other datasets can define their own schema without touching source code.
+- Field mapping + additional context tokens are declared in `datasets/emotion_data.config.json`. `train.py` reads this to emit the `Emotion` header, and because the context field sets `"canonical_tag": "|CTX|"`, it also writes the canonical `|CTX|:emotion:<value>` tags. Leave `canonical_tag` unset in other configs when you do **not** want synthetic context rows.
 
 Source: [https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b](https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b)
 Fast download [https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing](https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing)
