@@ -6,6 +6,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,17 +28,28 @@ type ManagedFileOptions struct {
 	MaxCachedSectors int
 }
 
+type flushRequest struct {
+	file *ManagedFile
+	key  uint64
+}
+
 type FileManager struct {
-	limit       int
-	files       sync.Map
-	openHandles atomic.Int32
+	limit        int
+	files        sync.Map
+	openHandles  atomic.Int32
+	flushQueue   chan flushRequest
+	flushStop    chan struct{}
+	flushWG      sync.WaitGroup
+	flushWorkers int
 }
 
 func NewFileManager(limit int) *FileManager {
 	if limit < 0 {
 		limit = 0
 	}
-	return &FileManager{limit: limit}
+	manager := &FileManager{limit: limit}
+	manager.startFlusher()
+	return manager
 }
 
 func (fm *FileManager) register(file *ManagedFile) {
@@ -50,6 +64,67 @@ func (fm *FileManager) handleOpened() {
 func (fm *FileManager) handleClosed() {
 	if fm.openHandles.Load() > 0 {
 		fm.openHandles.Add(-1)
+	}
+}
+
+func (fm *FileManager) startFlusher() {
+	workers := fm.resolveFlushWorkers()
+	fm.flushWorkers = workers
+	if workers <= 0 {
+		return
+	}
+	fm.flushQueue = make(chan flushRequest, flushQueueSize)
+	fm.flushStop = make(chan struct{})
+	for i := 0; i < workers; i++ {
+		fm.flushWG.Add(1)
+		go fm.flushWorker()
+	}
+}
+
+func (fm *FileManager) resolveFlushWorkers() int {
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_FLUSH_WORKERS")); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			return val
+		}
+	}
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
+func (fm *FileManager) flushWorker() {
+	defer fm.flushWG.Done()
+	for {
+		select {
+		case req := <-fm.flushQueue:
+			if req.file != nil {
+				req.file.flushSector(req.key)
+			}
+		case <-fm.flushStop:
+			return
+		}
+	}
+}
+
+func (fm *FileManager) Close() {
+	if fm.flushStop != nil {
+		close(fm.flushStop)
+	}
+	fm.flushWG.Wait()
+}
+
+func (fm *FileManager) enqueueFlush(file *ManagedFile, key uint64) bool {
+	if fm.flushQueue == nil {
+		return false
+	}
+	select {
+	case fm.flushQueue <- flushRequest{file: file, key: key}:
+		return true
+	default:
+		go file.flushSector(key)
+		return true
 	}
 }
 
@@ -108,11 +183,8 @@ type ManagedFile struct {
 	maxSectors int
 	sectorSize int64
 
-	flushQueue chan uint64
-	pendingMu  sync.Mutex
-	pending    map[uint64]struct{}
-	stopCh     chan struct{}
-	flushOnce  sync.Once
+	pendingMu sync.Mutex
+	pending   map[uint64]struct{}
 
 	refCount atomic.Int32
 	lastUsed atomic.Int64
@@ -138,10 +210,7 @@ func NewManagedFile(manager *FileManager, path string, opts ManagedFileOptions) 
 			opts.FlushInterval = 50 * time.Millisecond
 		}
 		mf.opts.FlushInterval = opts.FlushInterval
-		mf.flushQueue = make(chan uint64, flushQueueSize)
 		mf.pending = make(map[uint64]struct{})
-		mf.stopCh = make(chan struct{})
-		go mf.flushLoop()
 	}
 	if manager != nil {
 		manager.register(mf)
@@ -409,36 +478,20 @@ func (mf *ManagedFile) markDirty(idx int64) {
 }
 
 func (mf *ManagedFile) queueFlush(key uint64) {
-	if mf.flushQueue == nil {
-		return
-	}
 	mf.pendingMu.Lock()
+	if mf.pending == nil {
+		mf.pending = make(map[uint64]struct{})
+	}
 	if _, exists := mf.pending[key]; exists {
 		mf.pendingMu.Unlock()
 		return
 	}
 	mf.pending[key] = struct{}{}
 	mf.pendingMu.Unlock()
-	select {
-	case mf.flushQueue <- key:
-	default:
+	if mf.manager != nil && mf.manager.enqueueFlush(mf, key) {
+		return
 	}
-}
-
-func (mf *ManagedFile) flushLoop() {
-	ticker := time.NewTicker(mf.opts.FlushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case key := <-mf.flushQueue:
-			mf.flushSector(key)
-		case <-ticker.C:
-			mf.Flush()
-		case <-mf.stopCh:
-			mf.Flush()
-			return
-		}
-	}
+	go mf.flushSector(key)
 }
 
 func (mf *ManagedFile) flushSector(key uint64) {
@@ -473,9 +526,9 @@ func (mf *ManagedFile) flushSector(key uint64) {
 }
 
 func (mf *ManagedFile) Flush() {
-	if mf.flushQueue == nil {
+	if !mf.opts.CacheEnabled {
 		if mf.file != nil {
-			mf.file.Sync()
+			_ = mf.file.Sync()
 		}
 		return
 	}
@@ -496,9 +549,6 @@ func (mf *ManagedFile) Flush() {
 }
 
 func (mf *ManagedFile) Close() {
-	if mf.stopCh != nil {
-		close(mf.stopCh)
-	}
 	mf.Flush()
 	mf.forceCloseHandle()
 }

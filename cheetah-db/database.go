@@ -230,6 +230,9 @@ func (db *Database) Close() error {
 		}
 		return true
 	})
+	if db.fileManager != nil {
+		db.fileManager.Close()
+	}
 	return firstErr
 }
 
