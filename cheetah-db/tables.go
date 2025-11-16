@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 //const KeyStripeCount = 1024 // in types.go
@@ -168,18 +170,22 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 // / --- PairTable (TreeTable Node) ---
 // /
 type PairTable struct {
-	path string
-	file *os.File
-	mu   sync.RWMutex
+	id       uint32
+	path     string
+	file     *os.File
+	mu       sync.RWMutex
+	handleMu sync.Mutex
+	refCount atomic.Int32
+	lastUsed atomic.Int64
+	db       *Database
 }
 
-func NewPairTable(path string) (*PairTable, error) {
+func NewPairTable(db *Database, tableID uint32, path string) (*PairTable, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// Pre-alloca il file alla dimensione corretta se A" nuovo
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
@@ -192,11 +198,94 @@ func NewPairTable(path string) (*PairTable, error) {
 		}
 	}
 
-	return &PairTable{path: path, file: file}, nil
+	pt := &PairTable{id: tableID, path: path, file: file, db: db}
+	pt.touch()
+	pt.notifyHandleOpened()
+	return pt, nil
 }
 
+func (t *PairTable) notifyHandleOpened() {
+	if t.db != nil {
+		t.db.onPairTableHandleOpened()
+	}
+}
+
+func (t *PairTable) ensureHandle() error {
+	t.handleMu.Lock()
+	defer t.handleMu.Unlock()
+	if t.file != nil {
+		return nil
+	}
+	file, err := os.OpenFile(t.path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+	t.file = file
+	t.notifyHandleOpened()
+	return nil
+}
+
+func (t *PairTable) closeHandleIfIdle() bool {
+	t.handleMu.Lock()
+	defer t.handleMu.Unlock()
+	if t.file == nil || t.refCount.Load() > 0 {
+		return false
+	}
+	t.file.Close()
+	t.file = nil
+	if t.db != nil {
+		t.db.onPairTableHandleClosed()
+	}
+	return true
+}
+
+func (t *PairTable) forceCloseHandle() {
+	t.handleMu.Lock()
+	defer t.handleMu.Unlock()
+	if t.file == nil {
+		return
+	}
+	t.file.Close()
+	t.file = nil
+	if t.db != nil {
+		t.db.onPairTableHandleClosed()
+	}
+}
+
+func (t *PairTable) hasHandle() bool {
+	t.handleMu.Lock()
+	defer t.handleMu.Unlock()
+	return t.file != nil
+}
+
+func (t *PairTable) beginUse() {
+	t.refCount.Add(1)
+	t.touch()
+}
+
+func (t *PairTable) endUse() {
+	t.refCount.Add(-1)
+}
+
+func (t *PairTable) touch() {
+	t.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (t *PairTable) InUse() bool {
+	return t.refCount.Load() > 0
+}
+
+func (t *PairTable) LastUsedUnixNano() int64 {
+	return t.lastUsed.Load()
+}
 
 func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
+	t.beginUse()
+	defer t.endUse()
+	if err := t.ensureHandle(); err != nil {
+		return nil, err
+	}
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -207,6 +296,12 @@ func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
 }
 
 func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
+	t.beginUse()
+	defer t.endUse()
+	if err := t.ensureHandle(); err != nil {
+		return err
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -217,6 +312,12 @@ func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
 
 // IsEmpty controlla se il nodo non ha più figli o chiavi terminali.
 func (t *PairTable) IsEmpty() (bool, error) {
+	t.beginUse()
+	defer t.endUse()
+	if err := t.ensureHandle(); err != nil {
+		return false, err
+	}
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -237,25 +338,29 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	}
 
 	for i := 0; i < len(buffer); i += PairEntrySize {
-		// Il primo byte di ogni entry è il flag
 		if buffer[i] != 0 {
-			return false, nil // Se un flag è settato, non è vuoto
+			return false, nil
 		}
 	}
 	return true, nil
 }
 
 func (t *PairTable) Close() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.file != nil {
-		t.file.Close()
-		t.file = nil
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for t.InUse() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
+	t.forceCloseHandle()
 }
 
 // Snapshot returns a full copy of the current table state so callers can scan without holding locks.
 func (t *PairTable) Snapshot() ([]byte, error) {
+	t.beginUse()
+	defer t.endUse()
+	if err := t.ensureHandle(); err != nil {
+		return nil, err
+	}
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 

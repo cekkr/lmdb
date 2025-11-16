@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -27,11 +29,41 @@ type Database struct {
 	valuesTables    sync.Map
 	recycleTables   sync.Map
 	pairTables      sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	pairTableLimit  int
+	openPairTables  atomic.Int32
 	payloadCache    *payloadCache
 	mu              sync.Mutex
 	pairDir         string // Path alla cartella /pairs
 	nextPairIDPath  string // Path al file che memorizza il contatore
 	resources       *ResourceMonitor
+}
+
+func resolvePairTableLimit() int {
+	if raw := strings.TrimSpace(os.Getenv("CHEETAH_MAX_PAIR_TABLES")); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			return val
+		}
+	}
+	limit := fileDescriptorSoftLimit()
+	if limit > 0 {
+		candidate := limit - pairTableSafetyMargin
+		if candidate < minPairTableLimit {
+			candidate = minPairTableLimit
+		}
+		return candidate
+	}
+	return defaultPairTableLimit
+}
+
+func fileDescriptorSoftLimit() int {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return 0
+	}
+	if rl.Cur <= 0 || rl.Cur > math.MaxInt32 {
+		return 0
+	}
+	return int(rl.Cur)
 }
 
 const (
@@ -40,6 +72,9 @@ const (
 	pairSummaryDefaultDepth       = 1
 	pairSummaryDefaultBranchLimit = 32
 	pairSummaryMaxBranchLimit     = 1024
+	defaultPairTableLimit         = 1024
+	minPairTableLimit             = 64
+	pairTableSafetyMargin         = 128
 )
 
 type PairScanResult struct {
@@ -155,6 +190,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error)
 		mainKeys:       mkt,
 		payloadCache:   newPayloadCacheFromEnv(),
 		resources:      monitor,
+		pairTableLimit: resolvePairTableLimit(),
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -264,23 +300,104 @@ func (db *Database) getNewPairTableID() (uint32, error) {
 
 // getPairTable ora accetta un uint32 ID.
 func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
-	if table, ok := db.pairTables.Load(tableID); ok {
-		return table.(*PairTable), nil
+	if table, ok := db.loadPairTable(tableID); ok {
+		return table, nil
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if table, ok := db.pairTables.Load(tableID); ok {
-		return table.(*PairTable), nil
+	if table, ok := db.loadPairTable(tableID); ok {
+		return table, nil
 	}
 
 	// Il nome del file è l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	newTable, err := NewPairTable(path)
+	newTable, err := NewPairTable(db, tableID, path)
 	if err != nil {
 		return nil, err
 	}
-	db.pairTables.Store(tableID, newTable)
+	db.storePairTable(tableID, newTable)
 	return newTable, nil
+}
+
+func (db *Database) loadPairTable(tableID uint32) (*PairTable, bool) {
+	if table, ok := db.pairTables.Load(tableID); ok {
+		if pt, castOk := table.(*PairTable); castOk {
+			return pt, true
+		}
+	}
+	return nil, false
+}
+
+func (db *Database) storePairTable(tableID uint32, table *PairTable) {
+	db.pairTables.Store(tableID, table)
+}
+
+func (db *Database) enforcePairTableLimit() {
+	limit := db.pairTableLimit
+	if limit <= 0 {
+		return
+	}
+	for int(db.openPairTables.Load()) > limit {
+		if !db.evictIdlePairTableHandle() {
+			break
+		}
+	}
+}
+
+func (db *Database) onPairTableHandleOpened() {
+	db.openPairTables.Add(1)
+	db.enforcePairTableLimit()
+}
+
+func (db *Database) onPairTableHandleClosed() {
+	if db.openPairTables.Load() > 0 {
+		db.openPairTables.Add(-1)
+	}
+}
+
+func (db *Database) evictIdlePairTableHandle() bool {
+	var (
+		targetTable *PairTable
+		oldestUse   = int64(math.MaxInt64)
+	)
+	now := time.Now().UnixNano()
+	db.pairTables.Range(func(key, value interface{}) bool {
+		tableID, ok := key.(uint32)
+		if !ok || tableID == 0 {
+			return true
+		}
+		table, ok := value.(*PairTable)
+		if !ok || table.InUse() {
+			return true
+		}
+		lastUsed := table.LastUsedUnixNano()
+		if lastUsed == 0 {
+			lastUsed = now
+		}
+		if lastUsed < oldestUse {
+			oldestUse = lastUsed
+			targetTable = table
+		}
+		return true
+	})
+	if targetTable == nil || !targetTable.hasHandle() {
+		return false
+	}
+	if !targetTable.closeHandleIfIdle() {
+		return false
+	}
+	return true
+}
+
+func (db *Database) closePairTable(tableID uint32, table *PairTable, deleteFile bool) error {
+	if table != nil {
+		table.Close()
+	}
+	if deleteFile {
+		path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
+		return os.Remove(path)
+	}
+	return nil
 }
 
 // ExecuteCommand analizza ed esegue un comando.
@@ -599,15 +716,13 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 
 func (db *Database) deletePairTable(tableID uint32) error {
 	// Rimuove dalla cache
+	var pt *PairTable
 	if table, ok := db.pairTables.LoadAndDelete(tableID); ok {
-		if pt, castOk := table.(*PairTable); castOk {
-			pt.Close() // Chiude il file handle
+		if cast, castOk := table.(*PairTable); castOk {
+			pt = cast
 		}
 	}
-
-	// Costruisce il path e rimuove il file dal disco
-	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	return os.Remove(path)
+	return db.closePairTable(tableID, pt, true)
 }
 
 func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairScanResult, []byte, error) {

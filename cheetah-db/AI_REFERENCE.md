@@ -55,8 +55,8 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   pair-table pages concurrently, and results are deduplicated/ordered in a shared accumulator that
   respects cursors + `limit` cut-offs. This keeps trie pagination multi-core aware and prevents a
   single slow disk seek from blocking the entire scan.
-- cheetah-db now keeps persistent file handles per pair-trie node (RW locked), parallelizes reducer
-  payload hydration with a bounded worker pool, and treats child pointers + terminal keys as
+- cheetah-db keeps cached file handles per pair-trie node (RW locked), parallelizes reducer payload
+  hydration with a bounded worker pool, and treats child pointers + terminal keys as
   independent flags so prefix-sharing namespaces (`ctx:*`, `ctxv:*`, `topk:*`, etc.) finally
   coexist. `PAIR_SCAN`/`PAIR_REDUCE` accept optional cursors and emit `next_cursor=x...` when a page
   hits the configured limit, allowing clients to stream arbitrarily large namespaces without
@@ -65,6 +65,11 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).
+- The pair-table cache now enforces a descriptor cap derived from `RLIMIT_NOFILE` (override via
+  `CHEETAH_MAX_PAIR_TABLES`). Idle handles are closed and transparently re-opened when the trie node
+  is touched again, so long-running ingests stop tripping `open ... next_id.dat: too many open files`
+  even on workstations with aggressive limits (macOS default 256). Set the env var to a lower value
+  when running multiple cheetah instances on the same host or higher when you raise the OS limit.
 - cheetah-server now boots with a resource monitor: it detects logical cores, samples process vs
   system CPU percentages, and polls `/proc/self/io` for disk churn. Reducer worker pools call
   `RecommendedWorkers()` so hot `PAIR_REDUCE` bursts automatically back off when CPU or I/O pressure
