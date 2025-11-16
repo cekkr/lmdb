@@ -65,6 +65,12 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   before responses hit the REPL/logs, and `EvalLogWriter` records a `cycle_reference` entry with the
   first full reference/generated sentence for each evaluation batch so the JSON timeline always
   captures a non-truncated exemplar for the cycle.
+- Prompts handed to the decoder now always finish with the dataset-provided response label via
+  `db_slm.prompt_tags.ensure_response_prompt_tag()`. `train.py`, `load_eval_dataset()`, and
+  `run_inference_records()` call the helper before decoding, and `run.py` exposes
+  `--response-label` for interactive sessions. This is a high-priority invariant: without the
+  terminal `|RESPONSE|:` (or override) the model continues the `|USER|:` frame instead of producing a
+  reply, corrupting both training chunks and eval probes.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input

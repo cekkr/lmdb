@@ -11,6 +11,7 @@ from db_slm.context_dimensions import format_context_dimensions, parse_context_d
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 from db_slm.text_markers import append_end_marker
+from db_slm.prompt_tags import ensure_response_prompt_tag
 
 from helpers.cheetah_cli import (
     collect_namespace_summary_lines,
@@ -63,6 +64,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--instruction",
         help="Optional instruction/context block inserted ahead of every prompt.",
     )
+
+    #todo: Pay attention: specifying tags could be a limitation for some datasets. Add support directly to model.config.json (similar as dataset.config.json)
     parser.add_argument(
         "--instruction-label",
         default="|INSTRUCTION|",
@@ -72,6 +75,11 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--user-label",
         default="|USER|",
         help="Label applied to every prompt sent to DBSLM (default: %(default)s). Use '' to disable.",
+    )
+    parser.add_argument(
+        "--response-label",
+        default="|RESPONSE|",
+        help="Label appended before decoding so the model predicts the assistant turn (default: %(default)s).",
     )
     parser.add_argument(
         "--max-turns",
@@ -369,12 +377,14 @@ def respond_once_worker(
     worker: PromptWorker,
     prompt: str,
     formatter: Callable[[str], str],
+    response_label: str,
     response_formatter: Callable[[str], str],
 ) -> None:
     framed_prompt = formatter(prompt)
     if not framed_prompt:
         log("[run] Skipping empty prompt.")
         return
+    framed_prompt = ensure_response_prompt_tag(framed_prompt, response_label)
     response = worker.request(framed_prompt)
     log(f"user> {framed_prompt}")
     log(f"assistant> {response_formatter(response)}")
@@ -384,6 +394,7 @@ def interactive_loop(
     worker: PromptWorker,
     max_turns: int | None,
     formatter: Callable[[str], str],
+    response_label: str,
     response_formatter: Callable[[str], str],
 ) -> None:
     log("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
@@ -430,6 +441,7 @@ def interactive_loop(
         if not framed_prompt:
             log("[run] Ignoring empty prompt after framing.")
             continue
+        framed_prompt = ensure_response_prompt_tag(framed_prompt, response_label)
         log(f"user> {framed_prompt}")
         response = worker.request(framed_prompt)
         log(f"assistant> {response_formatter(response)}")
@@ -487,9 +499,21 @@ def main() -> None:
         response_formatter = build_response_formatter(args.max_response_words)
 
         if args.prompt:
-            respond_once_worker(worker, args.prompt, prompt_formatter, response_formatter)
+            respond_once_worker(
+                worker,
+                args.prompt,
+                prompt_formatter,
+                args.response_label,
+                response_formatter,
+            )
         else:
-            interactive_loop(worker, args.max_turns, prompt_formatter, response_formatter)
+            interactive_loop(
+                worker,
+                args.max_turns,
+                prompt_formatter,
+                args.response_label,
+                response_formatter,
+            )
     except ValueError as exc:
         parser.error(str(exc))
     finally:

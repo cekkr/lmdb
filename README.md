@@ -275,6 +275,13 @@ guaranteeing the sentence-level `|END|` marker is present even if a dataset omit
 treats `|END|` like the other structural markers, so appending it does not change semantic content
 but keeps segment boundaries unambiguous.
 
+`db_slm.prompt_tags.ensure_response_prompt_tag()` is now called by both `train.py` and the
+evaluation stack immediately before decoding so prompts always terminate with the configured
+response label (default `|RESPONSE|:`). `run.py` exposes `--response-label` for interactive sessions
+and uses the same helper. This is a high-priority invariant: without the sentinel the decoder will
+happily continue the `|USER|:` frame instead of predicting the reply, corrupting both training and
+evaluation logs.
+
 When crafting new dataset configs place the canonical labels directly in the JSON. The updated
 `datasets/GPTeacher.config.json` file now maps `input` → `|USER|` and registers the `instruction`
 column as a context field with `"placement": "before_prompt"`, yielding staged samples that begin

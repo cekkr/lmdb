@@ -38,6 +38,7 @@ from db_slm.evaluation import (
 )
 from db_slm.settings import DBSLMSettings, load_settings
 from db_slm.text_markers import append_end_marker
+from db_slm.prompt_tags import ensure_response_prompt_tag
 
 from helpers.resource_monitor import ResourceMonitor
 from helpers.cheetah_cli import (
@@ -248,6 +249,18 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _wipe_sqlite_artifacts(path: Path) -> None:
+    """Remove the SQLite database plus WAL/SHM companions when --reset is supplied."""
+    artifacts = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+    for artifact in artifacts:
+        try:
+            artifact.unlink()
+        except FileNotFoundError:
+            continue
+        except IsADirectoryError:
+            continue
+
+
 def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
     if raw == ":memory:":
         if reset:
@@ -255,8 +268,8 @@ def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
         return raw, None
     path = Path(raw).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if reset and path.exists():
-        path.unlink()
+    if reset:
+        _wipe_sqlite_artifacts(path)
     return str(path), path
 
 
@@ -677,24 +690,6 @@ def _dependency_layer_annotation(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _append_response_prompt_tag(prompt: str, response_label: str) -> str:
-    """
-    Ensure prompts end with a response marker so evaluation runs decode the assistant turn
-    instead of continuing the user request.
-    """
-    base = (prompt or "").rstrip()
-    label = (response_label or "|RESPONSE|").strip() or "|RESPONSE|"
-    sentinel = f"{label}:"
-    sentinel_with_space = f"{sentinel} "
-    if not base:
-        return sentinel_with_space
-    if base.endswith(sentinel_with_space):
-        return base
-    if base.endswith(sentinel):
-        return f"{base} "
-    return f"{base}\n{sentinel_with_space}"
-
-
 def iter_corpora(
     paths: Iterable[Path],
     encoding: str,
@@ -938,7 +933,7 @@ def iter_json_chunks(
         if annotation:
             segment_lines.append(f"DependencyLayer: {annotation}")
         segment = "\n".join(segment_lines)
-        evaluation_prompt = _append_response_prompt_tag(
+        evaluation_prompt = ensure_response_prompt_tag(
             framed_prompt or prompt_value or "",
             dataset_cfg.response.label,
         )
@@ -948,6 +943,7 @@ def iter_json_chunks(
             context_tokens=dataset_cfg.context_map(payload),
             prompt_dependencies=prompt_layer,
             response_dependencies=response_layer,
+            response_label=dataset_cfg.response.label,
         )
 
         log_prompt = evaluation_prompt
@@ -1026,13 +1022,18 @@ def load_eval_dataset(
         )
         prompt_layer = build_dependency_layer(framed_prompt or prompt_value)
         response_layer = build_dependency_layer(response)
+        evaluation_prompt = ensure_response_prompt_tag(
+            framed_prompt or prompt_value,
+            dataset_cfg.response.label,
+        )
         records.append(
             EvaluationRecord(
-                prompt=framed_prompt or prompt_value,
+                prompt=evaluation_prompt,
                 response=response,
                 context_tokens=dataset_cfg.context_map(payload),
                 prompt_dependencies=prompt_layer,
                 response_dependencies=response_layer,
+                response_label=dataset_cfg.response.label,
             )
         )
         if limit is not None and len(records) >= limit:

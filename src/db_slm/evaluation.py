@@ -22,6 +22,7 @@ from .metrics import lexical_overlap, rouge_l_score
 from .pipeline import DBSLMEngine
 from .quality import SentenceQualityScorer
 from .text_markers import extract_complete_sentence
+from .prompt_tags import ensure_response_prompt_tag
 from helpers.char_tree_similarity import similarity_score
 from helpers.resource_monitor import ResourceMonitor
 
@@ -55,6 +56,7 @@ class EvaluationRecord:
     context_tokens: dict[str, str] = field(default_factory=dict)
     prompt_dependencies: DependencyLayer | None = None
     response_dependencies: DependencyLayer | None = None
+    response_label: str = "|RESPONSE|"
 
 
 @dataclass(frozen=True)
@@ -707,9 +709,10 @@ def run_inference_records(
         flagged = False
         flag_reasons: list[str] = []
         active_decoder_cfg = entry.get("decoder_cfg_override") or decoder_cfg
+        framed_prompt = ensure_response_prompt_tag(record.prompt, getattr(record, "response_label", None))
         _, generated = issue_prompt(
             engine,
-            record.prompt,
+            framed_prompt,
             user_id=user_id,
             agent_name=agent_name,
             seed_history=False,
