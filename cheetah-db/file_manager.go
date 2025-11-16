@@ -33,6 +33,12 @@ type flushRequest struct {
 	key  uint64
 }
 
+type FileCheckpointOptions struct {
+	IdleThreshold time.Duration
+	DisableCache  bool
+	CloseHandles  bool
+}
+
 type FileManager struct {
 	limit        int
 	files        sync.Map
@@ -109,6 +115,13 @@ func (fm *FileManager) flushWorker() {
 }
 
 func (fm *FileManager) Close() {
+	if fm == nil {
+		return
+	}
+	fm.ForceCheckpoint(FileCheckpointOptions{
+		DisableCache: true,
+		CloseHandles: true,
+	})
 	if fm.flushStop != nil {
 		close(fm.flushStop)
 	}
@@ -164,6 +177,37 @@ func (fm *FileManager) enforceLimit() {
 	}
 }
 
+func (fm *FileManager) ForceCheckpoint(opts FileCheckpointOptions) int {
+	if fm == nil {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	var flushed int
+	fm.files.Range(func(_, value interface{}) bool {
+		file, ok := value.(*ManagedFile)
+		if !ok || file == nil {
+			return true
+		}
+		if opts.IdleThreshold > 0 {
+			last := file.lastUsed.Load()
+			if last != 0 && now-last < opts.IdleThreshold.Nanoseconds() {
+				return true
+			}
+		}
+		if opts.DisableCache {
+			file.DisableCache()
+		} else {
+			file.Flush()
+		}
+		if opts.CloseHandles {
+			file.forceCloseHandle()
+		}
+		flushed++
+		return true
+	})
+	return flushed
+}
+
 type sectorEntry struct {
 	data       []byte
 	dirty      bool
@@ -188,6 +232,8 @@ type ManagedFile struct {
 
 	refCount atomic.Int32
 	lastUsed atomic.Int64
+
+	cacheEnabled atomic.Bool
 }
 
 func NewManagedFile(manager *FileManager, path string, opts ManagedFileOptions) (*ManagedFile, error) {
@@ -205,7 +251,8 @@ func NewManagedFile(manager *FileManager, path string, opts ManagedFileOptions) 
 		maxSectors: opts.MaxCachedSectors,
 		sectorSize: opts.SectorSize,
 	}
-	if opts.CacheEnabled {
+	mf.cacheEnabled.Store(opts.CacheEnabled)
+	if mf.cacheEnabled.Load() {
 		if opts.FlushInterval <= 0 {
 			opts.FlushInterval = 50 * time.Millisecond
 		}
@@ -316,7 +363,7 @@ func (mf *ManagedFile) ReadAt(p []byte, off int64) (int, error) {
 	mf.beginUse()
 	defer mf.endUse()
 
-	if !mf.opts.CacheEnabled {
+	if !mf.cacheEnabled.Load() {
 		return mf.file.ReadAt(p, off)
 	}
 	return mf.readWithCache(p, off)
@@ -360,7 +407,7 @@ func (mf *ManagedFile) WriteAt(p []byte, off int64) (int, error) {
 	mf.beginUse()
 	defer mf.endUse()
 
-	if !mf.opts.CacheEnabled {
+	if !mf.cacheEnabled.Load() {
 		n, err := mf.file.WriteAt(p, off)
 		if err == nil {
 			mf.touch()
@@ -526,7 +573,7 @@ func (mf *ManagedFile) flushSector(key uint64) {
 }
 
 func (mf *ManagedFile) Flush() {
-	if !mf.opts.CacheEnabled {
+	if !mf.cacheEnabled.Load() {
 		if mf.file != nil {
 			_ = mf.file.Sync()
 		}
@@ -551,6 +598,47 @@ func (mf *ManagedFile) Flush() {
 func (mf *ManagedFile) Close() {
 	mf.Flush()
 	mf.forceCloseHandle()
+}
+
+func (mf *ManagedFile) SetCacheEnabled(enabled bool) {
+	if enabled {
+		if mf.cacheEnabled.Load() {
+			return
+		}
+		mf.cacheMu.Lock()
+		if mf.sectors == nil {
+			mf.sectors = make(map[uint64]*sectorEntry)
+		}
+		mf.cacheMu.Unlock()
+		mf.pendingMu.Lock()
+		if mf.pending == nil {
+			mf.pending = make(map[uint64]struct{})
+		}
+		mf.pendingMu.Unlock()
+		mf.cacheEnabled.Store(true)
+		mf.opts.CacheEnabled = true
+		return
+	}
+
+	if !mf.cacheEnabled.Load() {
+		if mf.file != nil {
+			_ = mf.file.Sync()
+		}
+		return
+	}
+	mf.Flush()
+	mf.cacheEnabled.Store(false)
+	mf.opts.CacheEnabled = false
+	mf.cacheMu.Lock()
+	mf.sectors = nil
+	mf.cacheMu.Unlock()
+	mf.pendingMu.Lock()
+	mf.pending = nil
+	mf.pendingMu.Unlock()
+}
+
+func (mf *ManagedFile) DisableCache() {
+	mf.SetCacheEnabled(false)
 }
 
 func min64(a, b int64) int64 {

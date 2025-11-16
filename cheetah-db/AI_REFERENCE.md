@@ -76,6 +76,14 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   of background workers drains the queue, so thousands of pair tables no longer spawn their own
   goroutines or burn CPU after they go idle, yet dirty sectors still reach disk quickly enough to
   keep SSD churn low.
+- The managed file layer now exposes a central checkpoint controller. Every `ManagedFile` registers
+  with the `FileManager`, which can force-flush dirty sectors, optionally disable caching, and close
+  handles based on idle time. Call `FILE_CHECKPOINT [IDLE=<duration>] [DROP_CACHE] [CLOSE_HANDLES]`
+  via the TCP/CLI protocol whenever you need to drain pending writes mid-run (for crash safety or to
+  shrink RAM use on cold namespaces). The engine automatically issues the equivalent of
+  `FILE_CHECKPOINT DROP_CACHE CLOSE_HANDLES` during shutdown, eliminating the "preparing DB exit..."
+  loops that appeared after heavy ingest sessions when thousands of pair tables still had dirty
+  caches waiting to flush.
 - cheetah-server now boots with a resource monitor: it detects logical cores, samples process vs
   system CPU percentages, and polls `/proc/self/io` for disk churn. Reducer worker pools call
   `RecommendedWorkers()` so hot `PAIR_REDUCE` bursts automatically back off when CPU or I/O pressure

@@ -648,6 +648,20 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			}
 		}
 		response = formatLogFlushResponse(logSink.Flush(limit))
+	case command == "FILE_CHECKPOINT":
+		if db.fileManager == nil {
+			response = "ERROR,file_manager_unavailable"
+			break
+		}
+		var cpOpts FileCheckpointOptions
+		cpOpts, err = parseFileCheckpointArgs(args)
+		if err != nil {
+			response = fmt.Sprintf("ERROR,%v", err)
+			err = nil
+			break
+		}
+		count := db.fileManager.ForceCheckpoint(cpOpts)
+		response = fmt.Sprintf("SUCCESS,file_checkpoint_flushed=%d", count)
 	default:
 		response = "ERROR,unknown_command"
 	}
@@ -1377,6 +1391,54 @@ func formatLogFlushResponse(entries []string) string {
 		b.WriteString(fmt.Sprintf("\n[%d] %s", idx+1, entry))
 	}
 	return b.String()
+}
+
+func parseFileCheckpointArgs(raw string) (FileCheckpointOptions, error) {
+	opts := FileCheckpointOptions{}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return opts, nil
+	}
+	tokens := strings.Fields(trimmed)
+	for _, token := range tokens {
+		upper := strings.ToUpper(token)
+		switch {
+		case upper == "DROP_CACHE":
+			opts.DisableCache = true
+		case upper == "CLOSE_HANDLES":
+			opts.CloseHandles = true
+		case strings.HasPrefix(upper, "IDLE="):
+			value := strings.TrimSpace(token[5:])
+			if value == "" {
+				return opts, fmt.Errorf("invalid_checkpoint_option:%s", token)
+			}
+			duration, err := time.ParseDuration(value)
+			if err != nil {
+				return opts, fmt.Errorf("invalid_idle_duration:%s", value)
+			}
+			if duration < 0 {
+				duration = 0
+			}
+			opts.IdleThreshold = duration
+		default:
+			if duration, err := time.ParseDuration(token); err == nil {
+				if duration < 0 {
+					duration = 0
+				}
+				opts.IdleThreshold = duration
+				continue
+			}
+			if seconds, err := strconv.Atoi(token); err == nil {
+				if seconds < 0 {
+					seconds = 0
+				}
+				opts.IdleThreshold = time.Duration(seconds) * time.Second
+				continue
+			}
+			return opts, fmt.Errorf("invalid_checkpoint_option:%s", token)
+		}
+	}
+	return opts, nil
 }
 
 func summarizeArg(arg string) string {
