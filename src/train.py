@@ -759,6 +759,79 @@ def parallel_corpus_stream(
     yield from _generator()
 
 
+def _iter_json_records(path: Path) -> Iterable[tuple[int, str]]:
+    """Yield raw JSON snippets (and their starting line numbers) from a file.
+
+    Supports traditional NDJSON (one object per line) and JSON arrays where
+    objects may be pretty-printed across multiple lines.
+    """
+    with path.open("r", encoding="utf-8") as handle:
+        first_non_ws_char: str | None = None
+        array_mode = False
+        buffer: list[str] = []
+        buffer_start_line: int | None = None
+        brace_depth = 0
+        in_string = False
+        escape = False
+        for line_no, raw_line in enumerate(handle, start=1):
+            line = raw_line
+            if first_non_ws_char is None:
+                idx = 0
+                while idx < len(raw_line) and (raw_line[idx].isspace() or raw_line[idx] == "\ufeff"):
+                    idx += 1
+                if idx >= len(raw_line):
+                    continue
+                first_non_ws_char = raw_line[idx]
+                if first_non_ws_char == "[":
+                    array_mode = True
+                    line = raw_line[idx + 1 :]
+                else:
+                    line = raw_line
+            if not array_mode:
+                stripped = raw_line.strip()
+                if stripped:
+                    yield line_no, stripped
+                continue
+            idx = 0
+            while idx < len(line):
+                ch = line[idx]
+                if buffer_start_line is None:
+                    if ch.isspace() or ch == ",":
+                        idx += 1
+                        continue
+                    if ch == "]":
+                        idx += 1
+                        continue
+                    if ch == "{":
+                        buffer_start_line = line_no
+                        brace_depth = 1
+                        in_string = False
+                        escape = False
+                        buffer = ["{"]
+                        idx += 1
+                        continue
+                    idx += 1
+                    continue
+                buffer.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\" and in_string:
+                    escape = True
+                elif ch == '"' and not escape:
+                    in_string = not in_string
+                elif not in_string:
+                    if ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth -= 1
+                        if brace_depth == 0 and buffer_start_line is not None:
+                            json_text = "".join(buffer)
+                            yield buffer_start_line, json_text
+                            buffer = []
+                            buffer_start_line = None
+                idx += 1
+
+
 def iter_json_chunks(
     path: Path,
     chunk_size: int,
@@ -772,68 +845,64 @@ def iter_json_chunks(
     chunk_index = 0
     consumed = 0
     limit = max(0, max_lines)
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                log(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
-                continue
-            prompt_value = dataset_cfg.extract_prompt(payload)
-            response = dataset_cfg.extract_response(payload)
-            context_values = list(dataset_cfg.iter_context_values(payload))
-            framed_prompt = dataset_cfg.compose_prompt(
-                payload, raw_prompt=prompt_value, context_values=context_values
-            )
-            preface_contexts, trailing_contexts = dataset_cfg.partition_context_values(context_values)
-            if not response:
-                continue
-            prompt_layer = build_dependency_layer(framed_prompt or prompt_value or "")
-            response_layer = build_dependency_layer(response)
-            segment_lines: list[str] = []
-            for field, ctx_value in preface_contexts:
-                if field.label:
-                    segment_lines.append(f"{field.label}: {ctx_value}")
-                normalized = field.normalized_token(ctx_value)
-                segment_lines.append(f"|CTX|:{field.token}:{normalized}")
-            if prompt_value:
-                segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt_value.strip()}")
-            for field, ctx_value in trailing_contexts:
-                if field.label:
-                    segment_lines.append(f"{field.label}: {ctx_value}")
-                normalized = field.normalized_token(ctx_value)
-                segment_lines.append(f"|CTX|:{field.token}:{normalized}")
-            response_line = f"{dataset_cfg.response.label}: {response.strip()}"
-            response_line = append_end_marker(response_line)
-            segment_lines.append(response_line)
-            annotation = _dependency_layer_annotation(prompt_layer, response_layer)
-            if annotation:
-                segment_lines.append(f"DependencyLayer: {annotation}")
-            segment = "\n".join(segment_lines)
-            record = EvaluationRecord(
-                prompt=framed_prompt or prompt_value or "",
-                response=response,
-                context_tokens=dataset_cfg.context_map(payload),
-                prompt_dependencies=prompt_layer,
-                response_dependencies=response_layer,
-            )
+    for line_no, json_text in _iter_json_records(path):
+        if limit and consumed >= limit:
+            break
+        try:
+            payload = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            log(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
+            continue
+        prompt_value = dataset_cfg.extract_prompt(payload)
+        response = dataset_cfg.extract_response(payload)
+        context_values = list(dataset_cfg.iter_context_values(payload))
+        framed_prompt = dataset_cfg.compose_prompt(
+            payload, raw_prompt=prompt_value, context_values=context_values
+        )
+        preface_contexts, trailing_contexts = dataset_cfg.partition_context_values(context_values)
+        if not response:
+            continue
+        prompt_layer = build_dependency_layer(framed_prompt or prompt_value or "")
+        response_layer = build_dependency_layer(response)
+        segment_lines: list[str] = []
+        for field, ctx_value in preface_contexts:
+            if field.label:
+                segment_lines.append(f"{field.label}: {ctx_value}")
+            normalized = field.normalized_token(ctx_value)
+            segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+        if prompt_value:
+            segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt_value.strip()}")
+        for field, ctx_value in trailing_contexts:
+            if field.label:
+                segment_lines.append(f"{field.label}: {ctx_value}")
+            normalized = field.normalized_token(ctx_value)
+            segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+        response_line = f"{dataset_cfg.response.label}: {response.strip()}"
+        response_line = append_end_marker(response_line)
+        segment_lines.append(response_line)
+        annotation = _dependency_layer_annotation(prompt_layer, response_layer)
+        if annotation:
+            segment_lines.append(f"DependencyLayer: {annotation}")
+        segment = "\n".join(segment_lines)
+        record = EvaluationRecord(
+            prompt=framed_prompt or prompt_value or "",
+            response=response,
+            context_tokens=dataset_cfg.context_map(payload),
+            prompt_dependencies=prompt_layer,
+            response_dependencies=response_layer,
+        )
 
-            log_prompt = framed_prompt or prompt_value or ""
-            if len(log_prompt) > 160:
-                log_prompt = f"{log_prompt[:157]}..."
-            log(f"[train] Staged line #{line_no} (Prompt: {log_prompt})")
+        log_prompt = framed_prompt or prompt_value or ""
+        if len(log_prompt) > 160:
+            log_prompt = f"{log_prompt[:157]}..."
+        log(f"[train] Staged line #{line_no} (Prompt: {log_prompt})")
 
-            entries.append((segment, record))
-            consumed += 1
-            if len(entries) >= chunk_size:
-                chunk_index += 1
-                yield _build_chunk(f"{path}#chunk{chunk_index}", entries, holdout_fraction)
-                entries = []
-            if limit and consumed >= limit:
-                break
+        entries.append((segment, record))
+        consumed += 1
+        if len(entries) >= chunk_size:
+            chunk_index += 1
+            yield _build_chunk(f"{path}#chunk{chunk_index}", entries, holdout_fraction)
+            entries = []
     if entries:
         chunk_index += 1
         yield _build_chunk(f"{path}#chunk{chunk_index}", entries, holdout_fraction)
@@ -883,37 +952,33 @@ def load_eval_dataset(
         3,
         f"[eval:v3] Loading evaluation dataset from {path} (limit={limit or 'all'} records).",
     )
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                log(f"[eval] Skipping line {line_no}: {exc}")
-                continue
-            prompt_value = dataset_cfg.extract_prompt(payload)
-            response = dataset_cfg.extract_response(payload)
-            if not prompt_value or not response:
-                continue
-            context_values = list(dataset_cfg.iter_context_values(payload))
-            framed_prompt = dataset_cfg.compose_prompt(
-                payload, raw_prompt=prompt_value, context_values=context_values
+    for line_no, json_text in _iter_json_records(path):
+        try:
+            payload = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            log(f"[eval] Skipping line {line_no}: {exc}")
+            continue
+        prompt_value = dataset_cfg.extract_prompt(payload)
+        response = dataset_cfg.extract_response(payload)
+        if not prompt_value or not response:
+            continue
+        context_values = list(dataset_cfg.iter_context_values(payload))
+        framed_prompt = dataset_cfg.compose_prompt(
+            payload, raw_prompt=prompt_value, context_values=context_values
+        )
+        prompt_layer = build_dependency_layer(framed_prompt or prompt_value)
+        response_layer = build_dependency_layer(response)
+        records.append(
+            EvaluationRecord(
+                prompt=framed_prompt or prompt_value,
+                response=response,
+                context_tokens=dataset_cfg.context_map(payload),
+                prompt_dependencies=prompt_layer,
+                response_dependencies=response_layer,
             )
-            prompt_layer = build_dependency_layer(framed_prompt or prompt_value)
-            response_layer = build_dependency_layer(response)
-            records.append(
-                EvaluationRecord(
-                    prompt=framed_prompt or prompt_value,
-                    response=response,
-                    context_tokens=dataset_cfg.context_map(payload),
-                    prompt_dependencies=prompt_layer,
-                    response_dependencies=response_layer,
-                )
-            )
-            if limit is not None and len(records) >= limit:
-                break
+        )
+        if limit is not None and len(records) >= limit:
+            break
     if limit is not None:
         random.shuffle(records)
     log_verbose(3, f"[eval:v3] Loaded {len(records)} evaluation record(s) from {path}.")
