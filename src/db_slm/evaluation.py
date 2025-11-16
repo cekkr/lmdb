@@ -416,7 +416,14 @@ def preview(text: str, width: int = 1000) -> str:
     collapsed = " ".join(text.split())
     if not collapsed:
         return ""
-    return textwrap.shorten(collapsed, width=width, placeholder="…\n")
+    marker = "|RESPONSE|:"
+    adjusted_width = width
+    marker_index = collapsed.find(marker)
+    if marker_index != -1:
+        adjusted_width = max(adjusted_width, marker_index + len(marker) + 256)
+    if len(collapsed) <= adjusted_width:
+        return collapsed
+    return textwrap.shorten(collapsed, width=adjusted_width, placeholder="…\n")
 
 
 _STRUCTURE_WORD_RE = re.compile(r"[A-Za-z0-9']+")

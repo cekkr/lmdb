@@ -677,6 +677,24 @@ def _dependency_layer_annotation(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _append_response_prompt_tag(prompt: str, response_label: str) -> str:
+    """
+    Ensure prompts end with a response marker so evaluation runs decode the assistant turn
+    instead of continuing the user request.
+    """
+    base = (prompt or "").rstrip()
+    label = (response_label or "|RESPONSE|").strip() or "|RESPONSE|"
+    sentinel = f"{label}:"
+    sentinel_with_space = f"{sentinel} "
+    if not base:
+        return sentinel_with_space
+    if base.endswith(sentinel_with_space):
+        return base
+    if base.endswith(sentinel):
+        return f"{base} "
+    return f"{base}\n{sentinel_with_space}"
+
+
 def iter_corpora(
     paths: Iterable[Path],
     encoding: str,
@@ -920,15 +938,19 @@ def iter_json_chunks(
         if annotation:
             segment_lines.append(f"DependencyLayer: {annotation}")
         segment = "\n".join(segment_lines)
+        evaluation_prompt = _append_response_prompt_tag(
+            framed_prompt or prompt_value or "",
+            dataset_cfg.response.label,
+        )
         record = EvaluationRecord(
-            prompt=framed_prompt or prompt_value or "",
+            prompt=evaluation_prompt,
             response=response,
             context_tokens=dataset_cfg.context_map(payload),
             prompt_dependencies=prompt_layer,
             response_dependencies=response_layer,
         )
 
-        log_prompt = framed_prompt or prompt_value or ""
+        log_prompt = evaluation_prompt
         if len(log_prompt) > 160:
             log_prompt = f"{log_prompt[:157]}..."
         log(f"[train] Staged line #{line_no} (Prompt: {log_prompt})")

@@ -54,8 +54,8 @@ class DatasetConfig:
     def default() -> DatasetConfig:
         return DatasetConfig(
             name="default",
-            prompt=DatasetFieldConfig("prompt", "Prompt"),
-            response=DatasetFieldConfig("response", "Response"),
+            prompt=DatasetFieldConfig("prompt", "|USER|"),
+            response=DatasetFieldConfig("response", "|RESPONSE|"),
             context_fields=tuple(),
             source_path=None,
         )
@@ -151,9 +151,9 @@ def _parse_dataset_config(path: Path) -> DatasetConfig:
     payload = json.loads(path.read_text(encoding="utf-8"))
     name = _stringify(payload.get("name") or path.stem or "dataset")
     prompt_key = _stringify(payload.get("prompt_field") or "prompt") or "prompt"
-    prompt_label = _stringify(payload.get("prompt_label") or "Prompt") or "Prompt"
+    prompt_label = _stringify(payload.get("prompt_label") or "|USER|") or "|USER|"
     response_key = _stringify(payload.get("response_field") or "response") or "response"
-    response_label = _stringify(payload.get("response_label") or "Response") or "Response"
+    response_label = _stringify(payload.get("response_label") or "|RESPONSE|") or "|RESPONSE|"
     prompt_cfg = DatasetFieldConfig(prompt_key, prompt_label)
     response_cfg = DatasetFieldConfig(response_key, response_label)
 

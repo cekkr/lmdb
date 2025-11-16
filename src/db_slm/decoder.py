@@ -59,7 +59,7 @@ class Decoder:
             dimension_tracker = ContextDimensionTracker(self.context_dimensions, list(context_ids))
         for _ in range(config.max_tokens):
             order = min(self.store.order, len(context_ids) + 1)
-            candidates = self.store.get_topk(context_ids, order, profile["topk"])
+            candidates = self._resolve_candidates(context_ids, order, profile["topk"])
             if not candidates:
                 candidates = self._relativistic_fallback(context_ids, order, profile["topk"])
                 if not candidates:
@@ -146,6 +146,21 @@ class Decoder:
         for token_id in list(base.keys()):
             base[token_id] = base[token_id] / total
         return base
+
+    def _resolve_candidates(
+        self,
+        context_ids: Sequence[int],
+        order: int,
+        k: int,
+    ) -> List[TokenCandidate]:
+        """
+        Step down through shorter contexts when the full-order lookup has no hits.
+        """
+        for current_order in range(order, 0, -1):
+            candidates = self.store.get_topk(context_ids, current_order, k)
+            if candidates:
+                return candidates
+        return []
 
     def _sample(
         self,
