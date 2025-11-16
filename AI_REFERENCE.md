@@ -46,6 +46,12 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   via the new `--prep-workers` (default: `max(1, cpu_count-1)`) and `--prep-prefetch` options so the
   ingestion loop can stay CPU-bound on the DB/Smoother while workers feed ready-to-train chunks.
   Std-in payloads are still staged synchronously to avoid buffering surprises.
+- Dataset configs now honor `context_fields[].placement` so structured metadata (for example the
+  GPTeacher `instruction` column) can be injected ahead of the user prompt as `|INSTRUCTION|: ...`.
+  `DatasetConfig.compose_prompt()` mirrors that preface for evaluation prompts, guaranteeing that
+  training chunks and held-out probes share the same `|INSTRUCTION|` + `|USER|` framing. The
+  inference CLI exposes `--instruction`, `--instruction-label`, and `--user-label` so `run.py`
+  sessions can generate prompts with the identical scaffolding.
 - Evaluation probes reuse the stored dependency layers to compute `strong_token_overlap` and
   `dependency_arc_overlap` metrics for each generation. Both are logged next to ROUGE/perplexity and
   folded into the metrics export so we can tell whether the decoder is preserving grammatical
