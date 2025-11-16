@@ -4,7 +4,7 @@ import argparse
 import multiprocessing
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from db_slm import DBSLMEngine
 from db_slm.context_dimensions import format_context_dimensions, parse_context_dimensions_arg
@@ -59,6 +59,20 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Single prompt to send in non-interactive mode. If omitted an interactive shell starts.",
     )
     parser.add_argument(
+        "--instruction",
+        help="Optional instruction/context block inserted ahead of every prompt.",
+    )
+    parser.add_argument(
+        "--instruction-label",
+        default="|INSTRUCTION|",
+        help="Label used when --instruction is set (default: %(default)s). Use '' to omit the label.",
+    )
+    parser.add_argument(
+        "--user-label",
+        default="|USER|",
+        help="Label applied to every prompt sent to DBSLM (default: %(default)s). Use '' to disable.",
+    )
+    parser.add_argument(
         "--max-turns",
         type=int,
         default=None,
@@ -107,6 +121,35 @@ def conversation_exists(engine: DBSLMEngine, conversation_id: str) -> bool:
         "SELECT 1 FROM tbl_l2_conversations WHERE id = ? LIMIT 1", (conversation_id,)
     )
     return bool(rows)
+
+
+def build_prompt_formatter(
+    instruction: str | None, instruction_label: str | None, user_label: str | None
+) -> Callable[[str], str]:
+    instruction_text = (instruction or "").strip()
+    instruction_label_clean = (instruction_label or "").strip()
+    instruction_line = ""
+    if instruction_text:
+        instruction_line = (
+            f"{instruction_label_clean}: {instruction_text}"
+            if instruction_label_clean
+            else instruction_text
+        )
+    user_label_clean = (user_label or "").strip()
+
+    def _formatter(raw_prompt: str) -> str:
+        prompt_text = (raw_prompt or "").strip()
+        segments: list[str] = []
+        if instruction_line:
+            segments.append(instruction_line)
+        if prompt_text:
+            if user_label_clean:
+                segments.append(f"{user_label_clean}: {prompt_text}")
+            else:
+                segments.append(prompt_text)
+        return "\n".join(segments).strip()
+
+    return _formatter
 
 
 class PromptWorker:
@@ -312,13 +355,17 @@ def _decoder_worker(
             engine.db.close()
 
 
-def respond_once_worker(worker: PromptWorker, prompt: str) -> None:
-    response = worker.request(prompt)
-    log(f"user> {prompt}")
+def respond_once_worker(worker: PromptWorker, prompt: str, formatter: Callable[[str], str]) -> None:
+    framed_prompt = formatter(prompt)
+    if not framed_prompt:
+        log("[run] Skipping empty prompt.")
+        return
+    response = worker.request(framed_prompt)
+    log(f"user> {framed_prompt}")
     log(f"assistant> {response}")
 
 
-def interactive_loop(worker: PromptWorker, max_turns: int | None) -> None:
+def interactive_loop(worker: PromptWorker, max_turns: int | None, formatter: Callable[[str], str]) -> None:
     log("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
     turns = 0
     while max_turns is None or turns < max_turns:
@@ -359,7 +406,12 @@ def interactive_loop(worker: PromptWorker, max_turns: int | None) -> None:
                     preview = preview[:197] + "..."
                 log(f"[run] History preview: {preview}")
             continue
-        response = worker.request(user_input)
+        framed_prompt = formatter(user_input)
+        if not framed_prompt:
+            log("[run] Ignoring empty prompt after framing.")
+            continue
+        log(f"user> {framed_prompt}")
+        response = worker.request(framed_prompt)
         log(f"assistant> {response}")
         turns += 1
     log(f"[run] Conversation {worker.conversation_id} closed after {turns} turn(s).")
@@ -397,11 +449,12 @@ def main() -> None:
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         log(f"[run] Using conversation: {worker.conversation_id} (context dims: {dims_label})")
+        prompt_formatter = build_prompt_formatter(args.instruction, args.instruction_label, args.user_label)
 
         if args.prompt:
-            respond_once_worker(worker, args.prompt)
+            respond_once_worker(worker, args.prompt, prompt_formatter)
         else:
-            interactive_loop(worker, args.max_turns)
+            interactive_loop(worker, args.max_turns, prompt_formatter)
     except ValueError as exc:
         parser.error(str(exc))
     finally:

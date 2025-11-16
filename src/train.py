@@ -782,17 +782,26 @@ def iter_json_chunks(
             except json.JSONDecodeError as exc:
                 log(f"[train] JSON ingest warning ({path} line {line_no}): {exc}")
                 continue
-            prompt = dataset_cfg.extract_prompt(payload)
+            prompt_value = dataset_cfg.extract_prompt(payload)
             response = dataset_cfg.extract_response(payload)
             context_values = list(dataset_cfg.iter_context_values(payload))
+            framed_prompt = dataset_cfg.compose_prompt(
+                payload, raw_prompt=prompt_value, context_values=context_values
+            )
+            preface_contexts, trailing_contexts = dataset_cfg.partition_context_values(context_values)
             if not response:
                 continue
-            prompt_layer = build_dependency_layer(prompt or "")
+            prompt_layer = build_dependency_layer(framed_prompt or prompt_value or "")
             response_layer = build_dependency_layer(response)
             segment_lines: list[str] = []
-            if prompt:
-                segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt.strip()}")
-            for field, ctx_value in context_values:
+            for field, ctx_value in preface_contexts:
+                if field.label:
+                    segment_lines.append(f"{field.label}: {ctx_value}")
+                normalized = field.normalized_token(ctx_value)
+                segment_lines.append(f"|CTX|:{field.token}:{normalized}")
+            if prompt_value:
+                segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt_value.strip()}")
+            for field, ctx_value in trailing_contexts:
                 if field.label:
                     segment_lines.append(f"{field.label}: {ctx_value}")
                 normalized = field.normalized_token(ctx_value)
@@ -805,14 +814,17 @@ def iter_json_chunks(
                 segment_lines.append(f"DependencyLayer: {annotation}")
             segment = "\n".join(segment_lines)
             record = EvaluationRecord(
-                prompt=prompt or "",
+                prompt=framed_prompt or prompt_value or "",
                 response=response,
                 context_tokens=dataset_cfg.context_map(payload),
                 prompt_dependencies=prompt_layer,
                 response_dependencies=response_layer,
             )
 
-            log(f"[train] Staged line #{line_no} (Prompt: {prompt})")
+            log_prompt = framed_prompt or prompt_value or ""
+            if len(log_prompt) > 160:
+                log_prompt = f"{log_prompt[:157]}..."
+            log(f"[train] Staged line #{line_no} (Prompt: {log_prompt})")
 
             entries.append((segment, record))
             consumed += 1
@@ -881,15 +893,19 @@ def load_eval_dataset(
             except json.JSONDecodeError as exc:
                 log(f"[eval] Skipping line {line_no}: {exc}")
                 continue
-            prompt = dataset_cfg.extract_prompt(payload)
+            prompt_value = dataset_cfg.extract_prompt(payload)
             response = dataset_cfg.extract_response(payload)
-            if not prompt or not response:
+            if not prompt_value or not response:
                 continue
-            prompt_layer = build_dependency_layer(prompt)
+            context_values = list(dataset_cfg.iter_context_values(payload))
+            framed_prompt = dataset_cfg.compose_prompt(
+                payload, raw_prompt=prompt_value, context_values=context_values
+            )
+            prompt_layer = build_dependency_layer(framed_prompt or prompt_value)
             response_layer = build_dependency_layer(response)
             records.append(
                 EvaluationRecord(
-                    prompt=prompt,
+                    prompt=framed_prompt or prompt_value,
                     response=response,
                     context_tokens=dataset_cfg.context_map(payload),
                     prompt_dependencies=prompt_layer,

@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, List, Tuple
+from typing import Any, Iterator, List, Sequence, Tuple
 
 
 def _stringify(value: Any) -> str:
@@ -27,6 +27,7 @@ class ContextFieldConfig:
     key: str
     label: str
     token: str
+    placement: str = "after_prompt"
 
     def normalized_token(self, value: str) -> str:
         lowered = value.strip().lower()
@@ -36,6 +37,9 @@ class ContextFieldConfig:
         sanitized = re.sub(r"[^a-z0-9_:-]", "", collapsed)
         sanitized = sanitized.strip("_:-")
         return sanitized or "unknown"
+
+    def should_prepend(self) -> bool:
+        return self.placement == "before_prompt"
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,48 @@ class DatasetConfig:
 
     def context_map(self, payload: dict[str, Any]) -> dict[str, str]:
         return {field.token: value for field, value in self.iter_context_values(payload)}
+
+    def partition_context_values(
+        self, context_values: Sequence[tuple[ContextFieldConfig, str]]
+    ) -> tuple[list[tuple[ContextFieldConfig, str]], list[tuple[ContextFieldConfig, str]]]:
+        preface: list[tuple[ContextFieldConfig, str]] = []
+        post: list[tuple[ContextFieldConfig, str]] = []
+        for field, value in context_values:
+            if field.should_prepend():
+                preface.append((field, value))
+            else:
+                post.append((field, value))
+        return preface, post
+
+    def compose_prompt(
+        self,
+        payload: dict[str, Any],
+        *,
+        raw_prompt: str | None = None,
+        context_values: Sequence[tuple[ContextFieldConfig, str]] | None = None,
+    ) -> str:
+        prompt_value = _stringify(raw_prompt) if raw_prompt is not None else self.extract_prompt(payload)
+        prompt_value = prompt_value.strip()
+        ctx_values = (
+            list(context_values)
+            if context_values is not None
+            else list(self.iter_context_values(payload))
+        )
+        lines: list[str] = []
+        for field, ctx_val in ctx_values:
+            if not field.should_prepend():
+                continue
+            ctx_line = ctx_val.strip()
+            if not ctx_line:
+                continue
+            if field.label:
+                lines.append(f"{field.label}: {ctx_line}")
+            else:
+                lines.append(ctx_line)
+        if prompt_value:
+            prompt_line = f"{self.prompt.label}: {prompt_value}" if self.prompt.label else prompt_value
+            lines.append(prompt_line.strip())
+        return "\n".join(lines).strip()
 
 
 def infer_config_path(dataset_path: Path) -> Path:
@@ -120,7 +166,8 @@ def _parse_dataset_config(path: Path) -> DatasetConfig:
             continue
         token_name = _stringify(entry.get("token_name") or field_key).strip() or field_key
         label = _stringify(entry.get("label") or token_name).strip() or token_name
-        context_fields.append(ContextFieldConfig(field_key, label, token_name))
+        placement = _normalize_context_placement(entry.get("placement"))
+        context_fields.append(ContextFieldConfig(field_key, label, token_name, placement))
 
     return DatasetConfig(
         name=name,
@@ -129,3 +176,12 @@ def _parse_dataset_config(path: Path) -> DatasetConfig:
         context_fields=tuple(context_fields),
         source_path=path,
     )
+
+
+def _normalize_context_placement(raw: Any) -> str:
+    normalized = _stringify(raw).strip().lower()
+    if not normalized:
+        return "after_prompt"
+    if normalized in {"before", "pre", "preface", "before_prompt", "prompt_preface"}:
+        return "before_prompt"
+    return "after_prompt"

@@ -259,21 +259,26 @@ hashed guidance path is used from the start.
 ### Instruction and Response Tags
 
 Prompt/response scaffolding now supports the explicit tags that the evaluator and regression tests
-already expect. `train.py` simply prints whatever `prompt_label`/`response_label` the dataset config
-provides, so setting, for example, `prompt_label` to `|INSTRUCTION|` yields staged lines that start
-with ``|INSTRUCTION|: ...``. Interactive helpers (`run.py`, the evaluation probes, and the
-paraphraser guards in `src/db_slm/pipeline.py`) continue to wrap prompts with `|USER|:` and model
-outputs with `|RESPONSE|:` so downstream tooling can distinguish user turns from generations. Every
-response sent through the trainer also flows through `append_end_marker()`, guaranteeing the
-sentence-level `|END|` marker is present even if a dataset omits it. The tokenizer treats `|END|`
-like the other structural markers, so appending it does not change semantic content but keeps
-segment boundaries unambiguous.
+already expect. `train.py` prints whatever `prompt_label`/`response_label` the dataset config
+provides, and any `context_fields` entry can opt into `"placement": "before_prompt"` so its label is
+inserted immediately ahead of the user prompt. `DatasetConfig.compose_prompt()` mirrors those
+preface lines when building held-out prompts, letting evaluation probes replay the exact
+`|INSTRUCTION|` + `|USER|` framing produced during staging. Interactive helpers (`run.py`, the
+evaluation probes, and the paraphraser guards in `src/db_slm/pipeline.py`) wrap prompts with
+`|USER|:` and model outputs with `|RESPONSE|:` so downstream tooling can distinguish user turns from
+generations. Every response sent through the trainer also flows through `append_end_marker()`,
+guaranteeing the sentence-level `|END|` marker is present even if a dataset omits it. The tokenizer
+treats `|END|` like the other structural markers, so appending it does not change semantic content
+but keeps segment boundaries unambiguous.
 
-When crafting new dataset configs place the canonical labels directly in the JSON. The new
-`datasets/GPTeacher.config.json` file demonstrates this by mapping `instruction` → `|INSTRUCTION|`
-and `response` → `|RESPONSE|`, while exposing the optional `input` column as a `|CTX|:input:<value>`
-context tag. No code changes were required in `src/train.py`; the loader already respects arbitrary
-labels and tokens supplied by `load_dataset_config()`.
+When crafting new dataset configs place the canonical labels directly in the JSON. The updated
+`datasets/GPTeacher.config.json` file now maps `input` → `|USER|` and registers the `instruction`
+column as a context field with `"placement": "before_prompt"`, yielding staged samples that begin
+with ``|INSTRUCTION|: ...`` followed by the actual ``|USER|: ...`` prompt. No code changes are
+required when adding similar datasets—`load_dataset_config()` already respects arbitrary labels,
+tokens, and placements supplied by the config file.
+Evaluation datasets still require the real prompt column; optional instruction/context fields are
+only added when present in the source JSON.
 
 ### cheetah Streaming Archive
 
@@ -398,6 +403,8 @@ Key arguments:
 - `--ngram-order`: Should match the value used during training; override only when you intentionally built a database with a different order.
 - `--context-dimensions`: Same parser as `train.py`. Override span ranges ("1-2,4-6", `off`, etc.) when you want to force different repeat penalties than the metadata stored alongside the database.
 - `--prompt`: Skip the REPL and emit a single response (great for CI hooks or quick sanity checks). When omitted, interactive mode starts.
+- `--instruction`/`--instruction-label`: Provide a system or teacher instruction that should always precede the real prompt. The CLI emits the block as ``|INSTRUCTION|: ...`` by default, matching the dataset framing.
+- `--user-label`: Labels every prompt before it is handed to DBSLM (defaults to `|USER|`). Pass `--user-label ''` to opt out when a raw prompt is desired.
 - `--conversation`: Resume a Level 2 conversation ID already stored in `tbl_l2_conversations`; omit to start a fresh session (the new ID is printed at startup).
 - `--user` / `--agent`: Customize the identifiers written to Level 2 so parallel sessions stay distinguishable in the logs.
 - `--max-turns`: Auto-exit after the specified number of user prompts. Useful when scripting deterministic walkthroughs.
