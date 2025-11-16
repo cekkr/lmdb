@@ -149,12 +149,13 @@ python src/train.py datasets/emotion_data.json \
 ### Argument guide
 
 - **Core ingest + storage**
-  - `inputs`: Files or directories to ingest. Directories respect `--recursive` and only pull in `*.txt`.
+  - `inputs`: Files or directories to ingest. Directories respect `--recursive` and only pull in `*.txt` files; explicit file arguments may be pre-tagged `.txt` corpora or `.json`/`.ndjson` datasets that pick up their configs automatically.
   - `--db`: Destination SQLite file. Parent directories are created automatically; use `:memory:` for scratch runs (cannot be combined with `--reset`). Keep the chosen path consistent with `run.py`.
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
+  - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
 - **File reading helpers**
   - `--recursive`: When scanning folders, include subdirectories (default is to read only the top level).
   - `--encoding`: Override the UTF-8 reader if the corpus uses another encoding.
@@ -170,6 +171,7 @@ python src/train.py datasets/emotion_data.json \
   - `--eval-variants <count>`: Responses per prompt (defaults to 2 when context dimensions are enabled, otherwise 1) so you can compare structural diversity.
   - `--eval-seed <int>`: Base seed for evaluation randomness. Each prompt/variant gets a deterministic sub-seed derived from this value.
   - `--eval-dataset <path>`: NDJSON file containing `prompt`/`response` pairs; defaults to `DBSLM_DATASET_PATH` from `.env`.
+  - `--eval-dataset-config <path>`: Override the metadata/label mapping used for `--eval-dataset`. Falls back to `<dataset>.config.json` or `DBSLM_DATASET_CONFIG_PATH` when omitted.
   - `--eval-pool-size <count>`: Maximum number of records kept in memory for the rolling evaluation pool (default 200, 0/None means unlimited).
 - **Profiling + logging**
   - `--profile-ingest`: Print per-corpus latency and RSS metrics while ingesting so you can raise chunk sizes confidently.
@@ -218,6 +220,22 @@ python3 src/train.py datasets/emotion_data.json \
   --eval-samples 2 \
   --eval-pool-size 20
 ```
+
+### Dataset defaults & configs
+
+`DBSLM_DATASET_PATH` in `.env` points at the canonical NDJSON dataset used for evaluation seeds
+(`datasets/emotion_data.json` by default). When you pass any `.json`/`.ndjson` corpus to
+`src/train.py`, the loader automatically searches for `<dataset>.config.json` (next to the data) or
+the config supplied via `--dataset-config`/`DBSLM_DATASET_CONFIG_PATH`. That file declares the
+prompt/response labels and optional context fields so the trainer can generate the `|CTX|:` tags and
+structural headers for you. Because the lookup runs per file, you can mix multiple JSON corpora in a
+single command—each will read its sibling `.config.json` unless you explicitly override the path.
+Plain `.txt` inputs continue to work for already-tagged corpora—they skip config discovery entirely
+and stage the text as-is.
+
+Use `--eval-dataset` plus `--eval-dataset-config` when the hold-out file differs from the training
+corpora. Otherwise the evaluator inherits the same discovery rules as training (infer, then fall back
+to the environment variable).
 
 ### Adaptive Tokenization + Context Tags
 

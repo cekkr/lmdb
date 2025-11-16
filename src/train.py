@@ -56,7 +56,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "inputs",
         nargs="*",
-        help="Text files or directories containing *.txt files to ingest.",
+        help="Text/JSON files or directories to ingest. Directories pull in *.txt files while JSON/NDJSON inputs honor dataset configs.",
     )
     parser.add_argument(
         "--db",
@@ -87,6 +87,13 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Read an additional corpus from STDIN.",
     )
     parser.add_argument(
+        "--dataset-config",
+        help=(
+            "Path to a dataset config JSON applied to *.json/NDJSON corpora. "
+            "Defaults to <dataset>.config.json or DBSLM_DATASET_CONFIG_PATH."
+        ),
+    )
+    parser.add_argument(
         "--recursive",
         action="store_true",
         help="When a directory is provided, recursively ingest *.txt files.",
@@ -111,6 +118,13 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-dataset",
         help="Path to an NDJSON dataset containing 'prompt' and 'response' fields. Defaults to DBSLM_DATASET_PATH.",
+    )
+    parser.add_argument(
+        "--eval-dataset-config",
+        help=(
+            "Override dataset metadata for --eval-dataset. "
+            "Defaults to <dataset>.config.json or DBSLM_DATASET_CONFIG_PATH."
+        ),
     )
     parser.add_argument(
         "--eval-pool-size",
@@ -633,12 +647,19 @@ def iter_corpora(
     json_chunk_size: int,
     max_json_lines: int,
     chunk_eval_percent: float,
+    dataset_config_path: str | None,
 ) -> Iterable[CorpusChunk]:
     holdout_fraction = max(0.0, min(chunk_eval_percent, 100.0)) / 100.0
     for path in paths:
         suffix = path.suffix.lower()
         if suffix in {".json", ".ndjson"}:
-            yield from iter_json_chunks(path, json_chunk_size, max_json_lines, holdout_fraction)
+            yield from iter_json_chunks(
+                path,
+                json_chunk_size,
+                max_json_lines,
+                holdout_fraction,
+                dataset_config_path,
+            )
             continue
         text = path.read_text(encoding=encoding)
         row_count = max(1, len([line for line in text.splitlines() if line.strip()]))
@@ -651,9 +672,19 @@ def _prepare_corpus_chunks(
     json_chunk_size: int,
     max_json_lines: int,
     chunk_eval_percent: float,
+    dataset_config_path: str | None,
 ) -> list[CorpusChunk]:
     path = Path(path_str)
-    return list(iter_corpora([path], encoding, json_chunk_size, max_json_lines, chunk_eval_percent))
+    return list(
+        iter_corpora(
+            [path],
+            encoding,
+            json_chunk_size,
+            max_json_lines,
+            chunk_eval_percent,
+            dataset_config_path,
+        )
+    )
 
 
 def parallel_corpus_stream(
@@ -664,9 +695,17 @@ def parallel_corpus_stream(
     chunk_eval_percent: float,
     workers: int,
     prefetch: int = 4,
+    dataset_config_path: str | None = None,
 ) -> Iterable[CorpusChunk]:
     if workers <= 1 or len(paths) <= 1:
-        yield from iter_corpora(paths, encoding, json_chunk_size, max_json_lines, chunk_eval_percent)
+        yield from iter_corpora(
+            paths,
+            encoding,
+            json_chunk_size,
+            max_json_lines,
+            chunk_eval_percent,
+            dataset_config_path,
+        )
         return
     max_inflight = max(1, prefetch)
     mp_ctx = multiprocessing.get_context("spawn")
@@ -687,6 +726,7 @@ def parallel_corpus_stream(
                     json_chunk_size,
                     max_json_lines,
                     chunk_eval_percent,
+                    dataset_config_path,
                 )
                 pending.append((str(path_obj), future))
             while pending:
@@ -711,6 +751,7 @@ def parallel_corpus_stream(
                                 json_chunk_size,
                                 max_json_lines,
                                 chunk_eval_percent,
+                                dataset_config_path,
                             ),
                         )
                     )
@@ -723,8 +764,9 @@ def iter_json_chunks(
     chunk_size: int,
     max_lines: int,
     holdout_fraction: float,
+    dataset_config_override: str | None,
 ) -> Iterable[CorpusChunk]:
-    dataset_cfg = load_dataset_config(path)
+    dataset_cfg = load_dataset_config(path, override=dataset_config_override)
     chunk_size = max(1, chunk_size)
     entries: list[tuple[str, EvaluationRecord]] = []
     chunk_index = 0
@@ -814,10 +856,15 @@ def _sample_holdouts(total_entries: int, fraction: float) -> set[int]:
     return set(random.sample(range(total_entries), holdout_count))
 
 
-def load_eval_dataset(path: Path, max_records: int | None = None) -> List[EvaluationRecord]:
+def load_eval_dataset(
+    path: Path,
+    max_records: int | None = None,
+    *,
+    config_override: str | None = None,
+) -> List[EvaluationRecord]:
     if not path.exists():
         raise FileNotFoundError(f"Evaluation dataset not found: {path}")
-    dataset_cfg = load_dataset_config(path)
+    dataset_cfg = load_dataset_config(path, override=config_override)
     records: list[EvaluationRecord] = []
     limit = max_records if max_records is not None and max_records > 0 else None
     log_verbose(
@@ -1154,6 +1201,7 @@ def main() -> None:
         args.chunk_eval_percent,
         workers=prep_workers,
         prefetch=prep_prefetch,
+        dataset_config_path=args.dataset_config,
     )
     if args.stdin:
         stdin_payload = sys.stdin.read()
@@ -1187,7 +1235,11 @@ def main() -> None:
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
         try:
-            eval_records = load_eval_dataset(dataset_path, args.eval_pool_size)
+            eval_records = load_eval_dataset(
+                dataset_path,
+                args.eval_pool_size,
+                config_override=args.eval_dataset_config or args.dataset_config,
+            )
             monitor = InferenceMonitor(
                 engine,
                 eval_records,
