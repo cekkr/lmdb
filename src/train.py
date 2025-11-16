@@ -715,7 +715,7 @@ def iter_corpora(
                 dataset_config_path,
             )
             continue
-        text = path.read_text(encoding=encoding)
+        text = append_end_marker(path.read_text(encoding=encoding))
         row_count = max(1, len([line for line in text.splitlines() if line.strip()]))
         yield CorpusChunk(str(path), text, [], total_rows=row_count, train_rows=row_count)
 
@@ -1348,7 +1348,15 @@ def main() -> None:
             stdin_rows = max(1, len([line for line in stdin_payload.splitlines() if line.strip()]))
             corpora_iter = itertools.chain(
                 corpora_iter,
-                [CorpusChunk("<stdin>", stdin_payload, [], total_rows=stdin_rows, train_rows=stdin_rows)],
+                [
+                    CorpusChunk(
+                        "<stdin>",
+                        append_end_marker(stdin_payload),
+                        [],
+                        total_rows=stdin_rows,
+                        train_rows=stdin_rows,
+                    )
+                ],
             )
             log_verbose(3, f"[train:v3] STDIN payload appended ({stdin_rows} rows).")
 

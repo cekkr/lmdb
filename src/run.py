@@ -10,6 +10,7 @@ from db_slm import DBSLMEngine
 from db_slm.context_dimensions import format_context_dimensions, parse_context_dimensions_arg
 from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
+from db_slm.text_markers import append_end_marker
 
 from helpers.cheetah_cli import (
     collect_namespace_summary_lines,
@@ -104,6 +105,15 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--cheetah-system-stats",
         action="store_true",
         help="Log cheetah SYSTEM_STATS before handling prompts.",
+    )
+    parser.add_argument(
+        "--max-response-words",
+        type=int,
+        default=512,
+        help=(
+            "Maximum number of words to display per assistant response before appending |END| "
+            "(default: %(default)s). Set to 0 or a negative value to disable trimming."
+        ),
     )
     return parser
 
@@ -355,17 +365,27 @@ def _decoder_worker(
             engine.db.close()
 
 
-def respond_once_worker(worker: PromptWorker, prompt: str, formatter: Callable[[str], str]) -> None:
+def respond_once_worker(
+    worker: PromptWorker,
+    prompt: str,
+    formatter: Callable[[str], str],
+    response_formatter: Callable[[str], str],
+) -> None:
     framed_prompt = formatter(prompt)
     if not framed_prompt:
         log("[run] Skipping empty prompt.")
         return
     response = worker.request(framed_prompt)
     log(f"user> {framed_prompt}")
-    log(f"assistant> {response}")
+    log(f"assistant> {response_formatter(response)}")
 
 
-def interactive_loop(worker: PromptWorker, max_turns: int | None, formatter: Callable[[str], str]) -> None:
+def interactive_loop(
+    worker: PromptWorker,
+    max_turns: int | None,
+    formatter: Callable[[str], str],
+    response_formatter: Callable[[str], str],
+) -> None:
     log("[run] Type ':exit' or press Ctrl+D to leave, ':history' to show the current context.")
     turns = 0
     while max_turns is None or turns < max_turns:
@@ -412,9 +432,23 @@ def interactive_loop(worker: PromptWorker, max_turns: int | None, formatter: Cal
             continue
         log(f"user> {framed_prompt}")
         response = worker.request(framed_prompt)
-        log(f"assistant> {response}")
+        log(f"assistant> {response_formatter(response)}")
         turns += 1
     log(f"[run] Conversation {worker.conversation_id} closed after {turns} turn(s).")
+
+
+def build_response_formatter(max_words: int | None) -> Callable[[str], str]:
+    limit = max(0, (max_words or 0))
+
+    def _formatter(response: str) -> str:
+        normalized = (response or "").strip()
+        if limit > 0:
+            words = normalized.split()
+            if len(words) > limit:
+                normalized = " ".join(words[:limit])
+        return append_end_marker(normalized)
+
+    return _formatter
 
 
 def main() -> None:
@@ -450,11 +484,12 @@ def main() -> None:
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         log(f"[run] Using conversation: {worker.conversation_id} (context dims: {dims_label})")
         prompt_formatter = build_prompt_formatter(args.instruction, args.instruction_label, args.user_label)
+        response_formatter = build_response_formatter(args.max_response_words)
 
         if args.prompt:
-            respond_once_worker(worker, args.prompt, prompt_formatter)
+            respond_once_worker(worker, args.prompt, prompt_formatter, response_formatter)
         else:
-            interactive_loop(worker, args.max_turns, prompt_formatter)
+            interactive_loop(worker, args.max_turns, prompt_formatter, response_formatter)
     except ValueError as exc:
         parser.error(str(exc))
     finally:
