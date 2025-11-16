@@ -118,9 +118,9 @@ continuation counts, and re-materializes quantized probability tables plus the T
 
 **Plain-text directories**
 
-> Remember to install dictionaries:
-> python -m spacy download en_core_web_lg
-> python -m spacy download en_core_web_sm
+> Remember to install dictionaries:  
+`$ python -m spacy download en_core_web_lg`  
+`$ python -m spacy download en_core_web_sm`
 
 ```bash
 python src/train.py \
