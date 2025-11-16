@@ -15,3 +15,7 @@
 
 Source: [https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b](https://www.kaggle.com/datasets/anthonytherrien/emotional-intelligence-booster-zephyr-7b)
 Fast download [https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing](https://drive.google.com/file/d/140Jbciw_ulNemJhtDSI4igZgTGQaXPjf/view?usp=sharing)
+
+## GPTeacher
+Dataset URL: [https://github.com/cekkr/GPTeacher](https://github.com/cekkr/GPTeacher) merge all datasets using `node merge.js`
+Direct download: [https://raw.githubusercontent.com/cekkr/GPTeacher/refs/heads/main/GPTeacher.json](https://raw.githubusercontent.com/cekkr/GPTeacher/refs/heads/main/GPTeacher.json)
