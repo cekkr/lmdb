@@ -29,8 +29,7 @@ type Database struct {
 	valuesTables    sync.Map
 	recycleTables   sync.Map
 	pairTables      sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
-	pairTableLimit  int
-	openPairTables  atomic.Int32
+	fileManager     *FileManager
 	payloadCache    *payloadCache
 	mu              sync.Mutex
 	pairDir         string // Path alla cartella /pairs
@@ -182,6 +181,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error)
 		return nil, err
 	}
 
+	fileManager := NewFileManager(resolvePairTableLimit())
 	db := &Database{
 		name:           name,
 		path:           path,
@@ -190,7 +190,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error)
 		mainKeys:       mkt,
 		payloadCache:   newPayloadCacheFromEnv(),
 		resources:      monitor,
-		pairTableLimit: resolvePairTableLimit(),
+		fileManager:    fileManager,
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -311,7 +311,7 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 
 	// Il nome del file è l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	newTable, err := NewPairTable(db, tableID, path)
+	newTable, err := NewPairTable(db.fileManager, tableID, path)
 	if err != nil {
 		return nil, err
 	}
@@ -330,63 +330,6 @@ func (db *Database) loadPairTable(tableID uint32) (*PairTable, bool) {
 
 func (db *Database) storePairTable(tableID uint32, table *PairTable) {
 	db.pairTables.Store(tableID, table)
-}
-
-func (db *Database) enforcePairTableLimit() {
-	limit := db.pairTableLimit
-	if limit <= 0 {
-		return
-	}
-	for int(db.openPairTables.Load()) > limit {
-		if !db.evictIdlePairTableHandle() {
-			break
-		}
-	}
-}
-
-func (db *Database) onPairTableHandleOpened() {
-	db.openPairTables.Add(1)
-	db.enforcePairTableLimit()
-}
-
-func (db *Database) onPairTableHandleClosed() {
-	if db.openPairTables.Load() > 0 {
-		db.openPairTables.Add(-1)
-	}
-}
-
-func (db *Database) evictIdlePairTableHandle() bool {
-	var (
-		targetTable *PairTable
-		oldestUse   = int64(math.MaxInt64)
-	)
-	now := time.Now().UnixNano()
-	db.pairTables.Range(func(key, value interface{}) bool {
-		tableID, ok := key.(uint32)
-		if !ok || tableID == 0 {
-			return true
-		}
-		table, ok := value.(*PairTable)
-		if !ok || table.InUse() {
-			return true
-		}
-		lastUsed := table.LastUsedUnixNano()
-		if lastUsed == 0 {
-			lastUsed = now
-		}
-		if lastUsed < oldestUse {
-			oldestUse = lastUsed
-			targetTable = table
-		}
-		return true
-	})
-	if targetTable == nil || !targetTable.hasHandle() {
-		return false
-	}
-	if !targetTable.closeHandleIfIdle() {
-		return false
-	}
-	return true
 }
 
 func (db *Database) closePairTable(tableID uint32, table *PairTable, deleteFile bool) error {

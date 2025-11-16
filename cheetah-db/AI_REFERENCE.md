@@ -70,6 +70,10 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   is touched again, so long-running ingests stop tripping `open ... next_id.dat: too many open files`
   even on workstations with aggressive limits (macOS default 256). Set the env var to a lower value
   when running multiple cheetah instances on the same host or higher when you raise the OS limit.
+- Pair-table reads/writes now route through a managed file layer that caches hot 4 KiB sectors,
+  batches dirty pages through a small queue, and flushes them on a short timer. Writers therefore
+  update in-RAM copies in parallel while a background goroutine syncs batches to disk, reducing both
+  lock contention and SSD write amplification.
 - cheetah-server now boots with a resource monitor: it detects logical cores, samples process vs
   system CPU percentages, and polls `/proc/self/io` for disk churn. Reducer worker pools call
   `RecommendedWorkers()` so hot `PAIR_REDUCE` bursts automatically back off when CPU or I/O pressure
