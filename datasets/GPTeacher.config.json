@@ -1,0 +1,16 @@
+{
+  "name": "GPTeacher",
+  "description": "Instruction-tuning corpus where each prompt should be framed with |INSTRUCTION| tags.",
+  "prompt_field": "instruction",
+  "prompt_label": "|INSTRUCTION|",
+  "response_field": "response",
+  "response_label": "|RESPONSE|",
+  "context_fields": [
+    {
+      "field": "input",
+      "label": "Input",
+      "token_name": "input",
+      "description": "Optional supplementary data paired with each instruction."
+    }
+  ]
+}

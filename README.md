@@ -238,6 +238,25 @@ benefits from the dataset profiler. To avoid Hugging Face downloads entirely (e.
 air-gapped labs), set `DBSLM_EMBEDDER_OFFLINE=1` or choose `DBSLM_EMBEDDER_MODEL=hashed` and the
 hashed guidance path is used from the start.
 
+### Instruction and Response Tags
+
+Prompt/response scaffolding now supports the explicit tags that the evaluator and regression tests
+already expect. `train.py` simply prints whatever `prompt_label`/`response_label` the dataset config
+provides, so setting, for example, `prompt_label` to `|INSTRUCTION|` yields staged lines that start
+with ``|INSTRUCTION|: ...``. Interactive helpers (`run.py`, the evaluation probes, and the
+paraphraser guards in `src/db_slm/pipeline.py`) continue to wrap prompts with `|USER|:` and model
+outputs with `|RESPONSE|:` so downstream tooling can distinguish user turns from generations. Every
+response sent through the trainer also flows through `append_end_marker()`, guaranteeing the
+sentence-level `|END|` marker is present even if a dataset omits it. The tokenizer treats `|END|`
+like the other structural markers, so appending it does not change semantic content but keeps
+segment boundaries unambiguous.
+
+When crafting new dataset configs place the canonical labels directly in the JSON. The new
+`datasets/GPTeacher.config.json` file demonstrates this by mapping `instruction` → `|INSTRUCTION|`
+and `response` → `|RESPONSE|`, while exposing the optional `input` column as a `|CTX|:input:<value>`
+context tag. No code changes were required in `src/train.py`; the loader already respects arbitrary
+labels and tokens supplied by `load_dataset_config()`.
+
 ### cheetah Streaming Archive
 
 The trainer streams every newly discovered context plus its Top-K probability slices directly into
