@@ -30,6 +30,10 @@ type ResourceSnapshot struct {
 	IOWriteRate         float64
 	MemAllocBytes       uint64
 	MemSysBytes         uint64
+	MemTotalBytes       uint64
+	MemAvailableBytes   uint64
+	MemoryPressure      float64
+	MemorySampled       bool
 	WorkerHints         map[int]int
 }
 
@@ -113,6 +117,7 @@ func (rm *ResourceMonitor) takeSample(now time.Time) {
 	procCPUTime, procErr := getProcessCPUTime()
 	systemSample, systemErr := readSystemCPUSample()
 	ioSample, ioErr := readProcSelfIO()
+	memTotal, memAvailable, memSupported := readSystemMemorySample()
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -121,12 +126,24 @@ func (rm *ResourceMonitor) takeSample(now time.Time) {
 	elapsed := now.Sub(prevSnapshot.Timestamp)
 
 	snapshot := ResourceSnapshot{
-		Timestamp:     now,
-		LogicalCores:  logicalCores,
-		Gomaxprocs:    gomaxprocs,
-		Goroutines:    goroutines,
-		MemAllocBytes: m.Alloc,
-		MemSysBytes:   m.Sys,
+		Timestamp:         now,
+		LogicalCores:      logicalCores,
+		Gomaxprocs:        gomaxprocs,
+		Goroutines:        goroutines,
+		MemAllocBytes:     m.Alloc,
+		MemSysBytes:       m.Sys,
+		MemTotalBytes:     memTotal,
+		MemAvailableBytes: memAvailable,
+	}
+	if memSupported && memTotal > 0 && memAvailable <= memTotal {
+		snapshot.MemorySampled = true
+		snapshot.MemoryPressure = 1 - float64(memAvailable)/float64(memTotal)
+		if snapshot.MemoryPressure < 0 {
+			snapshot.MemoryPressure = 0
+		}
+		if snapshot.MemoryPressure > 1 {
+			snapshot.MemoryPressure = 1
+		}
 	}
 
 	if procErr == nil {
@@ -302,4 +319,51 @@ func readProcSelfIO() (ioSample, error) {
 		return ioSample{}, err
 	}
 	return sample, nil
+}
+
+func readSystemMemorySample() (uint64, uint64, bool) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, false
+	}
+	var total, available uint64
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "MemTotal:"):
+			if val, err := parseMeminfoValue(line); err == nil {
+				total = val
+			}
+		case strings.HasPrefix(line, "MemAvailable:"):
+			if val, err := parseMeminfoValue(line); err == nil {
+				available = val
+			}
+		}
+		if total > 0 && available > 0 {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, 0, false
+	}
+	if total == 0 || available == 0 {
+		return total, available, false
+	}
+	return total, available, true
+}
+
+func parseMeminfoValue(line string) (uint64, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0, errors.New("invalid meminfo line")
+	}
+	value, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if len(fields) >= 3 && strings.EqualFold(fields[2], "kb") {
+		value *= 1024
+	}
+	return value, nil
 }

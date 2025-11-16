@@ -181,7 +181,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error)
 		return nil, err
 	}
 
-	fileManager := NewFileManager(resolvePairTableLimit())
+	fileManager := NewFileManager(resolvePairTableLimit(), monitor)
 	db := &Database{
 		name:           name,
 		path:           path,
@@ -281,7 +281,7 @@ func (db *Database) loadNextPairTableID() error {
 	data, err := os.ReadFile(db.nextPairIDPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Il file non esiste, partiamo da 1 (0 Ã¨ la root)
+			// Il file non esiste, partiamo da 1 (0 +¿ la root)
 			db.nextPairTableID.Store(1)
 			return nil
 		}
@@ -312,7 +312,7 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 		return table, nil
 	}
 
-	// Il nome del file Ã¨ l'ID in esadecimale
+	// Il nome del file +¿ l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
 	newTable, err := NewPairTable(db.fileManager, tableID, path)
 	if err != nil {

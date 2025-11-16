@@ -76,6 +76,13 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   of background workers drains the queue, so thousands of pair tables no longer spawn their own
   goroutines or burn CPU after they go idle, yet dirty sectors still reach disk quickly enough to
   keep SSD churn low.
+- The same managed file layer now tracks RAM pressure via the resource monitor and aggressively
+  evicts/flushes idle sectors. By default, sectors that sit untouched for 30 s are flushed and
+  removed, everything is forced out after 300 s, and when `MemAvailable/MemTotal` falls below
+  `CHEETAH_CACHE_PRESSURE_HIGH` (~0.9) the cache trims low-scoring sectors (weighted toward writes)
+  until usage returns to the `CHEETAH_CACHE_PRESSURE_LOW` band. Tune idle/force/sweep/stat windows
+  plus read/write weights with the `CHEETAH_CACHE_*` env block and watch `SYSTEM_STATS` to verify
+  memory is being released in real time instead of piling up until shutdown.
 - The managed file layer now exposes a central checkpoint controller. Every `ManagedFile` registers
   with the `FileManager`, which can force-flush dirty sectors, optionally disable caching, and close
   handles based on idle time. Call `FILE_CHECKPOINT [IDLE=<duration>] [DROP_CACHE] [CLOSE_HANDLES]`
