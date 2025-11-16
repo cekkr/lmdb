@@ -3,6 +3,9 @@ python3.11 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive -
 Ubuntu:
 DEVICE=cuda python3.13 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive --reset --json-chunk-size 100 --eval-samples 2 --eval-pool-size 500 --chunk-eval-percent 10.0 --eval-interval 100 --profile-ingest --decoder-presence-penalty 0.5 --decoder-frequency-penalty 0.25 --context-dimensions 6,12,24
 
+AlmaLinux: 
+python3.12 src/train.py datasets/GPTeacher.json --ngram-order 4 --recursive --reset --json-chunk-size 500 --eval-samples 3 --eval-variants 3 --chunk-eval-percent 10.0 --eval-interval 1000 --profile-ingest --decoder-presence-penalty 0.5 --decoder-frequency-penalty 0.25 --context-dimensions 6,12,24
+
 CheetahDB run: go run .
 
 python -m spacy download en_core_web_lg
