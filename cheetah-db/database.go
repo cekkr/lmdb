@@ -35,13 +35,13 @@ type Database struct {
 	pairDir         string // Path alla cartella /pairs
 	nextPairIDPath  string // Path al file che memorizza il contatore
 	resources       *ResourceMonitor
+	settings        DatabaseConfig
+	branchCodec     pairBranchCodec
 }
 
-func resolvePairTableLimit() int {
-	if raw := strings.TrimSpace(os.Getenv("CHEETAH_MAX_PAIR_TABLES")); raw != "" {
-		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
-			return val
-		}
+func resolvePairTableLimit(configured int) int {
+	if configured > 0 {
+		return configured
 	}
 	limit := fileDescriptorSoftLimit()
 	if limit > 0 {
@@ -166,7 +166,7 @@ func clearEntryTerminal(entry []byte) {
 	}
 }
 
-func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error) {
+func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig, maxPairTables int) (*Database, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
 	}
@@ -181,16 +181,23 @@ func NewDatabase(name, path string, monitor *ResourceMonitor) (*Database, error)
 		return nil, err
 	}
 
-	fileManager := NewFileManager(resolvePairTableLimit(), monitor)
+	codec, err := newPairBranchCodec(cfg.PairIndexBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	fileManager := NewFileManager(resolvePairTableLimit(maxPairTables), monitor)
 	db := &Database{
 		name:           name,
 		path:           path,
 		pairDir:        pairDir,
 		nextPairIDPath: filepath.Join(pairDir, "next_id.dat"),
 		mainKeys:       mkt,
-		payloadCache:   newPayloadCacheFromEnv(),
+		payloadCache:   newPayloadCacheFromConfig(cfg),
 		resources:      monitor,
 		fileManager:    fileManager,
+		settings:       cfg,
+		branchCodec:    codec,
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
@@ -281,7 +288,7 @@ func (db *Database) loadNextPairTableID() error {
 	data, err := os.ReadFile(db.nextPairIDPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Il file non esiste, partiamo da 1 (0 +¿ la root)
+			// Il file non esiste, partiamo da 1 (0 +Â¿ la root)
 			db.nextPairTableID.Store(1)
 			return nil
 		}
@@ -312,9 +319,9 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 		return table, nil
 	}
 
-	// Il nome del file +¿ l'ID in esadecimale
+	// Il nome del file +Â¿ l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	newTable, err := NewPairTable(db.fileManager, tableID, path)
+	newTable, err := NewPairTable(db.fileManager, tableID, path, db.branchCodec.branchCount)
 	if err != nil {
 		return nil, err
 	}
@@ -691,39 +698,50 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 	startTable := uint32(0)
 	if len(prefix) > 0 {
 		currentTableID := uint32(0)
-		for i, branchByte := range prefix {
+		var prefixAbort bool
+		err := db.branchCodec.walkKey(prefix, func(index uint32, chunk []byte, isLast bool) error {
 			table, err := db.getPairTable(currentTableID)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return []PairScanResult{}, nil, nil
+					prefixAbort = true
+					return errPairTraversalAbort
 				}
-				return nil, nil, err
+				return err
 			}
-			entry, err := table.ReadEntry(branchByte)
+			entry, err := table.ReadEntry(index)
 			if err != nil {
-				return nil, nil, err
+				return err
 			}
-			isLast := i == len(prefix)-1
 			if isLast {
 				if entryHasTerminal(entry) {
 					if acc.add(prefix, decodeAbsoluteKey(entry)) && limit > 0 {
-						results, nextCursor := acc.finalize(acc.limit)
-						return results, nextCursor, nil
+						prefixAbort = true
+						return errPairTraversalAbort
 					}
 				}
 				if entryHasChild(entry) {
 					startTable = entryChildID(entry)
 				}
-				break
+				return nil
 			}
 			if !entryHasChild(entry) {
-				return []PairScanResult{}, nil, nil
+				prefixAbort = true
+				return errPairTraversalAbort
 			}
 			childID := entryChildID(entry)
 			if childID == 0 {
-				return []PairScanResult{}, nil, nil
+				prefixAbort = true
+				return errPairTraversalAbort
 			}
 			currentTableID = childID
+			return nil
+		})
+		if err != nil {
+			if err == errPairTraversalAbort || prefixAbort {
+				results, nextCursor := acc.finalize(acc.limit)
+				return results, nextCursor, nil
+			}
+			return nil, nil, err
 		}
 		if startTable == 0 {
 			results, nextCursor := acc.finalize(acc.limit)
@@ -761,41 +779,51 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 	startTable := uint32(0)
 	if len(prefix) > 0 {
 		currentTableID := uint32(0)
-		for i, branchByte := range prefix {
+		var summaryAbort bool
+		err := db.branchCodec.walkKey(prefix, func(index uint32, chunk []byte, isLast bool) error {
 			table, err := db.getPairTable(currentTableID)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return acc.finalize(), nil
+					summaryAbort = true
+					return errPairTraversalAbort
 				}
-				return nil, err
+				return err
 			}
-			entry, err := table.ReadEntry(branchByte)
+			entry, err := table.ReadEntry(index)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			isLast := i == len(prefix)-1
 			if isLast {
 				if entryHasTerminal(entry) {
 					key := decodeAbsoluteKey(entry)
 					if key != 0 {
 						if err := db.recordSummaryTerminal(acc, append([]byte{}, prefix...), key); err != nil {
-							return nil, err
+							return err
 						}
 					}
 				}
 				if entryHasChild(entry) {
 					startTable = entryChildID(entry)
 				}
-				break
+				return nil
 			}
 			if !entryHasChild(entry) {
-				return acc.finalize(), nil
+				summaryAbort = true
+				return errPairTraversalAbort
 			}
 			childID := entryChildID(entry)
 			if childID == 0 {
-				return acc.finalize(), nil
+				summaryAbort = true
+				return errPairTraversalAbort
 			}
 			currentTableID = childID
+			return nil
+		})
+		if err != nil {
+			if err == errPairTraversalAbort || summaryAbort {
+				return acc.finalize(), nil
+			}
+			return nil, err
 		}
 		if startTable == 0 {
 			return acc.finalize(), nil
@@ -1077,18 +1105,23 @@ func (db *Database) walkPairSummary(
 		}
 		return err
 	}
-	for branch := 0; branch < 256; branch++ {
+	branchCount := table.BranchCount()
+	for branch := uint32(0); branch < uint32(branchCount); branch++ {
 		if abort != nil && abort.Load() {
 			return nil
 		}
-		entry, err := table.ReadEntry(byte(branch))
+		entry, err := table.ReadEntry(branch)
 		if err != nil {
 			return err
 		}
 		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry)) {
 			continue
 		}
-		value := append(append([]byte{}, task.path...), byte(branch))
+		chunk, ok := db.branchCodec.decode(branch)
+		if !ok {
+			continue
+		}
+		value := append(append([]byte{}, task.path...), chunk...)
 		if entryHasTerminal(entry) {
 			key := decodeAbsoluteKey(entry)
 			if key != 0 {
@@ -1133,15 +1166,23 @@ func (db *Database) walkPairTable(
 		}
 		return err
 	}
-	for branch := 0; branch < 256; branch++ {
+	branchCount := table.BranchCount()
+	for branch := uint32(0); branch < uint32(branchCount); branch++ {
 		if abort != nil && abort.Load() {
 			return nil
 		}
-		entry, err := table.ReadEntry(byte(branch))
+		entry, err := table.ReadEntry(branch)
 		if err != nil {
 			return err
 		}
-		value := append(append([]byte{}, task.prefix...), byte(branch))
+		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry)) {
+			continue
+		}
+		chunk, ok := db.branchCodec.decode(branch)
+		if !ok {
+			continue
+		}
+		value := append(append([]byte{}, task.prefix...), chunk...)
 		if entryHasTerminal(entry) {
 			if acc.add(value, decodeAbsoluteKey(entry)) && abort != nil && acc.limit > 0 {
 				abort.Store(true)

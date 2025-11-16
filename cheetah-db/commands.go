@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,8 @@ import (
 )
 
 const maxValueSize = int(^uint32(0))
+
+var errPairTraversalAbort = errors.New("pair traversal aborted")
 
 // --- Metodi CRUD per Database ---
 
@@ -161,36 +164,36 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 	}
 
 	currentTableID := uint32(0)
-	for i, branchByte := range value {
+	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
 		table, err := db.getPairTable(currentTableID)
 		if err != nil {
-			return "", err
+			return err
 		}
-		entry, _ := table.ReadEntry(branchByte)
-		isLast := i == len(value)-1
+		entry, _ := table.ReadEntry(index)
 		if isLast {
 			setEntryTerminal(entry, absKey)
-			if err := table.WriteEntry(branchByte, entry); err != nil {
-				return "", err
-			}
-			return "SUCCESS,pair_set", nil
+			return table.WriteEntry(index, entry)
 		}
 		childID := entryChildID(entry)
 		if !entryHasChild(entry) || childID == 0 {
 			newID, err := db.getNewPairTableID()
 			if err != nil {
-				return "", err
+				return err
 			}
 			setEntryChild(entry, newID)
-			if err := table.WriteEntry(branchByte, entry); err != nil {
-				return "", err
+			if err := table.WriteEntry(index, entry); err != nil {
+				return err
 			}
 			currentTableID = newID
-			continue
+			return nil
 		}
 		currentTableID = childID
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
-	return "ERROR,internal_logic_error", nil
+	return "SUCCESS,pair_set", nil
 }
 
 func (db *Database) PairGet(value []byte) (string, error) {
@@ -199,40 +202,50 @@ func (db *Database) PairGet(value []byte) (string, error) {
 	}
 
 	currentTableID := uint32(0)
-	for i, branchByte := range value {
+	var result string
+	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
 		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "ERROR,not_found", nil
+				result = "ERROR,not_found"
+				return errPairTraversalAbort
 			}
-			return "", err
+			return err
 		}
-
-		entry, _ := table.ReadEntry(branchByte)
-		isLast := i == len(value)-1
+		entry, _ := table.ReadEntry(index)
 		if isLast {
 			if !entryHasTerminal(entry) {
-				return "ERROR,not_found", nil
+				result = "ERROR,not_found"
+				return errPairTraversalAbort
 			}
-			absKey := decodeAbsoluteKey(entry)
-			return fmt.Sprintf("SUCCESS,key=%d", absKey), nil
+			result = fmt.Sprintf("SUCCESS,key=%d", decodeAbsoluteKey(entry))
+			return errPairTraversalAbort
 		}
 		if !entryHasChild(entry) {
-			return "ERROR,not_found", nil
+			result = "ERROR,not_found"
+			return errPairTraversalAbort
 		}
 		currentTableID = entryChildID(entry)
 		if currentTableID == 0 {
-			return "ERROR,not_found", nil
+			result = "ERROR,not_found"
+			return errPairTraversalAbort
 		}
+		return nil
+	})
+	if err != nil && err != errPairTraversalAbort {
+		return "", err
 	}
-	return "ERROR,not_found", nil
+	if result == "" {
+		result = "ERROR,not_found"
+	}
+	return result, nil
 }
 
 // PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
 
 type pathStackFrame struct {
-	TableID    uint32
-	BranchByte byte
+	TableID     uint32
+	BranchIndex uint32
 }
 
 // PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani,
@@ -253,40 +266,43 @@ func (db *Database) PairDel(value []byte) (string, error) {
 	}
 
 	currentTableID := uint32(0)
-	for i, branchByte := range value {
+	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
 		table, err := db.getPairTable(currentTableID)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "ERROR,not_found", nil
+				return errPairTraversalAbort
 			}
-			return "", err
+			return err
 		}
 
 		table.mu.RLock()
 		acquiredLocks = append(acquiredLocks, &table.mu)
 
-		entry, err := table.ReadEntry(branchByte)
+		entry, err := table.ReadEntry(index)
 		if err != nil {
-			cleanupReadLocks()
-			return "ERROR,not_found", nil
+			return errPairTraversalAbort
 		}
 
-		pathStack = append(pathStack, pathStackFrame{TableID: currentTableID, BranchByte: branchByte})
-		isLast := i == len(value)-1
+		pathStack = append(pathStack, pathStackFrame{TableID: currentTableID, BranchIndex: index})
 		if isLast {
 			if !entryHasTerminal(entry) {
-				cleanupReadLocks()
-				return "ERROR,not_found", nil
+				return errPairTraversalAbort
 			}
 		} else {
 			if !entryHasChild(entry) {
-				cleanupReadLocks()
-				return "ERROR,not_found", nil
+				return errPairTraversalAbort
 			}
 			currentTableID = entryChildID(entry)
 		}
+		return nil
+	})
+	cleanupReadLocks()
+	if err != nil {
+		if err == errPairTraversalAbort {
+			return "ERROR,not_found", nil
+		}
+		return "", err
 	}
-	cleanupReadLocks() // Rilasciamo tutti i read lock prima di passare ai write lock
 
 	// --- Fase 2: Blocco Esclusivo del Percorso (Write Locks) ---
 	pathTableIDs := make([]uint32, len(pathStack))
@@ -315,12 +331,12 @@ func (db *Database) PairDel(value []byte) (string, error) {
 	// Modifichiamo il nodo terminale
 	terminalFrame := pathStack[len(pathStack)-1]
 	terminalTable := lockedTables[terminalFrame.TableID]
-	terminalEntry, _ := terminalTable.ReadEntry(terminalFrame.BranchByte)
+	terminalEntry, _ := terminalTable.ReadEntry(terminalFrame.BranchIndex)
 	if !entryHasTerminal(terminalEntry) {
 		return "ERROR,not_found", nil
 	}
 	clearEntryTerminal(terminalEntry)
-	if err := terminalTable.WriteEntry(terminalFrame.BranchByte, terminalEntry); err != nil {
+	if err := terminalTable.WriteEntry(terminalFrame.BranchIndex, terminalEntry); err != nil {
 		return "", fmt.Errorf("failed to clear terminal entry: %w", err)
 	}
 
@@ -337,9 +353,9 @@ func (db *Database) PairDel(value []byte) (string, error) {
 		}
 		parentFrame := pathStack[i-1]
 		parentTable := lockedTables[parentFrame.TableID]
-		parentEntry, _ := parentTable.ReadEntry(parentFrame.BranchByte)
+		parentEntry, _ := parentTable.ReadEntry(parentFrame.BranchIndex)
 		clearEntryChild(parentEntry)
-		if err := parentTable.WriteEntry(parentFrame.BranchByte, parentEntry); err != nil {
+		if err := parentTable.WriteEntry(parentFrame.BranchIndex, parentEntry); err != nil {
 			return "", err
 		}
 		if frame.TableID != 0 {

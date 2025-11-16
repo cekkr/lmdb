@@ -2,8 +2,6 @@ package main
 
 import (
 	"container/list"
-	"os"
-	"strconv"
 	"sync"
 )
 
@@ -61,28 +59,9 @@ func newPayloadCache(maxEntries int, maxBytes int64) *payloadCache {
 	}
 }
 
-func newPayloadCacheFromEnv() *payloadCache {
-	entries := defaultPayloadCacheEntries
-	maxBytes := int64(defaultPayloadCacheBytes)
-
-	if v := os.Getenv("CHEETAH_PAYLOAD_CACHE_ENTRIES"); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			entries = parsed
-		}
-	}
-
-	if v := os.Getenv("CHEETAH_PAYLOAD_CACHE_MB"); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			maxBytes = int64(parsed) << 20
-		}
-	}
-
-	if v := os.Getenv("CHEETAH_PAYLOAD_CACHE_BYTES"); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			maxBytes = parsed
-		}
-	}
-
+func newPayloadCacheFromConfig(cfg DatabaseConfig) *payloadCache {
+	entries := cfg.PayloadCacheEntries
+	maxBytes := cfg.PayloadCacheBytes
 	return newPayloadCache(entries, maxBytes)
 }
 

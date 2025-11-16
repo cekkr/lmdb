@@ -44,7 +44,7 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 	logInfof("New connection from %s", conn.RemoteAddr())
 	defer conn.Close()
 
-	currentDB, err := s.engine.GetDatabase(DefaultDbName)
+	currentDB, err := s.engine.GetDatabase(s.engine.DefaultDatabaseName())
 	if err != nil {
 		io.WriteString(conn, "ERROR,failed_to_load_default_db\n")
 		return
@@ -75,18 +75,34 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 				response = "ERROR,missing_database_name"
 				break
 			}
-			dbName := strings.TrimSpace(parts[1])
-			newDB, errDb := s.engine.GetDatabase(dbName)
+			target, overrides, parseErr := parseDatabaseTarget(parts[1])
+			if parseErr != nil {
+				response = fmt.Sprintf("ERROR,%v", parseErr)
+				break
+			}
+			if overrides != nil {
+				s.engine.SetDatabaseOverrides(target, *overrides)
+			}
+			newDB, errDb := s.engine.GetDatabase(target)
 			if errDb != nil {
 				response = fmt.Sprintf("ERROR,cannot_load_db:%v", errDb)
 			} else {
 				currentDB = newDB
-				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", dbName)
+				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", target)
 			}
 		case "RESET_DB":
 			target := currentDB.Name()
+			var overrides *DatabaseOverrides
 			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-				target = strings.TrimSpace(parts[1])
+				var parseErr error
+				target, overrides, parseErr = parseDatabaseTarget(parts[1])
+				if parseErr != nil {
+					response = fmt.Sprintf("ERROR,%v", parseErr)
+					break
+				}
+			}
+			if overrides != nil {
+				s.engine.SetDatabaseOverrides(target, *overrides)
 			}
 			if err := s.engine.ResetDatabase(target); err != nil {
 				response = fmt.Sprintf("ERROR,cannot_reset_db:%v", err)

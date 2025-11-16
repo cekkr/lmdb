@@ -9,19 +9,23 @@ import (
 )
 
 type Engine struct {
+	cfg       *Config
 	basePath  string
 	databases map[string]*Database
+	overrides map[string]DatabaseOverrides
 	mu        sync.Mutex
 	monitor   *ResourceMonitor
 }
 
-func NewEngine(basePath string, monitor *ResourceMonitor) (*Engine, error) {
-	if err := os.MkdirAll(basePath, 0755); err != nil {
+func NewEngine(cfg *Config, monitor *ResourceMonitor) (*Engine, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		return nil, err
 	}
 	return &Engine{
-		basePath:  basePath,
+		cfg:       cfg,
+		basePath:  cfg.DataDir,
 		databases: make(map[string]*Database),
+		overrides: make(map[string]DatabaseOverrides),
 		monitor:   monitor,
 	}, nil
 }
@@ -35,7 +39,11 @@ func (e *Engine) GetDatabase(name string) (*Database, error) {
 	}
 
 	dbPath := filepath.Join(e.basePath, name)
-	db, err := NewDatabase(name, dbPath, e.monitor)
+	settings := e.cfg.DatabaseDefaults
+	if override, ok := e.overrides[name]; ok {
+		settings = mergeDatabaseConfig(settings, override)
+	}
+	db, err := NewDatabase(name, dbPath, e.monitor, settings, e.cfg.MaxPairTables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load database %s: %w", name, err)
 	}
@@ -61,6 +69,19 @@ func (e *Engine) ResetDatabase(name string) error {
 	}
 	logInfof("Reset database: %s", name)
 	return nil
+}
+
+func (e *Engine) SetDatabaseOverrides(name string, overrides DatabaseOverrides) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.overrides[name] = overrides
+}
+
+func (e *Engine) DefaultDatabaseName() string {
+	if e.cfg != nil && e.cfg.DefaultDatabase != "" {
+		return e.cfg.DefaultDatabase
+	}
+	return "default"
 }
 
 // Close chiude tutti i database gestiti dall'engine.

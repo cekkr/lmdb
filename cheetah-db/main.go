@@ -13,27 +13,22 @@ import (
 	"time"
 )
 
-const (
-	ListenAddr    = "0.0.0.0:4455"
-	DataDir       = "cheetah_data"
-	DefaultDbName = "default"
-)
-
 func main() {
+	cfg := loadConfig()
 	monitor := NewResourceMonitor(2 * time.Second)
 	defer monitor.Stop()
 	coreSnapshot := monitor.Snapshot()
 	logInfof("Detected %d logical CPU cores (GOMAXPROCS=%d)", coreSnapshot.LogicalCores, runtime.GOMAXPROCS(0))
 
 	// Inizializza l'engine del database
-	engine, err := NewEngine(DataDir, monitor)
+	engine, err := NewEngine(cfg, monitor)
 	if err != nil {
 		log.Fatalf("FATAL: Failed to start engine: %v", err)
 	}
 	defer engine.Close() // Assicura che tutti i DB siano chiusi all'uscita
 
 	// Avvia il server TCP in una goroutine separata
-	server := NewTCPServer(ListenAddr, engine)
+	server := NewTCPServer(cfg.ListenAddr, engine)
 	go func() {
 		if err := server.Start(); err != nil {
 			logErrorf("TCP Server failed: %v", err)
@@ -55,7 +50,7 @@ func main() {
 // runCLI gestisce l'input dal terminale per i comandi locali
 func runCLI(engine *Engine) {
 	logInfof("CheetahDB Console Interface is running. Type 'EXIT' to quit.")
-	currentDB, err := engine.GetDatabase(DefaultDbName)
+	currentDB, err := engine.GetDatabase(engine.DefaultDatabaseName())
 	if err != nil {
 		log.Fatalf("FATAL: Failed to load default database for CLI: %v", err)
 		return
@@ -85,18 +80,34 @@ func runCLI(engine *Engine) {
 				response = "ERROR,missing_database_name"
 				break
 			}
-			dbName := strings.TrimSpace(parts[1])
-			newDB, err := engine.GetDatabase(dbName)
+			target, overrides, parseErr := parseDatabaseTarget(parts[1])
+			if parseErr != nil {
+				response = fmt.Sprintf("ERROR,%v", parseErr)
+				break
+			}
+			if overrides != nil {
+				engine.SetDatabaseOverrides(target, *overrides)
+			}
+			newDB, err := engine.GetDatabase(target)
 			if err != nil {
 				response = fmt.Sprintf("ERROR,cannot_load_db:%v", err)
 			} else {
 				currentDB = newDB
-				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", dbName)
+				response = fmt.Sprintf("SUCCESS,database_changed_to_%s", target)
 			}
 		case "RESET_DB":
 			target := currentDB.Name()
+			var overrides *DatabaseOverrides
 			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-				target = strings.TrimSpace(parts[1])
+				var parseErr error
+				target, overrides, parseErr = parseDatabaseTarget(parts[1])
+				if parseErr != nil {
+					response = fmt.Sprintf("ERROR,%v", parseErr)
+					break
+				}
+			}
+			if overrides != nil {
+				engine.SetDatabaseOverrides(target, *overrides)
 			}
 			if err := engine.ResetDatabase(target); err != nil {
 				response = fmt.Sprintf("ERROR,cannot_reset_db:%v", err)

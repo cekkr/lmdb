@@ -173,11 +173,13 @@ type PairTable struct {
 	path string
 	file *ManagedFile
 	mu   sync.RWMutex
+	span int
 }
 
-func NewPairTable(manager *FileManager, tableID uint32, path string) (*PairTable, error) {
+func NewPairTable(manager *FileManager, tableID uint32, path string, branchCount int) (*PairTable, error) {
+	prealloc := int64(branchCount) * int64(PairEntrySize)
 	opts := ManagedFileOptions{
-		PreallocateSize:  int64(PairTablePreallocatedSize),
+		PreallocateSize:  prealloc,
 		CacheEnabled:     true,
 		FlushInterval:    25 * time.Millisecond,
 		SectorSize:       defaultSectorSize,
@@ -187,24 +189,24 @@ func NewPairTable(manager *FileManager, tableID uint32, path string) (*PairTable
 	if err != nil {
 		return nil, err
 	}
-	return &PairTable{id: tableID, path: path, file: file}, nil
+	return &PairTable{id: tableID, path: path, file: file, span: branchCount}, nil
 }
 
-func (t *PairTable) ReadEntry(branchByte byte) ([]byte, error) {
+func (t *PairTable) ReadEntry(branchIndex uint32) ([]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	entry := make([]byte, PairEntrySize)
-	offset := int64(branchByte) * int64(PairEntrySize)
+	offset := int64(branchIndex) * int64(PairEntrySize)
 	_, err := t.file.ReadAt(entry, offset)
 	return entry, err
 }
 
-func (t *PairTable) WriteEntry(branchByte byte, entry []byte) error {
+func (t *PairTable) WriteEntry(branchIndex uint32, entry []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	offset := int64(branchByte) * int64(PairEntrySize)
+	offset := int64(branchIndex) * int64(PairEntrySize)
 	_, err := t.file.WriteAt(entry, offset)
 	return err
 }
@@ -249,7 +251,8 @@ func (t *PairTable) Snapshot() ([]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	buf := make([]byte, PairTablePreallocatedSize)
+	size := int64(t.span) * int64(PairEntrySize)
+	buf := make([]byte, size)
 	if _, err := t.file.ReadAt(buf, 0); err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -259,4 +262,14 @@ func (t *PairTable) Snapshot() ([]byte, error) {
 // Path restituisce il percorso del file della tabella.
 func (t *PairTable) Path() string {
 	return t.path
+}
+
+func (t *PairTable) BranchCount() int {
+	if t == nil {
+		return 0
+	}
+	if t.span <= 0 {
+		return 0
+	}
+	return t.span
 }

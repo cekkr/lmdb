@@ -11,8 +11,11 @@ other dense analytical slices must be served with predictable latency.
 - **Byte-faithful layout.** Every entry is cataloged by byte length, table ID, and entry index, so
   reads turn into deterministic `ReadAt` calls instead of scanning variable-length payloads.
 - **Trie-indexed pair table.** The `pairs/` directory holds fixed-size nodes that behave like a
-  prefix tree. `PAIR_SCAN` and `PAIR_REDUCE` walk that trie, making namespace sweeps and reducer
-  workloads practical even when the keyspace spans billions of n-gram contexts.
+  prefix tree. Each node indexes two raw bytes per hop by default, cutting trie depth in half for
+  long namespaces. `PAIR_SCAN` and `PAIR_REDUCE` walk that trie, making namespace sweeps and reducer
+  workloads practical even when the keyspace spans billions of n-gram contexts. The `pair_index_bytes`
+  knob in `config.ini` (or per-database CLI overrides) falls back to 1-byte indexing when you need a
+  smaller on-disk footprint.
 - **Payload caching.** `database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
@@ -87,6 +90,17 @@ Environment variables:
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
 - `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
+Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
+`CHEETAH_CONFIG_PATH` at a custom file) and edit:
+
+- `[server]` covers `listen_addr`, `data_dir`, and `default_database`.
+- `[database]` sets `pair_index_bytes` (1 or 2) plus payload-cache sizing.
+- `[tuning]` exposes `max_pair_tables` so you can pin the open-file budget.
+
+Per-database overrides can be forced at runtime via CLI/TCP commands—append
+`key=value` tokens such as `pair_bytes=1` or `payload_cache_entries=0` to the
+`DATABASE`/`RESET_DB` commands to rebuild a trie with different settings.
+
 The binary prints `[cheetah_data/default]>` when ready. Use `DATABASE <name>` (CLI) to switch between
 logical databases or send the same command over TCP.
 
@@ -120,6 +134,9 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   branch digests returned (default: 32). This is the entry point for data-centric statistics—e.g.,
   estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
   the tree-indexing section below.
+- `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
+  to rebuild a specific database with narrower trie nodes or a different payload-cache budget without
+  editing `config.ini`.
 - `SYSTEM_STATS` emits `logical_cores`, GOMAXPROCS, goroutine counts, CPU percentages, and
   per-second disk I/O deltas so you can script adaptive ingest/decoder pipelines without shelling
   out to `top`/`iostat`. The payload cache now reports `payload_cache_*` fields (entries/bytes,
@@ -226,7 +243,8 @@ For deep operational checklists (tmux helpers, namespace triage, cache sizing ma
 
 cheetah-db’s performance hinges on a deterministic, trie-backed index that treats every namespace or
 key prefix as a path through fixed-size `PairTable` nodes. Each node behaves like the `CharTreeNode`
-structure shown in `src/helpers/char_tree_similarity.py`: it has byte-indexed children, terminal
+structure shown in `src/helpers/char_tree_similarity.py`: it has fixed-span children (two raw bytes
+per hop by default), terminal
 flags, and in-memory counts that highlight “hot” substrings. While the helper library leans on that
 structure to compare strings (build a char tree, keep significant substrings, compute overlaps), the
 database applies the same idea to on-disk tables:
@@ -236,8 +254,9 @@ database applies the same idea to on-disk tables:
   the absolute payload key. This mirrors the helper’s recursion where `CharTree` expands one
   character at a time and records substring counts.
 - `PAIR_SCAN` snapshots each node and streams children in lexical order, so namespace enumeration only
-  touches the branches that exist. Because each node is a dense 256-entry array, the engine can seek
-  directly via `branchByte * PairEntrySize` with no heap allocations—the storage equivalent of how
+  touches the branches that exist. Because each node is a dense array sized to the configured span
+  (65,536 entries when `pair_index_bytes=2`), the engine can seek directly via
+  `branchIndex * PairEntrySize` with no heap allocations—the storage equivalent of how
   `CharTree.from_text` iterates substrings without rebuilding prefixes.
 - `PAIR_REDUCE` executes reducers while it walks the trie. As soon as a branch is materialized, the
   reducer can hydrate payloads (`readValuePayload`) and emit inline aggregates. This is conceptually
@@ -256,6 +275,6 @@ database applies the same idea to on-disk tables:
 
 Treating namespace keys as traversable trees keeps INSERT/READ latency tied to fixed math instead of
 variable-length scans. It also gives future tooling (fuzzy namespace matching, char-tree-style
-similarity lookups, or trie-level compression) a solid footing because the invariants are identical
-to the pure-Python helper: branch per byte, attach metadata where a path terminates, and stream the
+similarity lookups, or trie-level compression) a solid footing because the invariants mirror the
+pure-Python helper: branch per configured byte-span, attach metadata where a path terminates, and stream the
 structure without rebuilding it in memory.
