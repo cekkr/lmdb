@@ -11,11 +11,11 @@ other dense analytical slices must be served with predictable latency.
 - **Byte-faithful layout.** Every entry is cataloged by byte length, table ID, and entry index, so
   reads turn into deterministic `ReadAt` calls instead of scanning variable-length payloads.
 - **Trie-indexed pair table.** The `pairs/` directory holds fixed-size nodes that behave like a
-  prefix tree. Each node indexes two raw bytes per hop by default, cutting trie depth in half for
-  long namespaces. `PAIR_SCAN` and `PAIR_REDUCE` walk that trie, making namespace sweeps and reducer
-  workloads practical even when the keyspace spans billions of n-gram contexts. The `pair_index_bytes`
-  knob in `config.ini` (or per-database CLI overrides) falls back to 1-byte indexing when you need a
-  smaller on-disk footprint.
+  prefix tree. Nodes index a single byte per hop by default to keep tables compact, while the optional
+  2-byte stride (set via `pair_index_bytes`) trades extra disk usage for shallower lookups. `PAIR_SCAN`
+  and `PAIR_REDUCE` walk that trie, making namespace sweeps and reducer workloads practical even when
+  the keyspace spans billions of n-gram contexts. Unique suffixes automatically collapse into jump
+  nodes so single-key branches no longer allocate full tables.
 - **Payload caching.** `database.go` keeps a bounded cache (defaults: 16k entries ≈64 MB) keyed by
   `<value_size, table_id, entry_id>` so hot payloads never hit disk. Tune it with
   `CHEETAH_PAYLOAD_CACHE_ENTRIES`, `CHEETAH_PAYLOAD_CACHE_MB`, or
@@ -243,8 +243,8 @@ For deep operational checklists (tmux helpers, namespace triage, cache sizing ma
 
 cheetah-db’s performance hinges on a deterministic, trie-backed index that treats every namespace or
 key prefix as a path through fixed-size `PairTable` nodes. Each node behaves like the `CharTreeNode`
-structure shown in `src/helpers/char_tree_similarity.py`: it has fixed-span children (two raw bytes
-per hop by default), terminal
+structure shown in `src/helpers/char_tree_similarity.py`: it has fixed-span children (one raw byte
+per hop by default, optionally two when configured), terminal
 flags, and in-memory counts that highlight “hot” substrings. While the helper library leans on that
 structure to compare strings (build a char tree, keep significant substrings, compute overlaps), the
 database applies the same idea to on-disk tables:
@@ -254,10 +254,15 @@ database applies the same idea to on-disk tables:
   the absolute payload key. This mirrors the helper’s recursion where `CharTree` expands one
   character at a time and records substring counts.
 - `PAIR_SCAN` snapshots each node and streams children in lexical order, so namespace enumeration only
-  touches the branches that exist. Because each node is a dense array sized to the configured span
-  (65,536 entries when `pair_index_bytes=2`), the engine can seek directly via
-  `branchIndex * PairEntrySize` with no heap allocations—the storage equivalent of how
-  `CharTree.from_text` iterates substrings without rebuilding prefixes.
+  touches the branches that exist. Nodes allocate exactly `∑_{i=1..pair_index_bytes} 256^i` slots
+  (256 entries when indexing a single byte, 256 + 65,536 entries when indexing two bytes), so the
+  engine can seek directly via `branchIndex * PairEntrySize` with no heap allocations—the storage
+  equivalent of how `CharTree.from_text` iterates substrings without rebuilding prefixes.
+- Jump nodes collapse unique suffixes into a compact segment so single-key branches no longer
+  allocate entire tables. `PAIR_SET` writes the remainder of a key into a jump node whenever a branch
+  has no siblings, and the node is split automatically if a later key shares part of that suffix. On
+  deletions the engine rechecks whether a child table now has only one branch and promotes it back
+  into a jump when possible, keeping disk usage proportional to the number of active prefixes.
 - `PAIR_REDUCE` executes reducers while it walks the trie. As soon as a branch is materialized, the
   reducer can hydrate payloads (`readValuePayload`) and emit inline aggregates. This is conceptually
   the same as weighting recurring substrings in `substring_multiset_similarity`: we take advantage of

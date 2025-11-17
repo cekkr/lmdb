@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -37,6 +38,9 @@ type Database struct {
 	resources       *ResourceMonitor
 	settings        DatabaseConfig
 	branchCodec     pairBranchCodec
+	jumpDir         string
+	nextJumpIDPath  string
+	nextJumpID      atomic.Uint32
 }
 
 func resolvePairTableLimit(configured int) int {
@@ -75,6 +79,8 @@ const (
 	minPairTableLimit             = 64
 	pairTableSafetyMargin         = 128
 )
+
+var errPairNotFound = errors.New("pair not found")
 
 type PairScanResult struct {
 	Value []byte
@@ -133,6 +139,7 @@ func setEntryChild(entry []byte, childID uint32) {
 		return
 	}
 	entry[0] |= FlagHasChild
+	entry[0] &^= FlagHasJump
 	binary.BigEndian.PutUint32(entry[pairEntryChildOffset:], childID)
 }
 
@@ -144,6 +151,43 @@ func clearEntryChild(entry []byte) {
 	for i := 0; i < PairEntryChildSize; i++ {
 		entry[pairEntryChildOffset+i] = 0
 	}
+}
+
+func entryHasJump(entry []byte) bool {
+	return len(entry) > 0 && (entry[0]&FlagHasJump) != 0
+}
+
+func entryJumpID(entry []byte) uint32 {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return 0
+	}
+	return binary.BigEndian.Uint32(entry[pairEntryChildOffset : pairEntryChildOffset+PairEntryChildSize])
+}
+
+func setEntryJump(entry []byte, jumpID uint32) {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return
+	}
+	entry[0] |= FlagHasJump
+	entry[0] &^= FlagHasChild
+	binary.BigEndian.PutUint32(entry[pairEntryChildOffset:], jumpID)
+}
+
+func clearEntryJump(entry []byte) {
+	if len(entry) < pairEntryChildOffset+PairEntryChildSize {
+		return
+	}
+	entry[0] &^= FlagHasJump
+	for i := 0; i < PairEntryChildSize; i++ {
+		entry[pairEntryChildOffset+i] = 0
+	}
+}
+
+func entryIsEmpty(entry []byte) bool {
+	if len(entry) == 0 {
+		return true
+	}
+	return (entry[0] & (FlagIsTerminal | FlagHasChild | FlagHasJump)) == 0
 }
 
 func setEntryTerminal(entry []byte, absKey uint64) {
@@ -166,6 +210,22 @@ func clearEntryTerminal(entry []byte) {
 	}
 }
 
+func (db *Database) nextChunk(key []byte, offset int) ([]byte, uint32, bool, error) {
+	if offset >= len(key) {
+		return nil, 0, true, fmt.Errorf("offset beyond key length")
+	}
+	end := offset + db.branchCodec.chunkBytes
+	if end > len(key) {
+		end = len(key)
+	}
+	chunk := key[offset:end]
+	index, err := db.branchCodec.branchIndexFromChunk(chunk)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return chunk, index, end == len(key), nil
+}
+
 func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig, maxPairTables int) (*Database, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, err
@@ -178,6 +238,10 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 
 	pairDir := filepath.Join(path, "pairs")
 	if err := os.MkdirAll(pairDir, 0755); err != nil {
+		return nil, err
+	}
+	jumpDir := filepath.Join(path, "pair_jumps")
+	if err := os.MkdirAll(jumpDir, 0755); err != nil {
 		return nil, err
 	}
 
@@ -198,10 +262,16 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		fileManager:    fileManager,
 		settings:       cfg,
 		branchCodec:    codec,
+		jumpDir:        jumpDir,
+		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
 	}
 
 	// Carica il contatore degli ID delle tabelle pair
 	if err := db.loadNextPairTableID(); err != nil {
+		return nil, err
+	}
+	if err := db.loadNextJumpID(); err != nil {
+		mkt.Close()
 		return nil, err
 	}
 
@@ -351,6 +421,627 @@ func (db *Database) closePairTable(tableID uint32, table *PairTable, deleteFile 
 		return os.Remove(path)
 	}
 	return nil
+}
+
+func (db *Database) setPairValue(value []byte, absKey uint64) error {
+	if len(value) == 0 {
+		return fmt.Errorf("pair value cannot be empty")
+	}
+	return db.insertPairAt(0, value, 0, absKey)
+}
+
+func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey uint64) error {
+	chunk, index, isLast, err := db.nextChunk(key, offset)
+	if err != nil {
+		return err
+	}
+	table, err := db.getPairTable(tableID)
+	if err != nil {
+		return err
+	}
+	entry, err := table.ReadEntry(index)
+	if err != nil {
+		return err
+	}
+	nextOffset := offset + len(chunk)
+	if entryHasJump(entry) {
+		return db.insertThroughJump(tableID, table, index, entry, key, nextOffset, absKey)
+	}
+	if isLast {
+		setEntryTerminal(entry, absKey)
+		if err := table.WriteEntry(index, entry); err != nil {
+			return err
+		}
+		return nil
+	}
+	if entryHasChild(entry) {
+		return db.insertPairAt(entryChildID(entry), key, nextOffset, absKey)
+	}
+	remainder := key[nextOffset:]
+	if len(remainder) == 0 {
+		setEntryTerminal(entry, absKey)
+		if err := table.WriteEntry(index, entry); err != nil {
+			return err
+		}
+		return nil
+	}
+	jumpID, err := db.createJump(remainder, true, absKey, 0)
+	if err != nil {
+		return err
+	}
+	setEntryJump(entry, jumpID)
+	if err := table.WriteEntry(index, entry); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int, absKey uint64) error {
+	jumpID := entryJumpID(entry)
+	node, err := db.loadJump(jumpID)
+	if err != nil {
+		return err
+	}
+	remainder := key[offset:]
+	common := longestCommonPrefix(node.Bytes, remainder)
+	if common == len(node.Bytes) {
+		offset += common
+		if offset == len(key) {
+			node.HasTerminal = true
+			node.TerminalKey = absKey
+			return db.writeJump(node)
+		}
+		if node.NextTableID == 0 {
+			newID, err := db.getNewPairTableID()
+			if err != nil {
+				return err
+			}
+			node.NextTableID = newID
+			if err := db.writeJump(node); err != nil {
+				return err
+			}
+		}
+		return db.insertPairAt(node.NextTableID, key, offset, absKey)
+	}
+	childID, err := db.splitJumpIntoChild(parent, branchIndex, entry, node, common)
+	if err != nil {
+		return err
+	}
+	return db.insertPairAt(childID, key, offset+common, absKey)
+}
+
+func (db *Database) splitJumpIntoChild(parent *PairTable, branchIndex uint32, entry []byte, node *JumpNode, splitOffset int) (uint32, error) {
+	childID, err := db.getNewPairTableID()
+	if err != nil {
+		return 0, err
+	}
+	remaining := node.Bytes[splitOffset:]
+	if len(remaining) == 0 {
+		return 0, fmt.Errorf("invalid jump split state")
+	}
+	if err := db.insertSuffixWithContinuation(childID, remaining, node.HasTerminal, node.TerminalKey, node.NextTableID); err != nil {
+		return 0, err
+	}
+	if err := db.deleteJump(node.ID); err != nil {
+		return 0, err
+	}
+	clearEntryJump(entry)
+	setEntryChild(entry, childID)
+	if err := parent.WriteEntry(branchIndex, entry); err != nil {
+		return 0, err
+	}
+	return childID, nil
+}
+
+func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, hasTerminal bool, terminalKey uint64, nextTableID uint32) error {
+	current := tableID
+	offset := 0
+	for {
+		chunk, index, isLast, err := db.nextChunk(suffix, offset)
+		if err != nil {
+			return err
+		}
+		table, err := db.getPairTable(current)
+		if err != nil {
+			return err
+		}
+		entry, err := table.ReadEntry(index)
+		if err != nil {
+			return err
+		}
+		nextOffset := offset + len(chunk)
+		if isLast {
+			if hasTerminal {
+				setEntryTerminal(entry, terminalKey)
+			}
+			if nextTableID != 0 {
+				setEntryChild(entry, nextTableID)
+			}
+			return table.WriteEntry(index, entry)
+		}
+		if entryHasChild(entry) {
+			current = entryChildID(entry)
+			offset = nextOffset
+			continue
+		}
+		remainder := suffix[nextOffset:]
+		if len(remainder) == 0 {
+			if hasTerminal {
+				setEntryTerminal(entry, terminalKey)
+			}
+			if nextTableID != 0 {
+				setEntryChild(entry, nextTableID)
+			}
+			return table.WriteEntry(index, entry)
+		}
+		jumpID, err := db.createJump(remainder, hasTerminal, terminalKey, nextTableID)
+		if err != nil {
+			return err
+		}
+		setEntryJump(entry, jumpID)
+		return table.WriteEntry(index, entry)
+	}
+}
+
+func longestCommonPrefix(a, b []byte) int {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	for i := 0; i < minLen; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return minLen
+}
+
+func (db *Database) getPairValue(value []byte) (uint64, error) {
+	if len(value) == 0 {
+		return 0, fmt.Errorf("pair value cannot be empty")
+	}
+	return db.lookupPairAt(0, value, 0)
+}
+
+func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64, error) {
+	chunk, index, isLast, err := db.nextChunk(key, offset)
+	if err != nil {
+		return 0, err
+	}
+	table, err := db.getPairTable(tableID)
+	if err != nil {
+		return 0, err
+	}
+	entry, err := table.ReadEntry(index)
+	if err != nil {
+		return 0, err
+	}
+	if len(entry) == 0 {
+		return 0, errPairNotFound
+	}
+	nextOffset := offset + len(chunk)
+	if entryHasJump(entry) {
+		return db.lookupThroughJump(entry, key, nextOffset)
+	}
+	if isLast {
+		if entryHasTerminal(entry) {
+			return decodeAbsoluteKey(entry), nil
+		}
+		return 0, errPairNotFound
+	}
+	if entryHasChild(entry) {
+		return db.lookupPairAt(entryChildID(entry), key, nextOffset)
+	}
+	return 0, errPairNotFound
+}
+
+func (db *Database) lookupThroughJump(entry []byte, key []byte, offset int) (uint64, error) {
+	node, err := db.loadJump(entryJumpID(entry))
+	if err != nil {
+		return 0, err
+	}
+	remainder := key[offset:]
+	if !bytes.HasPrefix(remainder, node.Bytes) {
+		return 0, errPairNotFound
+	}
+	offset += len(node.Bytes)
+	if offset == len(key) {
+		if node.HasTerminal {
+			return node.TerminalKey, nil
+		}
+		return 0, errPairNotFound
+	}
+	if node.NextTableID == 0 {
+		return 0, errPairNotFound
+	}
+	return db.lookupPairAt(node.NextTableID, key, offset)
+}
+
+func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (uint32, []byte, error) {
+	if len(prefix) == 0 {
+		return 0, nil, nil
+	}
+	targetLen := len(prefix)
+	pref := append([]byte{}, prefix...)
+	path := make([]byte, 0, len(pref))
+	tableID := uint32(0)
+	offset := 0
+	for offset < len(pref) {
+		chunk, index, _, err := db.nextChunk(pref, offset)
+		if err != nil {
+			return 0, path, err
+		}
+		table, err := db.getPairTable(tableID)
+		if err != nil {
+			return 0, path, err
+		}
+		entry, err := table.ReadEntry(index)
+		if err != nil {
+			return 0, path, err
+		}
+		if len(entry) == 0 {
+			return 0, path, errPairNotFound
+		}
+		path = append(path, chunk...)
+		offset += len(chunk)
+		if offset == targetLen && acc != nil && entryHasTerminal(entry) {
+			acc.add(append([]byte{}, path...), decodeAbsoluteKey(entry))
+		}
+		if entryHasJump(entry) {
+			node, err := db.loadJump(entryJumpID(entry))
+			if err != nil {
+				return 0, path, err
+			}
+			jumpBytes := node.Bytes
+			path = append(path, jumpBytes...)
+			remaining := targetLen - offset
+			switch {
+			case remaining > len(jumpBytes):
+				segment := jumpBytes
+				compare := pref[offset : offset+len(jumpBytes)]
+				if !bytes.Equal(segment, compare) {
+					return 0, path, errPairNotFound
+				}
+				offset += len(jumpBytes)
+			case remaining > 0:
+				if !bytes.Equal(jumpBytes[:remaining], pref[offset:offset+remaining]) {
+					return 0, path, errPairNotFound
+				}
+				offset += remaining
+				if remaining < len(jumpBytes) {
+					pref = append(pref, jumpBytes[remaining:]...)
+				}
+			default:
+				pref = append(pref, jumpBytes...)
+			}
+			if offset == targetLen && acc != nil && node.HasTerminal {
+				acc.add(append([]byte{}, path...), node.TerminalKey)
+			}
+			if node.NextTableID == 0 {
+				return 0, path, nil
+			}
+			tableID = node.NextTableID
+			continue
+		}
+		if entryHasChild(entry) {
+			tableID = entryChildID(entry)
+			continue
+		}
+		if offset < targetLen {
+			return 0, path, errPairNotFound
+		}
+		return 0, path, nil
+	}
+	return tableID, path, nil
+}
+
+func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumulator) (uint32, []byte, error) {
+	if len(prefix) == 0 {
+		return 0, nil, nil
+	}
+	targetLen := len(prefix)
+	pref := append([]byte{}, prefix...)
+	path := make([]byte, 0, len(pref))
+	tableID := uint32(0)
+	offset := 0
+	for offset < len(pref) {
+		chunk, index, _, err := db.nextChunk(pref, offset)
+		if err != nil {
+			return 0, path, err
+		}
+		table, err := db.getPairTable(tableID)
+		if err != nil {
+			return 0, path, err
+		}
+		entry, err := table.ReadEntry(index)
+		if err != nil {
+			return 0, path, err
+		}
+		if len(entry) == 0 {
+			return 0, path, errPairNotFound
+		}
+		path = append(path, chunk...)
+		offset += len(chunk)
+		if offset == targetLen && entryHasTerminal(entry) {
+			if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), decodeAbsoluteKey(entry)); err != nil {
+				return 0, path, err
+			}
+		}
+		if entryHasJump(entry) {
+			node, err := db.loadJump(entryJumpID(entry))
+			if err != nil {
+				return 0, path, err
+			}
+			jumpBytes := node.Bytes
+			path = append(path, jumpBytes...)
+			remaining := targetLen - offset
+			switch {
+			case remaining > len(jumpBytes):
+				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
+					return 0, path, errPairNotFound
+				}
+				offset += len(jumpBytes)
+			case remaining > 0:
+				if !bytes.Equal(jumpBytes[:remaining], pref[offset:offset+remaining]) {
+					return 0, path, errPairNotFound
+				}
+				offset += remaining
+				if remaining < len(jumpBytes) {
+					pref = append(pref, jumpBytes[remaining:]...)
+				}
+			default:
+				pref = append(pref, jumpBytes...)
+			}
+			if offset == targetLen && node.HasTerminal {
+				if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), node.TerminalKey); err != nil {
+					return 0, path, err
+				}
+			}
+			if node.NextTableID == 0 {
+				return 0, path, nil
+			}
+			tableID = node.NextTableID
+			continue
+		}
+		if entryHasChild(entry) {
+			tableID = entryChildID(entry)
+			continue
+		}
+		if offset < targetLen {
+			return 0, path, errPairNotFound
+		}
+		return 0, path, nil
+	}
+	return tableID, path, nil
+}
+
+func (db *Database) deletePairValue(value []byte) (bool, error) {
+	if len(value) == 0 {
+		return false, fmt.Errorf("pair value cannot be empty")
+	}
+	deleted, _, err := db.deletePairAt(0, value, 0)
+	return deleted, err
+}
+
+func (db *Database) deletePairAt(tableID uint32, key []byte, offset int) (bool, bool, error) {
+	chunk, index, isLast, err := db.nextChunk(key, offset)
+	if err != nil {
+		return false, false, err
+	}
+	table, err := db.getPairTable(tableID)
+	if err != nil {
+		return false, false, err
+	}
+	entry, err := table.ReadEntry(index)
+	if err != nil {
+		return false, false, err
+	}
+	if len(entry) == 0 {
+		return false, false, errPairNotFound
+	}
+	nextOffset := offset + len(chunk)
+	if entryHasJump(entry) {
+		return db.deleteWithinJump(table, index, entry, key, nextOffset)
+	}
+	if isLast {
+		if !entryHasTerminal(entry) {
+			return false, false, errPairNotFound
+		}
+		clearEntryTerminal(entry)
+		empty := entryIsEmpty(entry)
+		if err := table.WriteEntry(index, entry); err != nil {
+			return false, false, err
+		}
+		return true, empty, nil
+	}
+	if entryHasChild(entry) {
+		childID := entryChildID(entry)
+		deleted, childEmpty, err := db.deletePairAt(childID, key, nextOffset)
+		if err != nil {
+			return deleted, false, err
+		}
+		if !deleted {
+			return false, false, errPairNotFound
+		}
+		if childEmpty {
+			if err := db.deletePairTable(childID); err != nil {
+				return false, false, err
+			}
+			clearEntryChild(entry)
+		} else {
+			if err := db.promoteChildToJump(tableID, index, entry); err != nil {
+				return false, false, err
+			}
+		}
+		empty := entryIsEmpty(entry)
+		if err := table.WriteEntry(index, entry); err != nil {
+			return false, false, err
+		}
+		return true, empty, nil
+	}
+	return false, false, errPairNotFound
+}
+
+func (db *Database) deleteWithinJump(parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int) (bool, bool, error) {
+	node, err := db.loadJump(entryJumpID(entry))
+	if err != nil {
+		return false, false, err
+	}
+	remainder := key[offset:]
+	if !bytes.HasPrefix(remainder, node.Bytes) {
+		return false, false, errPairNotFound
+	}
+	offset += len(node.Bytes)
+	if offset == len(key) {
+		if !node.HasTerminal {
+			return false, false, errPairNotFound
+		}
+		node.HasTerminal = false
+		if !node.HasTerminal && node.NextTableID == 0 {
+			if err := db.deleteJump(node.ID); err != nil {
+				return false, false, err
+			}
+			clearEntryJump(entry)
+			empty := entryIsEmpty(entry)
+			if err := parent.WriteEntry(branchIndex, entry); err != nil {
+				return false, false, err
+			}
+			return true, empty, nil
+		}
+		if err := db.writeJump(node); err != nil {
+			return false, false, err
+		}
+		return true, false, nil
+	}
+	if node.NextTableID == 0 {
+		return false, false, errPairNotFound
+	}
+	deleted, childEmpty, err := db.deletePairAt(node.NextTableID, key, offset)
+	if err != nil {
+		return false, false, err
+	}
+	if !deleted {
+		return false, false, errPairNotFound
+	}
+	if childEmpty {
+		if err := db.deletePairTable(node.NextTableID); err != nil {
+			return false, false, err
+		}
+		node.NextTableID = 0
+	}
+	if !node.HasTerminal && node.NextTableID == 0 {
+		if err := db.deleteJump(node.ID); err != nil {
+			return false, false, err
+		}
+		clearEntryJump(entry)
+		empty := entryIsEmpty(entry)
+		if err := parent.WriteEntry(branchIndex, entry); err != nil {
+			return false, false, err
+		}
+		return true, empty, nil
+	}
+	if err := db.writeJump(node); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+func (db *Database) promoteChildToJump(parentTableID uint32, branchIndex uint32, entry []byte) error {
+	if !entryHasChild(entry) {
+		return nil
+	}
+	childID := entryChildID(entry)
+	path, hasTerminal, terminalKey, nextTableID, tables, jumps, ok, err := db.collectSingleBranchPath(childID)
+	if err != nil || !ok {
+		return err
+	}
+	if len(path) == 0 {
+		return nil
+	}
+	jumpID, err := db.createJump(path, hasTerminal, terminalKey, nextTableID)
+	if err != nil {
+		return err
+	}
+	for _, id := range tables {
+		if err := db.deletePairTable(id); err != nil {
+			return err
+		}
+	}
+	for _, jumpID := range jumps {
+		if err := db.deleteJump(jumpID); err != nil {
+			return err
+		}
+	}
+	clearEntryChild(entry)
+	setEntryJump(entry, jumpID)
+	return nil
+}
+
+func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint64, uint32, []uint32, []uint32, bool, error) {
+	current := tableID
+	path := make([]byte, 0)
+	tables := make([]uint32, 0, 4)
+	jumps := make([]uint32, 0, 2)
+	var terminal bool
+	var terminalKey uint64
+	var nextTableID uint32
+	for {
+		tables = append(tables, current)
+		table, err := db.getPairTable(current)
+		if err != nil {
+			return nil, false, 0, 0, nil, nil, false, err
+		}
+		branchCount := table.BranchCount()
+		var branchEntry []byte
+		branchIndex := -1
+		nonEmpty := 0
+		for i := 0; i < branchCount; i++ {
+			e, err := table.ReadEntry(uint32(i))
+			if err != nil {
+				return nil, false, 0, 0, nil, nil, false, err
+			}
+			if len(e) == 0 || entryIsEmpty(e) {
+				continue
+			}
+			nonEmpty++
+			branchEntry = e
+			branchIndex = i
+			if nonEmpty > 1 {
+				return nil, false, 0, 0, nil, nil, false, nil
+			}
+		}
+		if nonEmpty == 0 {
+			return nil, false, 0, 0, nil, nil, false, nil
+		}
+		chunk, ok := db.branchCodec.decode(uint32(branchIndex))
+		if !ok {
+			return nil, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
+		}
+		path = append(path, chunk...)
+		terminal = entryHasTerminal(branchEntry)
+		if terminal {
+			terminalKey = decodeAbsoluteKey(branchEntry)
+		}
+		if entryHasJump(branchEntry) {
+			jumpID := entryJumpID(branchEntry)
+			node, err := db.loadJump(jumpID)
+			if err != nil {
+				return nil, false, 0, 0, nil, nil, false, err
+			}
+			path = append(path, node.Bytes...)
+			terminal = node.HasTerminal
+			terminalKey = node.TerminalKey
+			nextTableID = node.NextTableID
+			jumps = append(jumps, jumpID)
+			return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
+		}
+		if entryHasChild(branchEntry) {
+			current = entryChildID(branchEntry)
+			continue
+		}
+		nextTableID = 0
+		return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
+	}
 }
 
 // ExecuteCommand analizza ed esegue un comando.
@@ -696,57 +1387,24 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 	limit = normalizePairScanLimit(limit)
 	acc := newPairScanAccumulator(limit, cursor)
 	startTable := uint32(0)
+	expandedPrefix := append([]byte{}, prefix...)
 	if len(prefix) > 0 {
-		currentTableID := uint32(0)
-		var prefixAbort bool
-		err := db.branchCodec.walkKey(prefix, func(index uint32, chunk []byte, isLast bool) error {
-			table, err := db.getPairTable(currentTableID)
-			if err != nil {
-				if os.IsNotExist(err) {
-					prefixAbort = true
-					return errPairTraversalAbort
-				}
-				return err
-			}
-			entry, err := table.ReadEntry(index)
-			if err != nil {
-				return err
-			}
-			if isLast {
-				if entryHasTerminal(entry) {
-					if acc.add(prefix, decodeAbsoluteKey(entry)) && limit > 0 {
-						prefixAbort = true
-						return errPairTraversalAbort
-					}
-				}
-				if entryHasChild(entry) {
-					startTable = entryChildID(entry)
-				}
-				return nil
-			}
-			if !entryHasChild(entry) {
-				prefixAbort = true
-				return errPairTraversalAbort
-			}
-			childID := entryChildID(entry)
-			if childID == 0 {
-				prefixAbort = true
-				return errPairTraversalAbort
-			}
-			currentTableID = childID
-			return nil
-		})
+		tableID, path, err := db.resolveScanPrefix(prefix, acc)
 		if err != nil {
-			if err == errPairTraversalAbort || prefixAbort {
+			if errors.Is(err, errPairNotFound) {
 				results, nextCursor := acc.finalize(acc.limit)
 				return results, nextCursor, nil
 			}
 			return nil, nil, err
 		}
-		if startTable == 0 {
+		expandedPrefix = path
+		startTable = tableID
+		if acc.shouldStop() || startTable == 0 {
 			results, nextCursor := acc.finalize(acc.limit)
 			return results, nextCursor, nil
 		}
+	} else {
+		expandedPrefix = nil
 	}
 	workerCount := 1
 	if db.resources != nil {
@@ -758,7 +1416,7 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 	if workerCount < 1 {
 		workerCount = 1
 	}
-	if err := db.parallelCollectPairEntries(startTable, prefix, workerCount, acc); err != nil {
+	if err := db.parallelCollectPairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
 		return nil, nil, err
 	}
 	results, nextCursor := acc.finalize(acc.limit)
@@ -777,57 +1435,22 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 	}
 	acc := newPairSummaryAccumulator(prefix, depthLimit, branchLimit)
 	startTable := uint32(0)
+	expandedPrefix := append([]byte{}, prefix...)
 	if len(prefix) > 0 {
-		currentTableID := uint32(0)
-		var summaryAbort bool
-		err := db.branchCodec.walkKey(prefix, func(index uint32, chunk []byte, isLast bool) error {
-			table, err := db.getPairTable(currentTableID)
-			if err != nil {
-				if os.IsNotExist(err) {
-					summaryAbort = true
-					return errPairTraversalAbort
-				}
-				return err
-			}
-			entry, err := table.ReadEntry(index)
-			if err != nil {
-				return err
-			}
-			if isLast {
-				if entryHasTerminal(entry) {
-					key := decodeAbsoluteKey(entry)
-					if key != 0 {
-						if err := db.recordSummaryTerminal(acc, append([]byte{}, prefix...), key); err != nil {
-							return err
-						}
-					}
-				}
-				if entryHasChild(entry) {
-					startTable = entryChildID(entry)
-				}
-				return nil
-			}
-			if !entryHasChild(entry) {
-				summaryAbort = true
-				return errPairTraversalAbort
-			}
-			childID := entryChildID(entry)
-			if childID == 0 {
-				summaryAbort = true
-				return errPairTraversalAbort
-			}
-			currentTableID = childID
-			return nil
-		})
+		tableID, path, err := db.resolveSummaryPrefix(prefix, acc)
 		if err != nil {
-			if err == errPairTraversalAbort || summaryAbort {
+			if errors.Is(err, errPairNotFound) {
 				return acc.finalize(), nil
 			}
 			return nil, err
 		}
+		expandedPrefix = path
+		startTable = tableID
 		if startTable == 0 {
 			return acc.finalize(), nil
 		}
+	} else {
+		expandedPrefix = nil
 	}
 	workerCount := 1
 	if db.resources != nil {
@@ -839,7 +1462,7 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 	if workerCount < 1 {
 		workerCount = 1
 	}
-	if err := db.parallelSummarizePairEntries(startTable, prefix, workerCount, acc); err != nil {
+	if err := db.parallelSummarizePairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
 		return nil, err
 	}
 	return acc.finalize(), nil
@@ -1114,7 +1737,7 @@ func (db *Database) walkPairSummary(
 		if err != nil {
 			return err
 		}
-		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry)) {
+		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
 			continue
 		}
 		chunk, ok := db.branchCodec.decode(branch)
@@ -1137,6 +1760,23 @@ func (db *Database) walkPairSummary(
 			}
 			pending.Add(1)
 			tasks <- pairSummaryTask{tableID: childID, path: value}
+		}
+		if entryHasJump(entry) {
+			node, err := db.loadJump(entryJumpID(entry))
+			if err != nil {
+				return err
+			}
+			extended := append(append([]byte{}, value...), node.Bytes...)
+			if node.HasTerminal {
+				if err := db.recordSummaryTerminal(acc, extended, node.TerminalKey); err != nil {
+					return err
+				}
+			}
+			if node.NextTableID != 0 {
+				pending.Add(1)
+				tasks <- pairSummaryTask{tableID: node.NextTableID, path: extended}
+			}
+			continue
 		}
 	}
 	return nil
@@ -1175,7 +1815,7 @@ func (db *Database) walkPairTable(
 		if err != nil {
 			return err
 		}
-		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry)) {
+		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
 			continue
 		}
 		chunk, ok := db.branchCodec.decode(branch)
@@ -1188,6 +1828,24 @@ func (db *Database) walkPairTable(
 				abort.Store(true)
 				return nil
 			}
+		}
+		if entryHasJump(entry) {
+			node, err := db.loadJump(entryJumpID(entry))
+			if err != nil {
+				return err
+			}
+			extended := append(append([]byte{}, value...), node.Bytes...)
+			if node.HasTerminal {
+				if acc.add(extended, node.TerminalKey) && abort != nil && acc.limit > 0 {
+					abort.Store(true)
+					return nil
+				}
+			}
+			if node.NextTableID != 0 {
+				pending.Add(1)
+				tasks <- pairScanTask{tableID: node.NextTableID, prefix: extended}
+			}
+			continue
 		}
 		if entryHasChild(entry) {
 			childID := entryChildID(entry)

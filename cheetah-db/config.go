@@ -38,7 +38,7 @@ func defaultConfig() Config {
 		DataDir:         "cheetah_data",
 		DefaultDatabase: "default",
 		DatabaseDefaults: DatabaseConfig{
-			PairIndexBytes:      2,
+			PairIndexBytes:      1,
 			PayloadCacheEntries: defaultPayloadCacheEntries,
 			PayloadCacheBytes:   defaultPayloadCacheBytes,
 		},

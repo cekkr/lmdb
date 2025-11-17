@@ -62,6 +62,23 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   hits the configured limit, allowing clients to stream arbitrarily large namespaces without
   reopening readers. Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from
   `cheetah-db/` to reproduce the latest snapshots:
+
+### Indexing Defaults & Jump Nodes
+
+- `pair_index_bytes` now defaults to `1` so each `PairTable` file tops out at 256 entries. Use
+  `config.ini` (see `config.example.ini`) or append overrides to `DATABASE`/`RESET_DB`
+  (`DATABASE ctx pair_bytes=2 payload_cache_entries=0`) whenever you truly need the wider
+  stride—2-byte tables allocate 256 + 65,536 slots and should be reserved for extremely dense
+  prefixes. Overrides persist per-database until reset.
+- Unique suffixes automatically collapse into jump nodes. When an insert discovers that the remaining
+  bytes on a branch only belong to that key, the entry stores the tail under `pair_jumps/` and points
+  to that segment instead of allocating another 256-entry table. New keys split those jump nodes as
+  soon as they overlap, and deletions re-check whether a child table is back to a single branch so it
+  can be re-promoted into a jump. This keeps disk usage proportional to the number of active prefixes
+  instead of the raw namespace depth.
+- `PAIR_SCAN` and `PAIR_SUMMARY` now respect compressed segments automatically. When a prefix lands
+  inside a jump node, the resolver extends the requested prefix with the forced bytes before queuing
+  traversal work, so clients do not have to manage the compressed paths themselves.
   - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).

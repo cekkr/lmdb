@@ -6,15 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
 
 const maxValueSize = int(^uint32(0))
-
-var errPairTraversalAbort = errors.New("pair traversal aborted")
 
 // --- Metodi CRUD per Database ---
 
@@ -162,35 +159,7 @@ func (db *Database) PairSet(value []byte, absKey uint64) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
-
-	currentTableID := uint32(0)
-	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
-		table, err := db.getPairTable(currentTableID)
-		if err != nil {
-			return err
-		}
-		entry, _ := table.ReadEntry(index)
-		if isLast {
-			setEntryTerminal(entry, absKey)
-			return table.WriteEntry(index, entry)
-		}
-		childID := entryChildID(entry)
-		if !entryHasChild(entry) || childID == 0 {
-			newID, err := db.getNewPairTableID()
-			if err != nil {
-				return err
-			}
-			setEntryChild(entry, newID)
-			if err := table.WriteEntry(index, entry); err != nil {
-				return err
-			}
-			currentTableID = newID
-			return nil
-		}
-		currentTableID = childID
-		return nil
-	})
-	if err != nil {
+	if err := db.setPairValue(value, absKey); err != nil {
 		return "", err
 	}
 	return "SUCCESS,pair_set", nil
@@ -200,175 +169,36 @@ func (db *Database) PairGet(value []byte) (string, error) {
 	if len(value) == 0 {
 		return "ERROR,pair_value_cannot_be_empty", nil
 	}
-
-	currentTableID := uint32(0)
-	var result string
-	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
-		table, err := db.getPairTable(currentTableID)
-		if err != nil {
-			if os.IsNotExist(err) {
-				result = "ERROR,not_found"
-				return errPairTraversalAbort
-			}
-			return err
-		}
-		entry, _ := table.ReadEntry(index)
-		if isLast {
-			if !entryHasTerminal(entry) {
-				result = "ERROR,not_found"
-				return errPairTraversalAbort
-			}
-			result = fmt.Sprintf("SUCCESS,key=%d", decodeAbsoluteKey(entry))
-			return errPairTraversalAbort
-		}
-		if !entryHasChild(entry) {
-			result = "ERROR,not_found"
-			return errPairTraversalAbort
-		}
-		currentTableID = entryChildID(entry)
-		if currentTableID == 0 {
-			result = "ERROR,not_found"
-			return errPairTraversalAbort
-		}
-		return nil
-	})
-	if err != nil && err != errPairTraversalAbort {
-		return "", err
-	}
-	if result == "" {
-		result = "ERROR,not_found"
-	}
-	return result, nil
-}
-
-// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
-
-type pathStackFrame struct {
-	TableID     uint32
-	BranchIndex uint32
-}
-
-// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani,
-// implementando la compressione del percorso.
-func (db *Database) PairDel(value []byte) (string, error) {
-	if len(value) == 0 {
-		return "ERROR,pair_value_cannot_be_empty", nil
-	}
-
-	// --- Fase 1: Scoperta del Percorso (Read Locks) ---
-	pathStack := make([]pathStackFrame, 0, len(value))
-	acquiredLocks := make([]*sync.RWMutex, 0, len(value))
-
-	cleanupReadLocks := func() {
-		for i := len(acquiredLocks) - 1; i >= 0; i-- {
-			acquiredLocks[i].RUnlock()
-		}
-	}
-
-	currentTableID := uint32(0)
-	err := db.branchCodec.walkKey(value, func(index uint32, chunk []byte, isLast bool) error {
-		table, err := db.getPairTable(currentTableID)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return errPairTraversalAbort
-			}
-			return err
-		}
-
-		table.mu.RLock()
-		acquiredLocks = append(acquiredLocks, &table.mu)
-
-		entry, err := table.ReadEntry(index)
-		if err != nil {
-			return errPairTraversalAbort
-		}
-
-		pathStack = append(pathStack, pathStackFrame{TableID: currentTableID, BranchIndex: index})
-		if isLast {
-			if !entryHasTerminal(entry) {
-				return errPairTraversalAbort
-			}
-		} else {
-			if !entryHasChild(entry) {
-				return errPairTraversalAbort
-			}
-			currentTableID = entryChildID(entry)
-		}
-		return nil
-	})
-	cleanupReadLocks()
+	key, err := db.getPairValue(value)
 	if err != nil {
-		if err == errPairTraversalAbort {
+		if errors.Is(err, errPairNotFound) {
+			return "ERROR,not_found", nil
+		}
+		if os.IsNotExist(err) {
 			return "ERROR,not_found", nil
 		}
 		return "", err
 	}
+	return fmt.Sprintf("SUCCESS,key=%d", key), nil
+}
 
-	// --- Fase 2: Blocco Esclusivo del Percorso (Write Locks) ---
-	pathTableIDs := make([]uint32, len(pathStack))
-	for i, frame := range pathStack {
-		pathTableIDs[i] = frame.TableID
+// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
+
+// PairDel cancella una mappatura valore->chiave e pulisce i nodi orfani.
+func (db *Database) PairDel(value []byte) (string, error) {
+	if len(value) == 0 {
+		return "ERROR,pair_value_cannot_be_empty", nil
 	}
-
-	// Ordiniamo gli ID per acquisire i lock in ordine ed evitare deadlock
-	sort.Slice(pathTableIDs, func(i, j int) bool { return pathTableIDs[i] < pathTableIDs[j] })
-
-	lockedTables := make(map[uint32]*PairTable)
-	for _, id := range pathTableIDs {
-		table, _ := db.getPairTable(id)
-		table.mu.Lock()
-		lockedTables[id] = table
-	}
-	defer func() { // Assicuriamo il rilascio di tutti i write lock
-		for _, id := range pathTableIDs {
-			if table, ok := lockedTables[id]; ok {
-				table.mu.Unlock()
-			}
+	deleted, err := db.deletePairValue(value)
+	if err != nil {
+		if errors.Is(err, errPairNotFound) {
+			return "ERROR,not_found", nil
 		}
-	}()
-
-	// --- Fase 3: Modifica e Pulizia ---
-	// Modifichiamo il nodo terminale
-	terminalFrame := pathStack[len(pathStack)-1]
-	terminalTable := lockedTables[terminalFrame.TableID]
-	terminalEntry, _ := terminalTable.ReadEntry(terminalFrame.BranchIndex)
-	if !entryHasTerminal(terminalEntry) {
+		return "", err
+	}
+	if !deleted {
 		return "ERROR,not_found", nil
 	}
-	clearEntryTerminal(terminalEntry)
-	if err := terminalTable.WriteEntry(terminalFrame.BranchIndex, terminalEntry); err != nil {
-		return "", fmt.Errorf("failed to clear terminal entry: %w", err)
-	}
-
-	// Risaliamo lo stack per pulire eventuali nodi vuoti
-	for i := len(pathStack) - 1; i >= 0; i-- {
-		frame := pathStack[i]
-		tableToAnalyze := lockedTables[frame.TableID]
-		isEmpty, err := tableToAnalyze.IsEmpty()
-		if err != nil || !isEmpty {
-			break
-		}
-		if i == 0 {
-			break // non cancelliamo mai la radice
-		}
-		parentFrame := pathStack[i-1]
-		parentTable := lockedTables[parentFrame.TableID]
-		parentEntry, _ := parentTable.ReadEntry(parentFrame.BranchIndex)
-		clearEntryChild(parentEntry)
-		if err := parentTable.WriteEntry(parentFrame.BranchIndex, parentEntry); err != nil {
-			return "", err
-		}
-		if frame.TableID != 0 {
-			if err := db.deletePairTable(frame.TableID); err != nil {
-				return "", err
-			}
-			delete(lockedTables, frame.TableID)
-		}
-	}
-
-	// --- Fase 4: Rilascio dei Lock ---
-	// Gestito dal defer in cima alla fase 2
-
 	return "SUCCESS,pair_deleted", nil
 }
 

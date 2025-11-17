@@ -7,7 +7,8 @@ import (
 
 type pairBranchCodec struct {
 	chunkBytes  int
-	base        int
+	offsets     []int
+	combos      []int
 	branchCount int
 }
 
@@ -18,26 +19,36 @@ func newPairBranchCodec(chunkBytes int) (pairBranchCodec, error) {
 	if chunkBytes > 2 {
 		return pairBranchCodec{}, fmt.Errorf("chunkBytes=%d exceeds supported maximum (2)", chunkBytes)
 	}
-	base := 1
-	for i := 0; i < chunkBytes; i++ {
-		base *= 256
+	offsets := make([]int, chunkBytes+1)
+	combos := make([]int, chunkBytes+1)
+	total := 0
+	for length := 1; length <= chunkBytes; length++ {
+		offsets[length] = total
+		count := 1
+		for i := 0; i < length; i++ {
+			count *= 256
+		}
+		combos[length] = count
+		total += count
 	}
 	return pairBranchCodec{
 		chunkBytes:  chunkBytes,
-		base:        base,
-		branchCount: chunkBytes * base,
+		offsets:     offsets,
+		combos:      combos,
+		branchCount: total,
 	}, nil
 }
 
 func (c pairBranchCodec) branchIndexFromChunk(chunk []byte) (uint32, error) {
-	if len(chunk) == 0 || len(chunk) > c.chunkBytes {
-		return 0, fmt.Errorf("invalid chunk length %d", len(chunk))
+	length := len(chunk)
+	if length == 0 || length > c.chunkBytes {
+		return 0, fmt.Errorf("invalid chunk length %d", length)
 	}
 	value := 0
 	for _, b := range chunk {
 		value = (value << 8) | int(b)
 	}
-	index := (len(chunk)-1)*c.base + value
+	index := c.offsets[length] + value
 	return uint32(index), nil
 }
 
@@ -45,18 +56,21 @@ func (c pairBranchCodec) decode(index uint32) ([]byte, bool) {
 	if index >= uint32(c.branchCount) {
 		return nil, false
 	}
-	group := int(index) / c.base
-	if group >= c.chunkBytes {
-		return nil, false
+	intIndex := int(index)
+	for length := 1; length <= c.chunkBytes; length++ {
+		start := c.offsets[length]
+		count := c.combos[length]
+		if intIndex >= start && intIndex < start+count {
+			value := intIndex - start
+			chunk := make([]byte, length)
+			for i := length - 1; i >= 0; i-- {
+				chunk[i] = byte(value & 0xFF)
+				value >>= 8
+			}
+			return chunk, true
+		}
 	}
-	length := group + 1
-	value := int(index) % c.base
-	chunk := make([]byte, length)
-	for i := length - 1; i >= 0; i-- {
-		chunk[i] = byte(value & 0xFF)
-		value >>= 8
-	}
-	return chunk, true
+	return nil, false
 }
 
 func (c pairBranchCodec) walkKey(key []byte, fn func(index uint32, chunk []byte, isLast bool) error) error {
