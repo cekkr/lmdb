@@ -59,6 +59,70 @@ func (s *sharedState) randomPair(r *rand.Rand) (pairEntry, bool) {
 	return s.pairValues[r.Intn(len(s.pairValues))], true
 }
 
+func TestEditResizesValues(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultConfig()
+	cfg.DataDir = filepath.Join(dir, "data")
+	engine, err := NewEngine(&cfg, nil)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	t.Cleanup(func() {
+		engine.Close()
+	})
+	db, err := engine.GetDatabase(cfg.DefaultDatabase)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	keyResp, err := db.Insert([]byte("seed"), 0)
+	if err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	key, err := parseKey(keyResp)
+	if err != nil {
+		t.Fatalf("parse key failed: %v", err)
+	}
+
+	growValue := []byte(strings.Repeat("B", 64))
+	if resp, err := db.Edit(key, growValue); err != nil || !strings.HasPrefix(resp, "SUCCESS") {
+		t.Fatalf("edit grow failed: resp=%s err=%v", resp, err)
+	}
+	assertStoredValue(t, db, key, growValue)
+
+	shrinkValue := []byte("ok")
+	if resp, err := db.Edit(key, shrinkValue); err != nil || !strings.HasPrefix(resp, "SUCCESS") {
+		t.Fatalf("edit shrink failed: resp=%s err=%v", resp, err)
+	}
+	assertStoredValue(t, db, key, shrinkValue)
+}
+
+func assertStoredValue(t *testing.T, db *Database, key uint64, expected []byte) {
+	t.Helper()
+	resp, err := db.Read(key)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if !strings.Contains(resp, fmt.Sprintf("size=%d", len(expected))) {
+		t.Fatalf("size mismatch for key=%d resp=%s", key, resp)
+	}
+	valuePrefix := "value="
+	var actual string
+	for _, part := range strings.Split(resp, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, valuePrefix) {
+			actual = part[len(valuePrefix):]
+			break
+		}
+	}
+	if actual == "" {
+		t.Fatalf("response missing value payload: %s", resp)
+	}
+	if actual != string(expected) {
+		t.Fatalf("value mismatch: expected %q got %q", string(expected), actual)
+	}
+}
+
 func TestCheetahDBBenchmark(t *testing.T) {
 	if os.Getenv("CHEETAHDB_BENCH") == "" {
 		t.Skip("set CHEETAHDB_BENCH=1 to run the 30s benchmark")
@@ -386,3 +450,4 @@ func parseKey(resp string) (uint64, error) {
 	}
 	return key, nil
 }
+

@@ -87,7 +87,16 @@ func (db *Database) Read(key uint64) (string, error) {
 }
 
 func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
-	entry, err := db.mainKeys.ReadEntry(key)
+	newSize := len(newValue)
+	if newSize <= 0 || newSize > maxValueSize {
+		return "ERROR,invalid_value_size", nil
+	}
+
+	lock := db.mainKeys.getLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	entry, err := db.mainKeys.readEntryFromFile(key)
 	if err != nil {
 		return "ERROR,key_not_found", err
 	}
@@ -95,20 +104,62 @@ func (db *Database) Edit(key uint64, newValue []byte) (string, error) {
 	if valueSize == 0 {
 		return "ERROR,key_not_found (deleted)", nil
 	}
-	if len(newValue) != int(valueSize) {
-		return fmt.Sprintf("ERROR,value_size_mismatch (expected %d, got %d)", valueSize, len(newValue)), nil
+
+	currentLocationBytes := make([]byte, ValueLocationIndexSize)
+	copy(currentLocationBytes, entry[ValueSizeBytes:])
+	currentLocation := DecodeValueLocationIndex(currentLocationBytes)
+
+	if newSize == int(valueSize) {
+		vTable, err := db.getValuesTable(valueSize, currentLocation.TableID)
+		if err != nil {
+			return "ERROR,cannot_load_values_table", err
+		}
+		offset := int64(currentLocation.EntryID) * int64(valueSize)
+		if _, err := vTable.WriteAt(newValue, offset); err != nil {
+			return "ERROR,value_update_failed", err
+		}
+		db.cachePayload(valueSize, currentLocation, newValue)
+		return fmt.Sprintf("SUCCESS,key=%d_updated", key), nil
 	}
 
-	location := DecodeValueLocationIndex(entry[ValueSizeBytes:])
-	vTable, err := db.getValuesTable(valueSize, location.TableID)
+	newSizeField := uint32(newSize)
+	newLocation, err := db.getAvailableLocation(newSizeField)
+	if err != nil {
+		return "ERROR,cannot_get_value_location", err
+	}
+	vTable, err := db.getValuesTable(newSizeField, newLocation.TableID)
 	if err != nil {
 		return "ERROR,cannot_load_values_table", err
 	}
-	offset := int64(location.EntryID) * int64(valueSize)
+	offset := int64(newLocation.EntryID) * int64(newSizeField)
 	if _, err := vTable.WriteAt(newValue, offset); err != nil {
 		return "ERROR,value_update_failed", err
 	}
-	db.cachePayload(valueSize, location, newValue)
+	db.cachePayload(newSizeField, newLocation, newValue)
+
+	newLocationBytes := newLocation.Encode()
+	writeValueSize(entry, newSizeField)
+	copy(entry[ValueSizeBytes:], newLocationBytes)
+	if err := db.mainKeys.writeEntryToFile(key, entry); err != nil {
+		if recycleTable, recycleErr := db.getRecycleTable(newSizeField); recycleErr == nil {
+			_ = recycleTable.Push(newLocationBytes)
+		}
+		db.invalidatePayload(newSizeField, newLocation)
+		return "ERROR,key_write_failed", err
+	}
+
+	db.invalidatePayload(valueSize, currentLocation)
+	if rTable, err := db.getRecycleTable(valueSize); err != nil {
+		logErrorf("failed to load recycle table for size=%d: %v", valueSize, err)
+	} else if err := rTable.Push(currentLocationBytes); err != nil {
+		logErrorf(
+			"failed to recycle location size=%d table=%d entry=%d: %v",
+			valueSize,
+			currentLocation.TableID,
+			currentLocation.EntryID,
+			err,
+		)
+	}
 
 	return fmt.Sprintf("SUCCESS,key=%d_updated", key), nil
 }
@@ -147,7 +198,7 @@ func (db *Database) Delete(key uint64) (string, error) {
 		return "ERROR,key_delete_failed", err
 	}
 
-	// Se abbiamo eliminato la chiave pi√π alta, trova la nuova
+	// Se abbiamo eliminato la chiave pi+¶ alta, trova la nuova
 	if key == db.highestKey.Load() {
 		db.findNewHighestKey(key)
 	}
@@ -310,3 +361,4 @@ func isPairDelResponseIgnorable(resp string) bool {
 	}
 	return strings.Contains(strings.ToLower(resp), "not_found")
 }
+
