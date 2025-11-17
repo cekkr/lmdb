@@ -42,11 +42,20 @@ class ContextDimensionTracker:
         self,
         dimensions: Sequence[ContextDimension],
         seed_tokens: Sequence[int] | None = None,
+        *,
+        dimension_weights: Sequence[float] | None = None,
     ) -> None:
         self.dimensions = list(dimensions)
         self.history: list[int] = []
         self.max_window = max((dim.end for dim in self.dimensions), default=0)
         self.counts = [defaultdict(int) for _ in self.dimensions]
+        if dimension_weights:
+            weights = [float(weight) for weight in dimension_weights]
+            while len(weights) < len(self.dimensions):
+                weights.append(1.0)
+            self.dimension_weights = weights[: len(self.dimensions)]
+        else:
+            self.dimension_weights = [1.0 for _ in self.dimensions]
         if seed_tokens:
             for token_id in seed_tokens:
                 self.record(token_id)
@@ -71,7 +80,8 @@ class ContextDimensionTracker:
                 if seen > max_seen:
                     max_seen = seen
             if max_seen:
-                weight = dim.weight
+                base_weight = dim.weight
+                weight = base_weight * self.dimension_weights[idx]
                 penalty += presence_penalty * weight
                 penalty += max_seen * frequency_penalty * weight
         return penalty

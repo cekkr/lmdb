@@ -689,6 +689,11 @@ def run_inference_records(
     log(
         f"[eval] Running {total_runs} inference probe(s) from {label} to gauge training quality."
     )
+    window_summary = getattr(engine, "context_windows", None)
+    if window_summary:
+        description = window_summary.describe()
+        if description:
+            log(f"[eval] Context window embeddings active: {description}")
     results: list[EvaluationSampleResult] = []
     pending: list[dict[str, Any]] = []
     queue_rng = seed_planner.queue_rng if seed_planner else random

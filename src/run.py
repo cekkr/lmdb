@@ -38,8 +38,9 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-dimensions",
         help=(
-            "Override the stored context-dimension penalties with ranges like '1-2,3-5' or "
-            "length specs such as '4,8,4'. Use 'off' to disable; omit to reuse metadata from the database."
+            "Override the stored context-dimension penalties with ranges like '6,12,24' or "
+            "length specs such as '4,8,4'. These drive both penalty spans and context-window embeddings. "
+            "Use 'off' to disable; omit to reuse metadata from the database."
         ),
     )
     parser.add_argument(
@@ -218,6 +219,7 @@ class PromptWorker:
             log(f"[run] {line}")
         self.conversation_id = ready.get("conversation_id", "")
         self.context_label = ready.get("context_dimensions")
+        self.window_label = ready.get("context_window_embeddings")
 
     def request(self, prompt: str) -> str:
         self._next_id += 1
@@ -261,6 +263,8 @@ class PromptWorker:
                 self.conversation_id = conv_id
             if "context_dimensions" in summary:
                 self.context_label = summary["context_dimensions"]
+            if "context_window_embeddings" in summary:
+                self.window_label = summary["context_window_embeddings"]
             return summary
 
     def close(self) -> None:
@@ -303,6 +307,7 @@ def _decoder_worker(
         else:
             conv_id = engine.start_conversation(user, agent)
         dims_label = format_context_dimensions(engine.context_dimensions)
+        window_label = engine.context_windows.describe()
         cheetah_lines: list[str] = []
         if cheetah_system_stats:
             cheetah_lines.extend(collect_system_stats_lines(engine.hot_path))
@@ -320,6 +325,8 @@ def _decoder_worker(
             "conversation_id": conv_id,
             "context_dimensions": dims_label,
         }
+        if window_label:
+            ready_payload["context_window_embeddings"] = window_label
         if cheetah_lines:
             ready_payload["cheetah_logs"] = cheetah_lines
         response_q.put(ready_payload)
@@ -360,6 +367,7 @@ def _decoder_worker(
                     summary = {
                         "conversation_id": conv_id,
                         "context_dimensions": format_context_dimensions(engine.context_dimensions),
+                        "context_window_embeddings": engine.context_windows.describe(),
                         "history": engine.memory.context_window(conv_id) or "(empty)",
                     }
                     response_q.put({"type": "conversation", "id": msg_id, "summary": summary})
@@ -431,6 +439,8 @@ def interactive_loop(
             log(f"[run] Conversation summary -> id={summary.get('conversation_id', worker.conversation_id)}")
             if "context_dimensions" in summary:
                 log(f"[run] Context dims: {summary['context_dimensions']}")
+            if "context_window_embeddings" in summary and summary["context_window_embeddings"]:
+                log(f"[run] Context windows: {summary['context_window_embeddings']}")
             if "history" in summary:
                 preview = summary["history"].strip() or "(empty)"
                 if len(preview) > 200:
@@ -494,7 +504,11 @@ def main() -> None:
             cheetah_system_stats=args.cheetah_system_stats,
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
-        log(f"[run] Using conversation: {worker.conversation_id} (context dims: {dims_label})")
+        window_label = worker.window_label or "n/a"
+        log(
+            f"[run] Using conversation: {worker.conversation_id} "
+            f"(context dims: {dims_label}; windows: {window_label})"
+        )
         prompt_formatter = build_prompt_formatter(args.instruction, args.instruction_label, args.user_label)
         response_formatter = build_response_formatter(args.max_response_words)
 

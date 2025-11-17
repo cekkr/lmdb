@@ -73,8 +73,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-dimensions",
         help=(
-            "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like '4,8,4' "
-            "used to group context penalties. Use 'off' to disable the additional grouping penalties."
+            "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like '6,12,24' "
+            "used to group context penalties and MiniLM-based context-window embeddings. Use 'off' to disable."
         ),
     )
     parser.add_argument(
@@ -1330,8 +1330,13 @@ def main() -> None:
         log(f"[train] Hot-path adapter active -> {describe_adapter()}")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
+    context_window_label = engine.context_windows.describe()
+    if context_window_label:
+        log(f"[train] Context window embeddings: {context_window_label}")
     if run_metadata is not None:
         run_metadata["context_dimensions"] = dims_label
+        if context_window_label:
+            run_metadata["context_window_embeddings"] = context_window_label
     _emit_cheetah_reports(engine, args)
     if args.eval_variants is not None:
         if args.eval_variants < 1:

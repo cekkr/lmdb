@@ -97,6 +97,15 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   embedder energy (the `_EMOTION_WORDS` allowlist is gone). Configure the embedding backbone with
   `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no Hugging Face downloads) via
   `DBSLM_EMBEDDER_OFFLINE=1`.
+- Context dimensions now double as MiniLM-driven window embeddings. When you pass spans such as
+  `--context-dimensions 6,12,24`, the trainer samples that many words per dimension (stride → 50%),
+  embeds the windows with `all-MiniLM-L6-v2`, and keeps running prototypes per dimension inside both
+  SQLite metadata and the cheetah hot-path namespace. During inference the decoder reuses those
+  prototypes to scale the per-dimension presence/frequency penalties via cosine similarity, so the
+  learned multi-scale contexts influence sampling without needing per-token embedding calls.
+- Future idea: promote each dimension to a small codebook (k-means per window size) and expose a CLI
+  inspector so we can audit the learned prototypes or pin certain domains (code, poetry, etc.)
+  before wiring them into penalty scaling.
 - Tokenization now supports a Hugging Face-backed backend: set
   `DBSLM_TOKENIZER_BACKEND=huggingface`, point `DBSLM_TOKENIZER_JSON` at a tokenizer.json
   (usually exported from `tokenizers` or HF Hub), and optionally disable lower-casing with

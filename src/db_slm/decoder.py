@@ -48,6 +48,7 @@ class Decoder:
         context_snippet: str = "",
         *,
         rng: random.Random | None = None,
+        dimension_weights: Sequence[float] | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
@@ -56,7 +57,11 @@ class Decoder:
         banned = self._load_bans(config.profile)
         dimension_tracker: ContextDimensionTracker | None = None
         if self.context_dimensions:
-            dimension_tracker = ContextDimensionTracker(self.context_dimensions, list(context_ids))
+            dimension_tracker = ContextDimensionTracker(
+                self.context_dimensions,
+                list(context_ids),
+                dimension_weights=dimension_weights,
+            )
         for _ in range(config.max_tokens):
             order = min(self.store.order, len(context_ids) + 1)
             candidates = self._resolve_candidates(context_ids, order, profile["topk"])

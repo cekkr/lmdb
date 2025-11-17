@@ -13,6 +13,7 @@ from .context_dimensions import (
     deserialize_context_dimensions,
     serialize_context_dimensions,
 )
+from .context_window_embeddings import ContextWindowEmbeddingManager
 from .db import DatabaseEnvironment
 from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
@@ -85,6 +86,12 @@ class DBSLMEngine:
         self.concepts = ConceptEngine(self.db, self.memory, self.quantizer)
         self.level1 = self.store  # backwards compatibility for callers expecting this attr
         self.segment_embedder = SentencePartEmbeddingPipeline(self.settings)
+        self.context_windows = ContextWindowEmbeddingManager(
+            self.context_dimensions,
+            embedder=self.segment_embedder.embedder,
+            db=self.db,
+            hot_path=self.hot_path,
+        )
         self._ensure_seed_data()
         self._low_resource_helper = LowResourceHelper(self)
         self._response_backstop = ResponseBackstop()
@@ -133,6 +140,8 @@ class DBSLMEngine:
     ) -> int:
         if progress_callback:
             progress_callback("prepare", 0, 1)
+        if self.context_windows.enabled():
+            self.context_windows.observe_corpus(corpus)
         prepared = self.segment_embedder.prepare_for_training(corpus)
         if progress_callback:
             progress_callback("prepare", 1, 1)
@@ -144,6 +153,8 @@ class DBSLMEngine:
             progress_callback("tokenize", total_tokens, total_tokens)
         self.store.ingest(token_ids, progress_callback=progress_callback)
         self.smoother.rebuild_all(progress_callback=progress_callback)
+        if self.context_windows.enabled():
+            self.context_windows.flush()
         return total_tokens
 
     # ------------------------------------------------------------------ #
@@ -190,12 +201,17 @@ class DBSLMEngine:
 
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
         rolling = list(rolling_context)
+        window_weights = None
+        if self.context_windows.enabled():
+            window_reference = bias_context or history_text
+            window_weights = self.context_windows.weights_for_text(window_reference)
         decoded_ids = self.decoder.decode(
             conversation_id,
             rolling,
             decoder_cfg,
             bias_context,
             rng=rng,
+            dimension_weights=window_weights,
         )
         decoded_text = self.tokenizer.decode(decoded_ids)
         if decoded_text:

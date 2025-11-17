@@ -50,6 +50,15 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   `DBSLMEngine.cheetah_topk_ratio()`, and Level 1 lookups can iterate namespaces with
   `NGramStore.iter_hot_context_hashes()` or trigger probabilistic tree queries via
   `engine.context_relativism(...)`. The old `ColdStorageFlusher`/MariaDB path has been removed.
+- MiniLM-driven context window embeddings live in cheetah metadata as well. The trainer flushes the
+  serialized prototypes to `meta:context_dimension_embeddings`, and `run.py` workers read them back
+  so context-dimension penalties + cosine weights stay consistent even when SQLite is bypassed.
+  Inspect the payload via `PAIR_GET meta:context_dimension_embeddings` whenever you need to audit the
+  learned windows or confirm that a `6,12,24` span absorbed fresh corpora.
+- Future cheetah task: keep a small rolling log (`meta:context_dimension_embeddings:<date>`) or
+  multi-centroid payload so we can store several prototypes per dimension without bloating SQLite.
+  This would let Go-side tools visualize how each dimension drifts and give the decoder multiple
+  reference anchors per window length.
 - `PAIR_SCAN` traversal now fan-outs across the trie using a worker pool sized from
   `ResourceMonitor.RecommendedWorkers(...)`: per-branch tasks stage into a channel, workers hydrate
   pair-table pages concurrently, and results are deduplicated/ordered in a shared accumulator that
