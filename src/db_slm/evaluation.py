@@ -717,7 +717,17 @@ def run_inference_records(
                     "decoder_cfg_override": None,
                 }
             )
+    max_iterations = max(1, total_runs * _MAX_BATCH_ATTEMPTS * 2)
+    iterations = 0
     while pending:
+        iterations += 1
+        if iterations > max_iterations:
+            log(
+                f"[eval] Warning: aborting {label} batch after {iterations - 1} attempts "
+                f"({len(pending)} sample(s) still pending)."
+            )
+            pending.clear()
+            break
         entry = pending.pop(0)
         record = entry["record"]
         idx = entry["index"]

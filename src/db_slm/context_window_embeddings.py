@@ -6,6 +6,7 @@ import math
 import random
 import re
 import shlex
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Sequence
 
@@ -22,6 +23,15 @@ class ContextWindowSnippet:
 
     dimension_index: int
     text: str
+    tag_marker: str | None = None
+
+
+@dataclass
+class TaggedToken:
+    """Tracks the originating prompt-tag for each lexical token."""
+
+    text: str
+    tag: str | None = None
 
 
 @dataclass
@@ -87,7 +97,7 @@ class ContextWindowExtractor:
         for index, dim in enumerate(self.dimensions):
             window = max(2, dim.span)
             stride = max(1, int(round(window * self.stride_ratio)))
-            candidates: list[list[str]] = []
+            candidates: list[list[TaggedToken]] = []
             for start in range(0, len(tokens), stride):
                 chunk = tokens[start : start + window]
                 if len(chunk) < 2:
@@ -103,64 +113,113 @@ class ContextWindowExtractor:
             else:
                 selected = candidates
             for chunk in selected:
-                snippets.append(ContextWindowSnippet(index, " ".join(chunk)))
+                snippet_text, tag_marker = self._build_snippet(index, chunk)
+                snippets.append(ContextWindowSnippet(index, snippet_text, tag_marker))
         return snippets
 
-    def _tokens(self, text: str) -> list[str]:
+    def _build_snippet(
+        self,
+        dimension_index: int,
+        chunk: Sequence[TaggedToken],
+    ) -> tuple[str, str | None]:
+        words = [token.text for token in chunk if token.text]
+        tag_marker = self._dimension_tag_marker(dimension_index, chunk)
+        parts: list[str] = []
+        if tag_marker:
+            parts.append(tag_marker)
+        if words:
+            parts.append(" ".join(words))
+        snippet_text = " ".join(part for part in parts if part).strip()
+        return snippet_text or " ".join(words), tag_marker
+
+    def _dimension_tag_marker(
+        self,
+        dimension_index: int,
+        chunk: Sequence[TaggedToken],
+    ) -> str | None:
+        counts = Counter(token.tag for token in chunk if token.tag)
+        if not counts:
+            return None
+        tag, _ = counts.most_common(1)[0]
+        if not tag:
+            return None
+        canonical = self._normalize_tag_token(tag) or tag.strip()
+        if not canonical:
+            return None
+        return f"|CTX_DIM_{dimension_index}:{canonical}|"
+
+    def _tokens(self, text: str) -> list[TaggedToken]:
         raw_tokens = self._lex(text)
         condensed = self._merge_titles(raw_tokens)
-        expanded: list[str] = []
+        expanded: list[TaggedToken] = []
         for token in condensed:
-            expanded.extend(self._split_compound(token))
-        return [token for token in expanded if token]
+            expanded.extend(self._split_compound_token(token))
+        return [token for token in expanded if token.text]
 
-    def _lex(self, text: str) -> list[str]:
+    def _lex(self, text: str) -> list[TaggedToken]:
         lexer = shlex.shlex(text, posix=True)
         lexer.whitespace_split = True
         lexer.commenters = ""
-        tokens: list[str] = []
-        for piece in lexer:
+        tokens: list[TaggedToken] = []
+        current_tag: str | None = None
+
+        def consume(piece: str) -> None:
+            nonlocal current_tag
             normalized = piece.strip()
             if not normalized:
-                continue
-            if normalized.startswith("|"):
-                # Skip metadata markers such as |SEGMENT|/|CTX|
-                continue
-            if normalized.endswith(":") and ":" not in normalized[:-1]:
-                continue
-            tokens.append(normalized)
+                return
+            tag_token = self._normalize_tag_token(normalized)
+            if tag_token:
+                current_tag = tag_token
+                tokens.append(TaggedToken(tag_token, current_tag))
+                return
+            tokens.append(TaggedToken(normalized, current_tag))
+
+        try:
+            for piece in lexer:
+                consume(piece)
+        except ValueError as exc:
+            log_verbose(
+                2,
+                f"[context-dim] Falling back to whitespace tokenization due to malformed lexeme: {exc}",
+            )
+            for piece in re.findall(r"\S+", text):
+                consume(piece)
         return tokens
 
-    def _split_compound(self, token: str) -> list[str]:
-        lowered = token.strip()
+    def _split_compound_token(self, token: TaggedToken) -> list[TaggedToken]:
+        lowered = token.text.strip()
         if not lowered:
             return []
+        if self._normalize_tag_token(lowered):
+            return [TaggedToken(self._normalize_tag_token(lowered) or lowered, token.tag)]
         for delimiter in ("::", "->", "=>"):
             if delimiter in lowered:
                 parts = [part for part in lowered.split(delimiter) if part]
                 if parts:
-                    return parts
+                    return [TaggedToken(part, token.tag) for part in parts]
         if any(sep in lowered for sep in ("_", "/", "+", "-", "#")):
             parts = re.split(r"[_/\+\-#]+", lowered)
-            return [part for part in parts if part]
+            return [TaggedToken(part, token.tag) for part in parts if part]
         camel = _CAMEL_CASE_PATTERN.split(lowered)
         if len(camel) > 1:
-            return [part for part in camel if part]
-        return [lowered]
+            return [TaggedToken(part, token.tag) for part in camel if part]
+        return [TaggedToken(lowered, token.tag)]
 
-    def _merge_titles(self, tokens: Sequence[str]) -> list[str]:
-        merged: list[str] = []
+    def _merge_titles(self, tokens: Sequence[TaggedToken]) -> list[TaggedToken]:
+        merged: list[TaggedToken] = []
         idx = 0
         while idx < len(tokens):
             token = tokens[idx]
-            if self._is_title_token(token):
+            if self._is_title_token(token.text):
                 chain = [token]
                 offset = idx + 1
-                while offset < len(tokens) and self._is_title_token(tokens[offset]):
+                while offset < len(tokens) and self._is_title_token(tokens[offset].text):
                     chain.append(tokens[offset])
                     offset += 1
                 if len(chain) > 1:
-                    merged.append(" ".join(chain))
+                    joined = " ".join(part.text for part in chain)
+                    merged.append(TaggedToken(joined, chain[0].tag))
                 else:
                     merged.append(token)
                 idx = offset
@@ -183,6 +242,18 @@ class ContextWindowExtractor:
         if not letters:
             return False
         return True
+
+    @staticmethod
+    def _normalize_tag_token(token: str) -> str | None:
+        candidate = token.strip()
+        if not candidate:
+            return None
+        trailing_colon = candidate.endswith(":")
+        if trailing_colon:
+            candidate = candidate[:-1]
+        if len(candidate) < 3 or not candidate.startswith("|") or not candidate.endswith("|"):
+            return None
+        return f"{candidate}:"
 
 
 class ContextWindowEmbeddingManager:
