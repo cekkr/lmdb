@@ -49,12 +49,16 @@ class Decoder:
         *,
         rng: random.Random | None = None,
         dimension_weights: Sequence[float] | None = None,
+        banned_token_ids: Sequence[int] | None = None,
+        commit_cache: bool = True,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
         generated: List[int] = []
         profile = self.cache.decode_profile(config.profile)
-        banned = self._load_bans(config.profile)
+        banned = set(self._load_bans(config.profile))
+        if banned_token_ids:
+            banned.update(int(token_id) for token_id in banned_token_ids)
         dimension_tracker: ContextDimensionTracker | None = None
         if self.context_dimensions:
             dimension_tracker = ContextDimensionTracker(
@@ -91,7 +95,8 @@ class Decoder:
                 dimension_tracker.record(next_token)
             if self.tokenizer.vocab.token_text(next_token) == "<EOS>":
                 break
-        self.cache.update(conversation_id, generated)
+        if commit_cache:
+            self.cache.update(conversation_id, generated)
         return generated
 
     def _adjust_candidates(

@@ -42,8 +42,11 @@ class ContextDimensionPrototype:
     stride: int
     vector: List[float] = field(default_factory=list)
     count: int = 0
+    tag_sum: float = 0.0
+    tag_sq_sum: float = 0.0
+    tag_total: int = 0
 
-    def update(self, new_vector: Sequence[float]) -> None:
+    def update(self, new_vector: Sequence[float], tag_index: int | None = None) -> None:
         if not new_vector:
             return
         if not self.vector:
@@ -59,6 +62,11 @@ class ContextDimensionPrototype:
             prior = self.vector[idx]
             self.vector[idx] = (prior * total + value) / (total + 1.0)
         self.count += 1
+        if tag_index is not None:
+            tag_value = float(tag_index)
+            self.tag_sum += tag_value
+            self.tag_sq_sum += tag_value * tag_value
+            self.tag_total += 1
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -68,7 +76,19 @@ class ContextDimensionPrototype:
             "stride": self.stride,
             "count": self.count,
             "vector": [round(value, 6) for value in self.vector],
+            "tag_sum": round(self.tag_sum, 6),
+            "tag_sq_sum": round(self.tag_sq_sum, 6),
+            "tag_total": self.tag_total,
         }
+
+    def tag_weight(self, tag_index: int | None) -> float:
+        if tag_index is None or self.tag_total <= 0:
+            return 1.0
+        mean = self.tag_sum / float(self.tag_total)
+        variance = max(0.0, (self.tag_sq_sum / float(self.tag_total)) - mean * mean)
+        deviation = abs(tag_index - mean)
+        baseline = 1.0 + deviation / (1.0 + variance)
+        return max(0.75, min(1.5, baseline))
 
 
 _CAMEL_CASE_PATTERN = re.compile(r"(?<!^)(?=[A-Z][a-z])")
@@ -281,6 +301,7 @@ class ContextWindowEmbeddingManager:
         self.max_infer_windows = max(1, max_infer_windows)
         self._prototypes: list[ContextDimensionPrototype] = []
         self._rng = random.Random(0xCEEDA7)
+        self._tag_enumerator: dict[str, int] = {}
         self._dirty = False
         self._load_metadata()
 
@@ -300,7 +321,8 @@ class ContextWindowEmbeddingManager:
         vectors = self.embedder.embed([snippet.text for snippet in snippets])
         for snippet, vector in zip(snippets, vectors):
             proto = self._ensure_prototype(snippet.dimension_index)
-            proto.update(vector)
+            tag_index = self._tag_index_from_marker(snippet.tag_marker)
+            proto.update(vector, tag_index)
             self._dirty = True
         if self._dirty:
             log_verbose(
@@ -321,13 +343,15 @@ class ContextWindowEmbeddingManager:
         if not snippets:
             return [1.0 for _ in self.dimensions]
         vectors = self.embedder.embed([snippet.text for snippet in snippets])
-        similarity_by_dim: dict[int, list[float]] = {}
+        similarity_by_dim: dict[int, list[tuple[float, float]]] = {}
         for snippet, vector in zip(snippets, vectors):
             proto = self._prototype_for(snippet.dimension_index)
             if proto is None or not proto.vector or not vector:
                 continue
             similarity = self._cosine_similarity(proto.vector, vector)
-            similarity_by_dim.setdefault(snippet.dimension_index, []).append(similarity)
+            tag_index = self._tag_index_from_marker(snippet.tag_marker)
+            tag_weight = proto.tag_weight(tag_index)
+            similarity_by_dim.setdefault(snippet.dimension_index, []).append((similarity, tag_weight))
         weights: list[float] = []
         for idx, _dim in enumerate(self.dimensions):
             proto = self._prototype_for(idx)
@@ -338,8 +362,10 @@ class ContextWindowEmbeddingManager:
             if not candidates:
                 weights.append(1.0)
                 continue
-            best = max(candidates)
-            weights.append(self._weight_from_similarity(best, proto))
+            best_similarity, tag_weight = max(candidates, key=lambda item: item[0])
+            base_weight = self._weight_from_similarity(best_similarity, proto)
+            combined = base_weight * tag_weight
+            weights.append(max(0.25, min(2.0, combined)))
         return weights
 
     def flush(self) -> None:
@@ -369,6 +395,15 @@ class ContextWindowEmbeddingManager:
         if not descriptors:
             return None
         return "; ".join(descriptors)
+
+    def set_tag_enumerator(self, enumerator: dict[str, int]) -> None:
+        cleaned: dict[str, int] = {}
+        for key, value in enumerator.items():
+            canonical = key.strip()
+            if not canonical:
+                continue
+            cleaned[canonical] = int(value)
+        self._tag_enumerator = cleaned
 
     def _ensure_prototype(self, index: int) -> ContextDimensionPrototype:
         while len(self._prototypes) <= index:
@@ -407,6 +442,17 @@ class ContextWindowEmbeddingManager:
             return 0.0
         return dot / math.sqrt(norm_base * norm_other)
 
+    def _tag_index_from_marker(self, marker: str | None) -> int | None:
+        if not marker or not self._tag_enumerator:
+            return None
+        _, _, suffix = marker.partition(":")
+        if not suffix:
+            return None
+        canonical = suffix.strip()
+        if canonical.endswith("|"):
+            canonical = canonical[:-1]
+        return self._tag_enumerator.get(canonical)
+
     def _load_metadata(self) -> None:
         reader = getattr(self.hot_path, "read_metadata", None)
         raw_value = None
@@ -434,10 +480,21 @@ class ContextWindowEmbeddingManager:
                 stride = int(dim_data.get("stride", max(1, (end - start + 1) // 2)))
                 count = int(dim_data.get("count", 0))
                 vector = [float(value) for value in dim_data.get("vector", [])]
+                tag_sum = float(dim_data.get("tag_sum", 0.0))
+                tag_sq_sum = float(dim_data.get("tag_sq_sum", 0.0))
+                tag_total = int(dim_data.get("tag_total", 0))
             except (KeyError, ValueError, TypeError):
                 continue
             dimension = ContextDimension(start, end)
-            proto = ContextDimensionPrototype(dimension, stride, list(vector), max(0, count))
+            proto = ContextDimensionPrototype(
+                dimension,
+                stride,
+                list(vector),
+                max(0, count),
+                tag_sum=max(0.0, tag_sum),
+                tag_sq_sum=max(0.0, tag_sq_sum),
+                tag_total=max(0, tag_total),
+            )
             prototypes.append(proto)
         if prototypes:
             ordered: list[ContextDimensionPrototype] = []

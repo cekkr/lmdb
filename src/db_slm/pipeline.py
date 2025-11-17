@@ -41,6 +41,17 @@ class ContextRelativismResult:
     ranked: Tuple[TokenCandidate, ...]
 
 
+_DEFAULT_PROMPT_TAG_TOKENS: Tuple[str, ...] = (
+    "|INSTRUCTION|:",
+    "|USER|:",
+    "|RESPONSE|:",
+    "|CONTEXT|:",
+    "|TAGS|:",
+    "|CORRECTION|:",
+)
+_PROMPT_TAG_SCAN_WINDOW = 160
+
+
 class DBSLMEngine:
     """Facilitates training + inference using the three-level DB-SLM stack."""
 
@@ -96,12 +107,87 @@ class DBSLMEngine:
         self._low_resource_helper = LowResourceHelper(self)
         self._response_backstop = ResponseBackstop()
         self._tag_formatter = TaggedResponseFormatter()
+        self._prompt_tag_tokens: list[str] = []
+        self._prompt_tag_token_ids: set[int] = set()
+        self._prompt_tag_aliases: set[str] = set()
+        self._prompt_tag_enumerator: dict[str, int] = {}
+        self._prompt_tag_retry_attempts = 3
+        self.register_prompt_tags(_DEFAULT_PROMPT_TAG_TOKENS)
 
     def register_prompt_tags(self, tag_tokens: Sequence[str]) -> None:
         """Allow callers to seed tokenizer/vocabulary with structured prompt tags."""
         if not tag_tokens:
             return
-        self.tokenizer.register_special_tokens(tag_tokens)
+        new_tokens: list[str] = []
+        for token in tag_tokens:
+            normalized = (token or "").strip()
+            if not normalized or normalized in self._prompt_tag_tokens:
+                continue
+            self._prompt_tag_tokens.append(normalized)
+            new_tokens.append(normalized)
+        if not new_tokens and self._prompt_tag_tokens:
+            return
+        if new_tokens:
+            self.tokenizer.register_special_tokens(new_tokens)
+        self._prompt_tag_token_ids = {self.vocab.token_id(token) for token in self._prompt_tag_tokens}
+        self._prompt_tag_aliases = self._derive_prompt_tag_aliases(self._prompt_tag_tokens)
+        enumerator = self._build_prompt_tag_enumerator(self._prompt_tag_tokens)
+        self._prompt_tag_enumerator = enumerator
+        self.context_windows.set_tag_enumerator(enumerator)
+
+    @staticmethod
+    def _canonical_prompt_label(token: str) -> str | None:
+        normalized = (token or "").strip()
+        if not normalized:
+            return None
+        if normalized.endswith(":"):
+            normalized = normalized[:-1]
+        if normalized.startswith("|") and normalized.endswith("|") and len(normalized) > 2:
+            return normalized
+        return None
+
+    def _build_prompt_tag_enumerator(self, tokens: Sequence[str]) -> dict[str, int]:
+        enumerator: dict[str, int] = {}
+        for idx, token in enumerate(tokens):
+            canonical = self._canonical_prompt_label(token)
+            if not canonical or canonical in enumerator:
+                continue
+            enumerator[canonical] = idx
+        return enumerator
+
+    def _derive_prompt_tag_aliases(self, tokens: Sequence[str]) -> set[str]:
+        aliases: set[str] = set()
+        for token in tokens:
+            alias_group = self._prompt_tag_aliases_for_token(token)
+            aliases.update(alias_group)
+        return aliases
+
+    def _prompt_tag_aliases_for_token(self, token: str) -> set[str]:
+        normalized = (token or "").strip()
+        if not normalized:
+            return set()
+        lowered = normalized.lower()
+        variants = {lowered}
+        if lowered.endswith(":"):
+            variants.add(lowered[:-1])
+        canonical = self._canonical_prompt_label(normalized)
+        if canonical:
+            canonical_lower = canonical.lower()
+            variants.add(canonical_lower)
+            variants.add(f"{canonical_lower}:")
+            bare = canonical_lower.strip("|")
+            if bare:
+                variants.add(f"{bare}:")
+        return {variant for variant in variants if variant}
+
+    def _contains_prompt_artifacts(self, response: str) -> bool:
+        if not response or not self._prompt_tag_aliases:
+            return False
+        normalized = response.strip().lower()
+        if not normalized:
+            return False
+        scan_window = normalized[:_PROMPT_TAG_SCAN_WINDOW]
+        return any(alias in scan_window for alias in self._prompt_tag_aliases)
 
     def _init_context_dimensions(
         self, requested: Sequence[ContextDimension] | None
@@ -199,24 +285,44 @@ class DBSLMEngine:
                 self.cache.update(conversation_id, concept_ids)
             bias_context = f"{history_text}\n{concept_exec.text}".strip()
 
+        prefix_segments = tuple(segment.strip() for segment in segments if segment.strip())
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
-        rolling = list(rolling_context)
+        base_context = list(rolling_context)
         window_weights = None
         if self.context_windows.enabled():
             window_reference = bias_context or history_text
             window_weights = self.context_windows.weights_for_text(window_reference)
-        decoded_ids = self.decoder.decode(
-            conversation_id,
-            rolling,
-            decoder_cfg,
-            bias_context,
-            rng=rng,
-            dimension_weights=window_weights,
-        )
-        decoded_text = self.tokenizer.decode(decoded_ids)
-        if decoded_text:
-            segments.append(decoded_text)
-        response = " ".join(segment.strip() for segment in segments if segment.strip()).strip()
+
+        attempt_count = max(1, self._prompt_tag_retry_attempts)
+        final_ids: List[int] = []
+        response = ""
+        decoded_text = ""
+        for attempt in range(attempt_count):
+            context_seed = list(base_context)
+            attempt_rng = random.Random(rng.random())
+            decoded_ids = self.decoder.decode(
+                conversation_id,
+                context_seed,
+                decoder_cfg,
+                bias_context,
+                rng=attempt_rng,
+                dimension_weights=window_weights,
+                banned_token_ids=self._prompt_tag_token_ids,
+                commit_cache=False,
+            )
+            decoded_text = self.tokenizer.decode(decoded_ids)
+            attempt_segments = [segment for segment in prefix_segments if segment]
+            if decoded_text:
+                attempt_segments.append(decoded_text)
+            response_candidate = " ".join(segment.strip() for segment in attempt_segments if segment.strip()).strip()
+            final_ids = decoded_ids
+            response = response_candidate
+            if not self._contains_prompt_artifacts(response_candidate):
+                break
+        if final_ids:
+            self.cache.update(conversation_id, final_ids)
+        else:
+            self.cache.update(conversation_id, [])
         response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
         if scaffold_response:
             response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)

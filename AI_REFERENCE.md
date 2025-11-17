@@ -25,6 +25,12 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
 - Pair trie tables now ride on a managed I/O layer that caches 4 KiB sectors in RAM, queues dirty sectors through a background flusher, and only touches disk when necessary. Concurrent writers therefore hit in-memory buffers while the queue drains in the background, which both respects the descriptor cap and slashes SSD churn during heavy ingest.
 - The managed file cache now listens to `ResourceMonitor` memory pressure and aggressively flushes/evicts idle sectors. Dirty pages are forced to disk (default 30s after last access, hard cap 5 minutes), freed immediately after the write completes, and low-usage sectors are culled whenever RAM pressure crosses ~90% (tunable via `CHEETAH_CACHE_*`). Set `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`, `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH/LOW`, or the read/write weight knobs to bias which sectors survive.
 
+## Prompt Tag Guardrails (High Priority)
+
+- `DBSLMEngine.register_prompt_tags()` (`src/db_slm/pipeline.py`) now seeds the built-in structural tokens (`|INSTRUCTION|:`, `|USER|:`, `|RESPONSE|:`, `|CONTEXT|:`, etc.), appends every dataset-specific tag in discovery order, and forwards that enumeration to both the tokenizer and `ContextWindowEmbeddingManager`. Always call `collect_prompt_tag_tokens()` before ingest/eval so the global enumerator stays authoritative.
+- Decoder sampling (`src/db_slm/pipeline.py` + `src/db_slm/decoder.py`) hard-bans those tokens and scans the first ~160 characters of every candidate for alias strings such as `user:` or `|instruction|:`. If any scaffold tag appears, the engine discards the text and re-runs decoding with a new RNG up to three times, mirroring how `|END|` retries work for too-short outputs.
+- Context windows (`src/db_slm/context_window_embeddings.py`) now store the running mean/variance of each tag enumerator per dimension. These tag-aware weights flow into `ContextDimensionTracker`, so predicting a tag that belongs to a different prompt segment immediately increases the presence/frequency penalty even before the string-level guard activates.
+
 ## Codebase State
 
 - `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
