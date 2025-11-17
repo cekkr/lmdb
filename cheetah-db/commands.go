@@ -198,7 +198,7 @@ func (db *Database) Delete(key uint64) (string, error) {
 		return "ERROR,key_delete_failed", err
 	}
 
-	// Se abbiamo eliminato la chiave pi+¶ alta, trova la nuova
+	// Se abbiamo eliminato la chiave pi√π alta, trova la nuova
 	if key == db.highestKey.Load() {
 		db.findNewHighestKey(key)
 	}
