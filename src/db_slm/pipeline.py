@@ -274,18 +274,18 @@ class DBSLMEngine:
         if not history_ids:
             history_ids = [self.vocab.token_id("<BOS>")]
 
-        segments: List[str] = []
         concept_exec = self._run_concept_layer(conversation_id, history_ids)
         bias_context = history_text
         if concept_exec:
-            segments.append(concept_exec.text)
-            concept_ids = self.tokenizer.encode(concept_exec.text, add_special_tokens=False)
-            history_ids.extend(concept_ids)
-            if concept_ids:
-                self.cache.update(conversation_id, concept_ids)
-            bias_context = f"{history_text}\n{concept_exec.text}".strip()
+            concept_text = concept_exec.text.strip()
+            if concept_text:
+                concept_ids = self.tokenizer.encode(concept_text, add_special_tokens=False)
+                history_ids.extend(concept_ids)
+                if concept_ids:
+                    self.cache.update(conversation_id, concept_ids)
+                bias_context = f"{history_text}\n{concept_text}".strip()
 
-        prefix_segments = tuple(segment.strip() for segment in segments if segment.strip())
+        prefix_segments: tuple[str, ...] = tuple()
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
         base_context = list(rolling_context)
         window_weights = None

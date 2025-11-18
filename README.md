@@ -423,6 +423,10 @@ Key arguments:
 - `--max-turns`: Auto-exit after the specified number of user prompts. Useful when scripting deterministic walkthroughs.
 - REPL commands: `:history` prints the Level 2 context window, `:exit`/`:quit` (or `Ctrl+D`) leaves the session immediately.
 
+Level 3 context summaries (`ContextSummary` signals) still influence decoding, but their `|CONTEXT|:` scaffolding
+never surfaces in responses. The engine injects those payloads solely into the rolling bias text and context-dimension
+weights so datasets remain in full control of which structural tags appear in prompts or completions.
+
 Because the CLI uses the exact same engine object, anything logged via `run.py` is immediately
 available to downstream tooling (correction logging, concept payload providers, etc.).
 
