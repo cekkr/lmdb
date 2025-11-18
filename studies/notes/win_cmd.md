@@ -3,7 +3,7 @@ emotion_data.json
 GPTeacher.json
 
 Windows:
-python3.11 src/train.py datasets/GPTeacher.json --ngram-order 5 --reset --json-chunk-size 250 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 20.0 --eval-interval 40000 --profile-ingest --decoder-presence-penalty 0.5 --decoder-frequency-penalty 0.25 --context-dimensions 4,8,12,16
+python3.11 src/train.py datasets/GPTeacher.json --ngram-order 6 --reset --json-chunk-size 500 --eval-samples 3 --eval-variants 4 --chunk-eval-percent 20.0 --eval-interval 40000 --profile-ingest --decoder-presence-penalty 0.5 --decoder-frequency-penalty 0.25 --context-dimensions 8,12,16,24
 
 Ubuntu:
 DEVICE=cuda python3.13 src/train.py datasets/emotion_data.json --ngram-order 4 --recursive --reset --json-chunk-size 100 --eval-samples 2 --eval-pool-size 500 --chunk-eval-percent 10.0 --eval-interval 100 --profile-ingest --decoder-presence-penalty 0.5 --decoder-frequency-penalty 0.25 --context-dimensions 6,12,24
