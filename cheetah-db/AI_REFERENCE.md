@@ -72,14 +72,18 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   reopening readers. Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from
   `cheetah-db/` to reproduce the latest snapshots:
 
-- **High-priority reference — cluster-ready fork scheduling.** Treat every trie fork (child pointer
-  or jump node) as a schedulable shard with its own WAL/checkpoint metadata so branches can be
-  placed on different hosts. A coordinator hashes the requested prefix to a `fork_id`, looks up the
-  owning node in `meta:cluster_topology`, and streams `PAIR_SCAN`/`PAIR_REDUCE` calls directly to
-  that worker. Workers gossip fan-out stats + byte density so the planner can reassign forks when a
-  branch outgrows its current node. Mirrors of the fork metadata live alongside the trie so
-  distributed ingest and prediction reads can target the right shard without replaying the whole
-  namespace on every machine.
+- **Cluster-ready fork scheduling is wired in.** Every trie fork (child pointer or jump node) is
+  hashed into a deterministic `fork_id` mirrored under `cluster_topology.json`. Use the new commands
+  to steer the distributed planner:
+  - `CLUSTER_UPDATE` accepts inline specs (`replication=2 nodeA=10.0.0.1:4455/4 ...`) or
+    `json=<base64>` payloads to register nodes, capacities, and replication factors.
+  - `CLUSTER_STATUS` dumps the active topology + fork counters so you can verify placement before
+    migrating shards.
+  - `FORK_ASSIGN <prefix|*>` reveals which nodes own the shard for any prefix. `PAIR_SCAN`,
+    `PAIR_SUMMARY`, and downstream reducers automatically observe forks so scheduler stats track
+    live workloads and highlight hotspots pre-migration.
+  Because the metadata persists next to the trie, resyncing a node only requires replaying WAL
+  segments for the forks it owns rather than rehydrating the entire namespace.
 
 ## Matrix-related tree predictions
 
@@ -121,6 +125,26 @@ matrix.
   so contexts with different strides remain comparable, then bias/normalize during the merge cycle.
 - Distributed execution: align prediction tables with the cluster-ready fork scheduler so matrix
   queries run on the shard that hosts the bytes, avoiding expensive cross-node replays.
+
+#### CLI workflow & acceleration toggles
+
+- `PREDICT_SET key=<value> value=<result> prob=<0-1> [weights=<base64 json>]` persists a prediction
+  row. Byte inputs accept plaintext or `x...` hex. Context weights follow the `ContextWeight` schema
+  (encode JSON -> base64) so sparse depth vectors stay compact.
+- `PREDICT_QUERY key=<value> [ctx=<base64 json>] [windows=<base64 json>]` evaluates a key with the
+  provided context matrix and optional probability windows. Responses return ordered pairs as
+  `<value_hex>:<prob>` plus the backend name.
+- `PREDICT_TRAIN key=<value> target=<result> [ctx=...] [lr=0.01]` runs the recursive update loop so
+  contexts fine-tune weights without rewriting payloads.
+- `PREDICT_BACKEND [cpu|gpu]` toggles between the CPU path and the simulated WebGPU merger
+  (`CHEETAH_PREDICT_MERGER=gpu` sets the default). Acceleration fans out merges across CPU cores to
+  mirror WebGPU behaviour until native bindings are available.
+- `PREDICT_BENCH samples=<n> window=<len>` benchmarks CPU vs accelerated merges to decide when to
+  enable GPU-style execution on a host.
+
+Context matrices + window specs are passed as base64-encoded JSON arrays so CLI whitespace stays
+stable. The probability merger truncates vectors to the shared byte-span before aggregating and
+automatically normalizes outputs.
 
 ### Indexing Defaults & Jump Nodes
 
@@ -283,9 +307,9 @@ matrix.
 
 ## Next Steps
 
-- Wire the cluster-ready fork scheduler into the live `cheetah-server` runtime so shards can be
-  assigned/moved dynamically instead of remaining documentation-only.
-- Prototype the GPU/WebGPU accelerated probability-merging path for the matrix-related prediction
-  tables, including CPU fallback benchmarks.
-- Expose dedicated training/maintenance commands for matrix-aware prediction tables so contexts,
-  weights, and pruning thresholds can be tuned without manual edits.
+- Add shard-health gossip + RPC fan-out so the fork scheduler can place/move shards across multiple
+  cheetah-server instances instead of remaining a single-node planner.
+- Replace the simulated WebGPU merger with a real GPU/WebGPU compute backend (Vulkan/WGSL) and store
+  per-host benchmarks so the server can auto-select the right accelerator.
+- Hook prediction-table training into ingest so context matrices stay fresh without requiring manual
+  `PREDICT_TRAIN` batches.

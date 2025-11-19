@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -41,6 +42,8 @@ type Database struct {
 	jumpDir         string
 	nextJumpIDPath  string
 	nextJumpID      atomic.Uint32
+	forkScheduler   *ForkScheduler
+	predictTable    *PredictionTable
 }
 
 func resolvePairTableLimit(configured int) int {
@@ -264,7 +267,14 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		branchCodec:    codec,
 		jumpDir:        jumpDir,
 		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
+		forkScheduler:  newForkScheduler(path),
 	}
+	predictTable, err := newPredictionTable(path)
+	if err != nil {
+		mkt.Close()
+		return nil, err
+	}
+	db.predictTable = predictTable
 
 	// Carica il contatore degli ID delle tabelle pair
 	if err := db.loadNextPairTableID(); err != nil {
@@ -309,6 +319,9 @@ func (db *Database) Close() error {
 	})
 	if db.fileManager != nil {
 		db.fileManager.Close()
+	}
+	if db.predictTable != nil {
+		db.predictTable.Close()
 	}
 	return firstErr
 }
@@ -1330,6 +1343,22 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response = formatPairSummaryResponse(summary)
+	case command == "CLUSTER_UPDATE":
+		response, err = db.handleClusterUpdate(args)
+	case command == "CLUSTER_STATUS":
+		response = db.clusterStatusResponse()
+	case command == "FORK_ASSIGN":
+		response, err = db.handleForkAssign(args)
+	case command == "PREDICT_SET":
+		response, err = db.handlePredictSet(args)
+	case command == "PREDICT_QUERY":
+		response, err = db.handlePredictQuery(args)
+	case command == "PREDICT_TRAIN":
+		response, err = db.handlePredictTrain(args)
+	case command == "PREDICT_BACKEND":
+		response = db.handlePredictBackend(args)
+	case command == "PREDICT_BENCH":
+		response = db.handlePredictBench(args)
 	case command == "SYSTEM_STATS":
 		response = db.systemStatsResponse()
 	case command == "LOG_FLUSH":
@@ -1385,6 +1414,7 @@ func (db *Database) deletePairTable(tableID uint32) error {
 
 func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairScanResult, []byte, error) {
 	limit = normalizePairScanLimit(limit)
+	db.observeFork(prefix)
 	acc := newPairScanAccumulator(limit, cursor)
 	startTable := uint32(0)
 	expandedPrefix := append([]byte{}, prefix...)
@@ -1424,6 +1454,7 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 }
 
 func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) (*PairSummaryResult, error) {
+	db.observeFork(prefix)
 	if depthLimit < 0 {
 		depthLimit = -1
 	}
@@ -2138,6 +2169,289 @@ func parseFileCheckpointArgs(raw string) (FileCheckpointOptions, error) {
 		}
 	}
 	return opts, nil
+}
+
+func (db *Database) handleClusterUpdate(args string) (string, error) {
+	if db.forkScheduler == nil {
+		return "ERROR,fork_scheduler_unavailable", nil
+	}
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" {
+		return "ERROR,cluster_update_requires_payload", nil
+	}
+	var topo ClusterTopology
+	if strings.HasPrefix(trimmed, "json=") {
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "json="))
+		data, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return fmt.Sprintf("ERROR,invalid_topology_payload:%v", err), nil
+		}
+		if err := json.Unmarshal(data, &topo); err != nil {
+			return fmt.Sprintf("ERROR,invalid_topology_payload:%v", err), nil
+		}
+	} else {
+		parsed, err := parseInlineTopology(trimmed)
+		if err != nil {
+			return fmt.Sprintf("ERROR,%v", err), nil
+		}
+		topo = parsed
+	}
+	if len(topo.Nodes) == 0 {
+		return "ERROR,cluster_update_requires_nodes", nil
+	}
+	if err := db.forkScheduler.UpdateTopology(topo); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,cluster_nodes=%d,replication=%d", len(topo.Nodes), topo.ReplicationFactor), nil
+}
+
+func (db *Database) clusterStatusResponse() string {
+	if db.forkScheduler == nil {
+		return "ERROR,fork_scheduler_unavailable"
+	}
+	topo, stats := db.forkScheduler.Snapshot()
+	nodeSummaries := make([]string, 0, len(topo.Nodes))
+	for _, node := range topo.Nodes {
+		nodeSummaries = append(nodeSummaries, fmt.Sprintf("%s@%s(cap=%d)", node.ID, node.Address, node.Capacity))
+	}
+	return fmt.Sprintf(
+		"SUCCESS,cluster_nodes=%d,replication=%d,updated=%s,nodes=%s,assignments=%d",
+		len(topo.Nodes),
+		topo.ReplicationFactor,
+		topo.UpdatedAt.Format(time.RFC3339),
+		strings.Join(nodeSummaries, "|"),
+		len(stats),
+	)
+}
+
+func (db *Database) handleForkAssign(args string) (string, error) {
+	if db.forkScheduler == nil {
+		return "ERROR,fork_scheduler_unavailable", nil
+	}
+	prefix := strings.TrimSpace(args)
+	var bytesPrefix []byte
+	if prefix != "" && prefix != "*" {
+		value, err := parseValue(prefix)
+		if err != nil {
+			return err.Error(), nil
+		}
+		bytesPrefix = value
+	}
+	assign := db.forkScheduler.AssignFork(bytesPrefix)
+	if len(assign.NodeIDs) == 0 {
+		return "ERROR,no_cluster_nodes", nil
+	}
+	return fmt.Sprintf("SUCCESS,fork_id=%s,nodes=%s", assign.ForkID, strings.Join(assign.NodeIDs, "|")), nil
+}
+
+func (db *Database) handlePredictSet(args string) (string, error) {
+	if db.predictTable == nil {
+		return "ERROR,prediction_table_unavailable", nil
+	}
+	params := parseKeyValueArgs(args)
+	rawKey := params["key"]
+	rawValue := params["value"]
+	if rawKey == "" || rawValue == "" {
+		return "ERROR,predict_set_requires_key_and_value", nil
+	}
+	keyBytes, err := parseValue(rawKey)
+	if err != nil {
+		return err.Error(), nil
+	}
+	valueBytes, err := parseValue(rawValue)
+	if err != nil {
+		return err.Error(), nil
+	}
+	probability := 0.5
+	if rawProb := params["prob"]; rawProb != "" {
+		if parsed, parseErr := strconv.ParseFloat(rawProb, 64); parseErr == nil {
+			probability = parsed
+		}
+	}
+	var weights []ContextWeight
+	if rawWeights := params["weights"]; rawWeights != "" {
+		data, decodeErr := base64.StdEncoding.DecodeString(rawWeights)
+		if decodeErr != nil {
+			return fmt.Sprintf("ERROR,invalid_weights_payload:%v", decodeErr), nil
+		}
+		if err := json.Unmarshal(data, &weights); err != nil {
+			return fmt.Sprintf("ERROR,invalid_weights_payload:%v", err), nil
+		}
+	}
+	entry, err := db.predictTable.SetPrediction(keyBytes, valueBytes, probability, weights)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,prediction_values=%d", len(entry.Values)), nil
+}
+
+func (db *Database) handlePredictQuery(args string) (string, error) {
+	if db.predictTable == nil {
+		return "ERROR,prediction_table_unavailable", nil
+	}
+	params := parseKeyValueArgs(args)
+	rawKey := params["key"]
+	if rawKey == "" {
+		return "ERROR,predict_query_requires_key", nil
+	}
+	keyBytes, err := parseValue(rawKey)
+	if err != nil {
+		return err.Error(), nil
+	}
+	ctx, err := parseContextMatrixArg(params["ctx"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_ctx:%v", err), nil
+	}
+	windows, err := parseWindowMatrixArg(params["windows"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_windows:%v", err), nil
+	}
+	results, err := db.predictTable.Evaluate(keyBytes, ctx, windows)
+	if err != nil {
+		return err.Error(), nil
+	}
+	var entries []string
+	for _, res := range results {
+		entries = append(entries, fmt.Sprintf("%x:%.4f", res.Value, res.Probability))
+	}
+	return fmt.Sprintf("SUCCESS,count=%d,backend=%s,items=%s", len(results), db.predictTable.CurrentMerger(), strings.Join(entries, ";")), nil
+}
+
+func (db *Database) handlePredictTrain(args string) (string, error) {
+	if db.predictTable == nil {
+		return "ERROR,prediction_table_unavailable", nil
+	}
+	params := parseKeyValueArgs(args)
+	rawKey := params["key"]
+	rawTarget := params["target"]
+	if rawKey == "" || rawTarget == "" {
+		return "ERROR,predict_train_requires_key_and_target", nil
+	}
+	keyBytes, err := parseValue(rawKey)
+	if err != nil {
+		return err.Error(), nil
+	}
+	targetBytes, err := parseValue(rawTarget)
+	if err != nil {
+		return err.Error(), nil
+	}
+	ctx, err := parseContextMatrixArg(params["ctx"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_ctx:%v", err), nil
+	}
+	learningRate := 0.01
+	if rawLR := params["lr"]; rawLR != "" {
+		if parsed, parseErr := strconv.ParseFloat(rawLR, 64); parseErr == nil {
+			learningRate = parsed
+		}
+	}
+	entry, err := db.predictTable.Train(keyBytes, targetBytes, ctx, learningRate)
+	if err != nil {
+		return err.Error(), nil
+	}
+	return fmt.Sprintf("SUCCESS,prediction_values=%d,lr=%.4f", len(entry.Values), learningRate), nil
+}
+
+func (db *Database) handlePredictBackend(args string) string {
+	if db.predictTable == nil {
+		return "ERROR,prediction_table_unavailable"
+	}
+	mode := strings.TrimSpace(args)
+	if mode == "" {
+		return fmt.Sprintf("SUCCESS,backend=%s", db.predictTable.CurrentMerger())
+	}
+	selected := db.predictTable.SetMergerMode(mode)
+	return fmt.Sprintf("SUCCESS,backend=%s", selected)
+}
+
+func (db *Database) handlePredictBench(args string) string {
+	if db.predictTable == nil {
+		return "ERROR,prediction_table_unavailable"
+	}
+	params := parseKeyValueArgs(args)
+	samples := 0
+	if raw := params["samples"]; raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			samples = v
+		}
+	}
+	if samples == 0 {
+		samples = 32
+	}
+	vectorLen := 0
+	if raw := params["window"]; raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			vectorLen = v
+		}
+	}
+	results := db.predictTable.Benchmark(samples, vectorLen)
+	entries := make([]string, 0, len(results))
+	for backend, duration := range results {
+		entries = append(entries, fmt.Sprintf("%s=%s", backend, duration))
+	}
+	return fmt.Sprintf("SUCCESS,samples=%d,window=%d,bench=%s", samples, vectorLen, strings.Join(entries, "|"))
+}
+
+func parseInlineTopology(raw string) (ClusterTopology, error) {
+	topo := ClusterTopology{}
+	fields := strings.Fields(raw)
+	for _, field := range fields {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if key == "" || val == "" {
+			continue
+		}
+		if strings.EqualFold(key, "replication") || strings.EqualFold(key, "rf") {
+			if parsed, err := strconv.Atoi(val); err == nil {
+				topo.ReplicationFactor = parsed
+			}
+			continue
+		}
+		capacity := 1
+		if slash := strings.LastIndex(val, "/"); slash > strings.LastIndex(val, ":") {
+			if parsed, err := strconv.Atoi(val[slash+1:]); err == nil && parsed > 0 {
+				capacity = parsed
+				val = val[:slash]
+			}
+		}
+		topo.Nodes = append(topo.Nodes, ClusterNode{
+			ID:       key,
+			Address:  val,
+			Capacity: capacity,
+		})
+	}
+	if topo.ReplicationFactor <= 0 {
+		topo.ReplicationFactor = 1
+	}
+	if len(topo.Nodes) == 0 {
+		return topo, fmt.Errorf("no_nodes_provided")
+	}
+	return topo, nil
+}
+
+func parseKeyValueArgs(raw string) map[string]string {
+	fields := strings.Fields(raw)
+	result := make(map[string]string, len(fields))
+	for _, field := range fields {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		result[key] = strings.TrimSpace(val)
+	}
+	return result
+}
+
+func (db *Database) observeFork(prefix []byte) {
+	if db.forkScheduler == nil {
+		return
+	}
+	db.forkScheduler.AssignFork(prefix)
 }
 
 func summarizeArg(arg string) string {
