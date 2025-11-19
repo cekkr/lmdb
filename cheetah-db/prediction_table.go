@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +21,11 @@ import (
 var errPredictionEntryNotFound = errors.New("prediction_entry_not_found")
 
 type ContextMatrix [][]float64
+
+const (
+	predictionFileMagic   = "CHPREDTB"
+	predictionFileVersion = uint16(1)
+)
 
 // PredictionValue stores the base probability and context weights for a result.
 type PredictionValue struct {
@@ -50,14 +60,16 @@ type PredictionTable struct {
 	mu        sync.RWMutex
 	entries   map[string]*PredictionEntry
 	path      string
+	legacy    string
 	tableName string
 	merger    ProbabilityMerger
 	closed    bool
 }
 
-func newPredictionTable(path string, tableName string) (*PredictionTable, error) {
+func newPredictionTable(path string, legacyPath string, tableName string) (*PredictionTable, error) {
 	p := &PredictionTable{
 		path:      path,
+		legacy:    legacyPath,
 		tableName: tableName,
 		entries:   make(map[string]*PredictionEntry),
 		merger:    selectProbabilityMerger(""),
@@ -71,39 +83,269 @@ func newPredictionTable(path string, tableName string) (*PredictionTable, error)
 func (p *PredictionTable) load() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	data, err := os.ReadFile(p.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	if err := p.loadBinaryLocked(); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
+		if p.legacy != "" {
+			if err := p.loadLegacyJSONLocked(); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if len(p.entries) > 0 {
+				if err := p.persistLocked(); err != nil {
+					return err
+				}
+				_ = os.Remove(p.legacy)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *PredictionTable) loadBinaryLocked() error {
+	file, err := os.Open(p.path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		p.entries = make(map[string]*PredictionEntry)
+		return nil
+	}
+	magic := make([]byte, len(predictionFileMagic))
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return err
+	}
+	if string(magic) != predictionFileMagic {
+		return fmt.Errorf("invalid_prediction_table_magic")
+	}
+	var version uint16
+	if err := binary.Read(file, binary.LittleEndian, &version); err != nil {
+		return err
+	}
+	if version != predictionFileVersion {
+		return fmt.Errorf("unsupported_prediction_table_version:%d", version)
+	}
+	var entryCount uint32
+	if err := binary.Read(file, binary.LittleEndian, &entryCount); err != nil {
+		return err
+	}
+	entries := make(map[string]*PredictionEntry, int(entryCount))
+	for i := uint32(0); i < entryCount; i++ {
+		key, err := readPredictionString(file)
+		if err != nil {
+			return err
+		}
+		var updatedAtNano int64
+		if err := binary.Read(file, binary.LittleEndian, &updatedAtNano); err != nil {
+			return err
+		}
+		entry := &PredictionEntry{Key: key}
+		if updatedAtNano > 0 {
+			entry.UpdatedAt = time.Unix(0, updatedAtNano).UTC()
+		}
+		var valueCount uint32
+		if err := binary.Read(file, binary.LittleEndian, &valueCount); err != nil {
+			return err
+		}
+		if valueCount > 0 {
+			entry.Values = make([]PredictionValue, 0, int(valueCount))
+		}
+		for j := uint32(0); j < valueCount; j++ {
+			valStr, err := readPredictionString(file)
+			if err != nil {
+				return err
+			}
+			var baseProb float64
+			if err := binary.Read(file, binary.LittleEndian, &baseProb); err != nil {
+				return err
+			}
+			var lastUpdated int64
+			if err := binary.Read(file, binary.LittleEndian, &lastUpdated); err != nil {
+				return err
+			}
+			var weightCount uint32
+			if err := binary.Read(file, binary.LittleEndian, &weightCount); err != nil {
+				return err
+			}
+			weights := make([]ContextWeight, 0, int(weightCount))
+			for k := uint32(0); k < weightCount; k++ {
+				var depth int32
+				if err := binary.Read(file, binary.LittleEndian, &depth); err != nil {
+					return err
+				}
+				var bias float64
+				if err := binary.Read(file, binary.LittleEndian, &bias); err != nil {
+					return err
+				}
+				vector, err := readFloat64Slice(file)
+				if err != nil {
+					return err
+				}
+				weights = append(weights, ContextWeight{
+					Depth:  int(depth),
+					Bias:   bias,
+					Vector: vector,
+				})
+			}
+			entry.Values = append(entry.Values, PredictionValue{
+				Value:            valStr,
+				BaseProbability:  baseProb,
+				ContextWeights:   weights,
+				LastUpdatedEpoch: lastUpdated,
+			})
+		}
+		var windowCount uint32
+		if err := binary.Read(file, binary.LittleEndian, &windowCount); err != nil {
+			return err
+		}
+		if windowCount > 0 {
+			entry.WindowHints = make([][]float64, 0, int(windowCount))
+		}
+		for k := uint32(0); k < windowCount; k++ {
+			row, err := readFloat64Slice(file)
+			if err != nil {
+				return err
+			}
+			entry.WindowHints = append(entry.WindowHints, row)
+		}
+		entries[entry.Key] = entry
+	}
+	p.entries = entries
+	return nil
+}
+
+func (p *PredictionTable) loadLegacyJSONLocked() error {
+	if p.legacy == "" {
+		return os.ErrNotExist
+	}
+	data, err := os.ReadFile(p.legacy)
+	if err != nil {
 		return err
 	}
 	if len(data) == 0 {
 		return nil
 	}
-	var entries []*PredictionEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	var items []*PredictionEntry
+	if err := json.Unmarshal(data, &items); err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if entry == nil {
+	entries := make(map[string]*PredictionEntry, len(items))
+	for _, entry := range items {
+		if entry == nil || entry.Key == "" {
 			continue
 		}
-		p.entries[entry.Key] = entry
+		entries[entry.Key] = entry
 	}
+	p.entries = entries
 	return nil
 }
 
 func (p *PredictionTable) persistLocked() error {
-	items := make([]*PredictionEntry, 0, len(p.entries))
-	for _, entry := range p.entries {
-		items = append(items, entry)
-	}
-	data, err := json.MarshalIndent(items, "", "  ")
+	tempPath := p.path + ".tmp"
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p.path, data, 0644)
+	bw := bufio.NewWriter(file)
+	cleanup := func(err error) error {
+		bw.Flush()
+		file.Close()
+		if err != nil {
+			_ = os.Remove(tempPath)
+		}
+		return err
+	}
+	if _, err := bw.Write([]byte(predictionFileMagic)); err != nil {
+		return cleanup(err)
+	}
+	if err := binary.Write(bw, binary.LittleEndian, predictionFileVersion); err != nil {
+		return cleanup(err)
+	}
+	keys := make([]string, 0, len(p.entries))
+	for key, entry := range p.entries {
+		if entry == nil {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	entryCount := uint32(len(keys))
+	if err := binary.Write(bw, binary.LittleEndian, entryCount); err != nil {
+		return cleanup(err)
+	}
+	for _, key := range keys {
+		entry := p.entries[key]
+		if err := writePredictionString(bw, entry.Key); err != nil {
+			return cleanup(err)
+		}
+		var updatedAt int64
+		if !entry.UpdatedAt.IsZero() {
+			updatedAt = entry.UpdatedAt.UTC().UnixNano()
+		}
+		if err := binary.Write(bw, binary.LittleEndian, updatedAt); err != nil {
+			return cleanup(err)
+		}
+		valueCount := uint32(len(entry.Values))
+		if err := binary.Write(bw, binary.LittleEndian, valueCount); err != nil {
+			return cleanup(err)
+		}
+		for _, value := range entry.Values {
+			if err := writePredictionString(bw, value.Value); err != nil {
+				return cleanup(err)
+			}
+			if err := binary.Write(bw, binary.LittleEndian, value.BaseProbability); err != nil {
+				return cleanup(err)
+			}
+			if err := binary.Write(bw, binary.LittleEndian, value.LastUpdatedEpoch); err != nil {
+				return cleanup(err)
+			}
+			weightCount := uint32(len(value.ContextWeights))
+			if err := binary.Write(bw, binary.LittleEndian, weightCount); err != nil {
+				return cleanup(err)
+			}
+			for _, weight := range value.ContextWeights {
+				if err := binary.Write(bw, binary.LittleEndian, int32(weight.Depth)); err != nil {
+					return cleanup(err)
+				}
+				if err := binary.Write(bw, binary.LittleEndian, weight.Bias); err != nil {
+					return cleanup(err)
+				}
+				if err := writeFloat64Slice(bw, weight.Vector); err != nil {
+					return cleanup(err)
+				}
+			}
+		}
+		windowCount := uint32(len(entry.WindowHints))
+		if err := binary.Write(bw, binary.LittleEndian, windowCount); err != nil {
+			return cleanup(err)
+		}
+		for _, row := range entry.WindowHints {
+			if err := writeFloat64Slice(bw, row); err != nil {
+				return cleanup(err)
+			}
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Sync(); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, p.path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (p *PredictionTable) Close() error {
@@ -408,6 +650,70 @@ func clonePredictionEntry(entry *PredictionEntry) *PredictionEntry {
 		}
 	}
 	return cloned
+}
+
+func writePredictionString(w io.Writer, value string) error {
+	if len(value) == 0 {
+		if err := binary.Write(w, binary.LittleEndian, uint32(0)); err != nil {
+			return err
+		}
+		return nil
+	}
+	if len(value) > math.MaxUint32 {
+		return fmt.Errorf("prediction_string_too_large")
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(value))); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte(value))
+	return err
+}
+
+func readPredictionString(r io.Reader) (string, error) {
+	var size uint32
+	if err := binary.Read(r, binary.LittleEndian, &size); err != nil {
+		return "", err
+	}
+	if size == 0 {
+		return "", nil
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func writeFloat64Slice(w io.Writer, values []float64) error {
+	if len(values) > math.MaxUint32 {
+		return fmt.Errorf("float_slice_too_large")
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(values))); err != nil {
+		return err
+	}
+	for _, v := range values {
+		if err := binary.Write(w, binary.LittleEndian, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readFloat64Slice(r io.Reader) ([]float64, error) {
+	var size uint32
+	if err := binary.Read(r, binary.LittleEndian, &size); err != nil {
+		return nil, err
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	result := make([]float64, size)
+	for i := uint32(0); i < size; i++ {
+		if err := binary.Read(r, binary.LittleEndian, &result[i]); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 // ProbabilityMerger merges probability vectors coming from different windows.

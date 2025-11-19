@@ -96,6 +96,23 @@ Cheetah's byte trees already partition sequences for fast lookup. The matrix-rel
 same structure but swaps the terminal payload for a prediction table that reacts to a mutable context
 matrix.
 
+### Fixed-byte prediction storage
+
+- Every prediction table persists to `prediction_<name>.table` next to the trie. The file begins with
+  the `CHPREDTB` magic + version tag, followed by a deterministic entry count so the server can memory
+  map or stripe the file without parsing JSON. Each entry encodes the key length, last update stamp,
+  value count, and context metadata using `uint32` lengths plus IEEE-754 floats, mirroring the
+  fixed-byte guarantees of the regular value tables. Context vectors and window hints also use
+  `[len][float64...]` blocks so a pager can jump directly to the next record.
+- JSON now exists only for CLI/IPC payloads (`PREDICT_SET weights=`, `PREDICT_QUERY ctx=`, etc.). On
+  disk the tables never store JSON, eliminating the previous bottleneck of rewriting megabytes of
+  text for every update. Existing `.json` tables are auto-migrated the first time they are opened and
+  rewritten into the binary format.
+- Because each record is deterministic and endian-stable, the files can be split, mirrored, or copied
+  with the same tooling used for `values_*.table` (e.g., `PAIR_SUMMARY` forklifts, fork transfers).
+  Key/value pairs stay contiguous, which keeps hot prediction shards cache-friendly and compatible
+  with the fixed-byte assumptions elsewhere in the engine.
+
 ### Prediction table contract
 
 - Keys map to multiple candidate results (value, probability vector, weight blobs) rather than a

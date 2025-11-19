@@ -212,7 +212,8 @@ SUCCESS,key=1_deleted
   can be parsed by shell scripts (`awk -F,`) or structured log scrapers.
 
 - **Prediction tables & context matrices.** The database can now host multiple prediction tables
-  (stored as `prediction_<name>.json` alongside the trie) and expose GPU-style probability merges:
+  (stored as fixed-byte `prediction_<name>.table` files alongside the trie; JSON only appears on the
+  CLI for request/response payloads) and expose GPU-style probability merges:
 
   - `PREDICT_SET key=<prefix> value=<bytes> prob=<0-1> [weights=<base64 json>] [table=name]` stores a
     candidate value for the given prefix. Context weights use the JSON schema documented in

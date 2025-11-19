@@ -24,6 +24,11 @@ func newPredictionManager(basePath string) *PredictionManager {
 	}
 }
 
+func (pm *PredictionManager) tablePaths(name string) (string, string) {
+	return filepath.Join(pm.basePath, fmt.Sprintf("prediction_%s.table", name)),
+		filepath.Join(pm.basePath, fmt.Sprintf("prediction_%s.json", name))
+}
+
 func (pm *PredictionManager) sanitizeTableName(raw string) string {
 	name := raw
 	if name == "" {
@@ -50,8 +55,8 @@ func (pm *PredictionManager) Get(table string) (*PredictionTable, error) {
 	if existing, ok := pm.tables[name]; ok {
 		return existing, nil
 	}
-	path := filepath.Join(pm.basePath, fmt.Sprintf("prediction_%s.json", name))
-	pt, err := newPredictionTable(path, name)
+	path, legacy := pm.tablePaths(name)
+	pt, err := newPredictionTable(path, legacy, name)
 	if err != nil {
 		return nil, err
 	}
@@ -94,18 +99,27 @@ func (pm *PredictionManager) ensureTablesLocked() {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "prediction_") || !strings.HasSuffix(name, ".json") {
+		if !strings.HasPrefix(name, "prediction_") {
 			continue
 		}
-		base := strings.TrimSuffix(strings.TrimPrefix(name, "prediction_"), ".json")
+		var base, ext string
+		switch {
+		case strings.HasSuffix(name, ".table"):
+			ext = ".table"
+		case strings.HasSuffix(name, ".json"):
+			ext = ".json"
+		default:
+			continue
+		}
+		base = strings.TrimSuffix(strings.TrimPrefix(name, "prediction_"), ext)
 		if base == "" {
 			continue
 		}
 		if _, ok := pm.tables[base]; ok {
 			continue
 		}
-		path := filepath.Join(pm.basePath, name)
-		table, err := newPredictionTable(path, base)
+		path, legacy := pm.tablePaths(base)
+		table, err := newPredictionTable(path, legacy, base)
 		if err != nil {
 			logErrorf("failed loading prediction table %s: %v", base, err)
 			continue
