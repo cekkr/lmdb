@@ -72,6 +72,56 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   reopening readers. Run `CHEETAHDB_BENCH=1 go test -run TestCheetahDBBenchmark -count=1 -v` from
   `cheetah-db/` to reproduce the latest snapshots:
 
+- **High-priority reference — cluster-ready fork scheduling.** Treat every trie fork (child pointer
+  or jump node) as a schedulable shard with its own WAL/checkpoint metadata so branches can be
+  placed on different hosts. A coordinator hashes the requested prefix to a `fork_id`, looks up the
+  owning node in `meta:cluster_topology`, and streams `PAIR_SCAN`/`PAIR_REDUCE` calls directly to
+  that worker. Workers gossip fan-out stats + byte density so the planner can reassign forks when a
+  branch outgrows its current node. Mirrors of the fork metadata live alongside the trie so
+  distributed ingest and prediction reads can target the right shard without replaying the whole
+  namespace on every machine.
+
+## Matrix-related tree predictions
+
+Cheetah's byte trees already partition sequences for fast lookup. The matrix-related tree reuses the
+same structure but swaps the terminal payload for a prediction table that reacts to a mutable context
+matrix.
+
+### Prediction table contract
+
+- Keys map to multiple candidate results (value, probability vector, weight blobs) rather than a
+  single scalar payload, letting queries request the top-N series for identical byte prefixes.
+- Queries can specify multiple windows (e.g., overlapping 3/5/7-byte spans) and merge the resulting
+  probability vectors before ranking results.
+- Probabilities respond to a context matrix defined as an array of arrays where each sub-array is a
+  context vector of arbitrary length. Missing entries default to zero so sparse contexts are cheap.
+- Training/ingest MUST prune edges whose normalized probability stays below the configured
+  `discard_below` threshold to avoid gigabytes of low-value weights during early learning.
+
+### Context matrix weighting
+
+- Each context sub-array is treated as an angular vector whose bias/dot products alter result
+  probabilities. Vectors apply in declaration order: parents never depend on the deeper optional
+  arrays, but deeper arrays can fine-tune an already-biased probability when higher precision is
+  needed.
+- The training loop runs forward/backward passes. Forward: collect per-window probabilities, fold in
+  active context vectors, truncate to the requested byte span, then merge. Backward: adjust the
+  stored weights so correlated byte sequences + contexts keep consistent probabilities, attaching
+  new context arrays on demand. Missing vector indices auto-initialize to zero, so the matrix can be
+  infinitely sparse.
+- Because results influence one another, store weights per result-value blob. Updating one value lets
+  the recursion propagate to related entries when their correlation flags are set during training.
+
+### Execution notes
+
+- GPU/WebGPU acceleration: expose a prediction-table setting (e.g., `enable_accelerated_merges`)
+  that routes merging and context-application kernels through WebGPU/Vulkan whenever the host
+  supports it; CPU fallback remains the default path.
+- Multi-window merging: truncate each probability vector to the requested byte count before merging
+  so contexts with different strides remain comparable, then bias/normalize during the merge cycle.
+- Distributed execution: align prediction tables with the cluster-ready fork scheduler so matrix
+  queries run on the shard that hosts the bytes, avoiding expensive cross-node replays.
+
 ### Indexing Defaults & Jump Nodes
 
 - `pair_index_bytes` now defaults to `1` so each `PairTable` file tops out at 256 entries. Use
@@ -230,3 +280,12 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   Keep `NEXT_STEPS.md` updated with those gaps and record interoperability details in
   `cheetah-db/README.md` for future agents, since the roadmap now aims to delete the remaining
   SQLite-only code paths once the reducers land.
+
+## Next Steps
+
+- Wire the cluster-ready fork scheduler into the live `cheetah-server` runtime so shards can be
+  assigned/moved dynamically instead of remaining documentation-only.
+- Prototype the GPU/WebGPU accelerated probability-merging path for the matrix-related prediction
+  tables, including CPU fallback benchmarks.
+- Expose dedicated training/maintenance commands for matrix-aware prediction tables so contexts,
+  weights, and pruning thresholds can be tuned without manual edits.
