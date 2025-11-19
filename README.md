@@ -373,6 +373,30 @@ can log the cleanup inside `studies/BENCHMARKS.md`. `--threshold`, `--max-json-l
 previews the exact command (useful when orchestrating via
 `wsl.exe -d Ubuntu-24.04 -- PYTHONPATH=src ... scripts/drain_queue.py ...`).
 
+### Cheetah Prediction Tables & Context Probes
+
+The Python adapter now exposes cheetah's prediction-table commands, letting you exercise the context
+matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
+
+- `ContextWindowEmbeddingManager.context_matrix_for_text()` derives the same angular vectors used for
+  context-dimension penalties. `train.py` uses this helper whenever you pass one or more
+  `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted into a
+  context matrix via the active `--context-dimensions`, then piped through
+  `PREDICT_QUERY table=context_matrices key=meta:context_dimension_embeddings` by default.
+- Override `--cheetah-predict-table` or `--cheetah-predict-key` to target a different prediction
+  shard, e.g. `--cheetah-predict-table ctx_predictions` for custom namespaces.
+- Results are rendered with `helpers.cheetah_cli.format_prediction_query()`, so the log stream lists
+  the backend, total hit count, and the top entries (`value_hex -> probability`) for inspection.
+- Example (run before ingest to inspect the current context-matrix state):
+  ```bash
+  python src/train.py datasets/emotion_data.json \
+    --cheetah-context-probe "Summaries about remote work" \
+    --cheetah-context-probe "Reflect on the previous lesson" \
+    --cheetah-system-stats
+  ```
+  When context windows are disabled (e.g., `--context-dimensions off`), the trainer skips the probes
+  automatically.
+
 ## Inference CLI (`src/run.py`)
 
 `run.py` spins up a conversational REPL backed by the database produced during training. The loop

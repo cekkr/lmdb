@@ -173,6 +173,20 @@ Context matrices + window specs are passed as base64-encoded JSON arrays so CLI 
 stable. The probability merger truncates vectors to the shared byte-span before aggregating and
 automatically normalizes outputs.
 
+#### Python integration
+
+- `src/db_slm/adapters/cheetah.py` now exposes `predict_query()`/`predict_ctx()` helpers that wrap
+  the base64 payloads described above (`helpers.cheetah_cli.format_prediction_query()` renders the
+  replies for logs/tests). The adapter automatically populates `ctx=`, `windows=`, and
+  `key_windows=` arguments when Python passes raw float matrices.
+- `ContextWindowEmbeddingManager.context_matrix_for_text()` emits the same per-dimension vectors used
+  for repeat penalties, so CLI tools can build a prediction-ready matrix for arbitrary prose.
+- `src/train.py` accepts `--cheetah-context-probe "<text>"` (repeatable) plus
+  `--cheetah-predict-table`/`--cheetah-predict-key`. At startup the trainer builds a matrix from each
+  snippet (respecting `--context-dimensions`) and issues `PREDICT_QUERY` against the selected table
+  (defaults to `context_matrices` / `meta:context_dimension_embeddings`). Probe results are logged
+  before ingest begins, giving a quick snapshot of the active context-matrix weights.
+
 ### Indexing Defaults & Jump Nodes
 
 - `pair_index_bytes` now defaults to `1` so each `PairTable` file tops out at 256 entries. Use
