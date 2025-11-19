@@ -257,15 +257,26 @@ class SentencePartEmbeddingPipeline:
         lines: list[str] = []
         if header_line:
             lines.append(header_line)
-        for idx, segment in enumerate(segments):
-            vector = vectors[idx] if idx < len(vectors) else []
-            signature = self.embedder.signature(vector)
-            segment_line = f"|SEGMENT|#{idx + 1} {signature} {segment.strip()}"
-            lines.append(segment_line)
-            ctx_keywords = self._contextual_keywords(segment, vector)
-            if ctx_keywords:
-                lines.append("|CTX_KEY| " + " ".join(ctx_keywords))
-        lines.append("|RAW|")
+
+        segmentTagging = False #todo: remove all these unmanaged tags (CTX_KEY, RAW...)
+        if segmentTagging:
+            for idx, segment in enumerate(segments):
+                vector = vectors[idx] if idx < len(vectors) else []
+                signature = self.embedder.signature(vector)
+                segment_line = f"|SEGMENT|#{idx + 1} {signature} {segment.strip()}"
+                lines.append(segment_line)            
+                ctx_keywords = self._contextual_keywords(segment, vector)
+                if ctx_keywords:
+                    lines.append("|CTX_KEY| " + " ".join(ctx_keywords))
+
+                lines.append("|RAW|")
+        else:
+            for idx, segment in enumerate(segments):
+                vector = vectors[idx] if idx < len(vectors) else []
+                signature = self.embedder.signature(vector)
+                segment_line = f"{segment.strip()}"
+                lines.append(segment_line)            
+
         lines.append(payload)
 
         snapshot = self.profiler.snapshot()
