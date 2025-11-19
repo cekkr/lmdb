@@ -932,15 +932,20 @@ class EvalLogWriter:
                     "index": sample.index,
                     "variant": sample.variant,
                     "context": sample.context_tokens,
-                    "prompt": preview(sample.prompt, width=240),
-                    "reference": preview(sample.reference, width=240),
-                    "generated": preview(sample.generated, width=240),
+                    "prompt": preview(sample.prompt, width=384),
+                    "reference": preview(sample.reference, width=384),
+                    "generated": preview(sample.generated, width=384),
                     "metrics": self._sanitize_metrics(sample.metrics),
                     "flagged": sample.flagged,
                 }
                 for sample in samples
             ],
         }
+
+        for sample in samples:
+            print("\nsample.prompt: ", sample.prompt)
+            print("sample.generated: ", sample.generated, "\n")
+
         cycle_reference = self._cycle_reference(samples)
         if cycle_reference:
             event["cycle_reference"] = cycle_reference

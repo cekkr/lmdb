@@ -704,11 +704,7 @@ def _dependency_layer_annotation(
             "prompt": _flatten_dependency_tokens(prompt_layer),
             "response": _flatten_dependency_tokens(response_layer),
         },
-    }
-
-    # High (bad position insertion) debug logging
-    print("\nPommpt: ", prompt_payload)
-    print("Response: ", response_payload, "\n")
+    }   
 
     return json.dumps(payload, ensure_ascii=False)
 
