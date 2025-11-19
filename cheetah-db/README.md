@@ -211,6 +211,38 @@ SUCCESS,key=1_deleted
   fd counts without spawning `top`. Because `database.go` formats it in CSV-like key/value pairs, it
   can be parsed by shell scripts (`awk -F,`) or structured log scrapers.
 
+- **Prediction tables & context matrices.** The database can now host multiple prediction tables
+  (stored as `prediction_<name>.json` alongside the trie) and expose GPU-style probability merges:
+
+  - `PREDICT_SET key=<prefix> value=<bytes> prob=<0-1> [weights=<base64 json>] [table=name]` stores a
+    candidate value for the given prefix. Context weights use the JSON schema documented in
+    `AI_REFERENCE.md` (encode the JSON blob, then pass it as base64).
+  - `PREDICT_QUERY key=<prefix> [keys=a,b,c] [ctx=<base64 json>] [windows=<base64 json>]
+    [key_windows=<base64 json>] [merge=avg|sum|max] [table=name]` evaluates one or many prefixes and
+    merges their probability windows. `keys=` lets you query several prefixes at once, while
+    `key_windows=` accepts a base64 array of `{ "key": "<hex>", "windows": [[...], ...] }` objects for
+    per-prefix window overrides. Responses include the backend name (`cpu` or the simulated
+    `webgpu-simulated` merger).
+  - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]` adjusts
+    stored weights via the forward/backward loop, and `PREDICT_CTX key=<prefix> ctx=<base64 json>
+    [mode=bias|scale] [strength=1] [table=name]` applies an immediate context bias without retraining.
+  - `PREDICT_BACKEND [mode=cpu|gpu] [table=name]` toggles the probability merger per table, and
+    `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
+    current host.
+
+  All prediction commands accept plaintext prefixes or the `x<hex>` form. Context matrices and window
+  specs must be base64-encoded JSON so CLI input stays newline-safe.
+
+- **Cluster coordination.** Multi-node deployments can now tell cheetah where each fork lives. Set
+  `CHEETAH_NODE_ID=<id>` on every server, then use:
+  - `CLUSTER_UPDATE replication=<n> nodeA=host:port/weight ...` (or `json=<base64>`) to register the
+    topology,
+  - `CLUSTER_STATUS` to view assignments,
+  - `FORK_ASSIGN <prefix|*>` to see which nodes own a shard, and
+  - `CLUSTER_MOVE prefix=<bytes>|fork=<id> node=<nodeID>` to override placement (broadcast to peers via
+    `CLUSTER_GOSSIP json=<payload>`). Overrides persist next to `cluster_topology.json`, so restarts
+    keep the new mapping.
+
 ## Streaming Helpers
 
 - `PAIR_SCAN <prefix> [limit]` favors namespace exhaustiveness: `PAIR_SCAN ctx: 100` walks the first
