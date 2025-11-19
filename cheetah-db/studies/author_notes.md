@@ -19,3 +19,6 @@ Remember a standolone implementation, but while studying new ideal Cheetah's alg
 
 ### Last things
 - Implement in lmdb python code src/ the new Cheetah DB's prediction-tables and context-matrix features and queries 
+
+### Remember during implementation:
+Next step: exercise python src/train.py ... --cheetah-context-probe "<sample text>" against a running cheetah server to verify prediction tables respond as expected.
