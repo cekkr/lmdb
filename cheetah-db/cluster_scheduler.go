@@ -45,6 +45,7 @@ type ForkScheduler struct {
 	topology    ClusterTopology
 	ring        []ringNode
 	stats       map[string]uint64
+	overrides   map[string]string
 }
 
 func newForkScheduler(dbPath string) *ForkScheduler {
@@ -55,7 +56,8 @@ func newForkScheduler(dbPath string) *ForkScheduler {
 			Version:           1,
 			ReplicationFactor: 1,
 		},
-		stats: make(map[string]uint64),
+		stats:     make(map[string]uint64),
+		overrides: make(map[string]string),
 	}
 	_ = fs.load()
 	fs.rebuildRingLocked()
@@ -80,6 +82,9 @@ func (fs *ForkScheduler) load() error {
 		topo.ReplicationFactor = 1
 	}
 	fs.topology = topo
+	if fs.overrides == nil {
+		fs.overrides = make(map[string]string)
+	}
 	fs.rebuildRingLocked()
 	return nil
 }
@@ -146,6 +151,9 @@ func (fs *ForkScheduler) AssignFork(prefix []byte) ForkAssignment {
 	defer fs.mu.Unlock()
 	forkID := deriveForkID(prefix)
 	nodes := fs.walkRingLocked(prefix, fs.topology.ReplicationFactor)
+	if target, ok := fs.overrides[forkID]; ok && target != "" {
+		nodes = []string{target}
+	}
 	fs.stats[forkID]++
 	return ForkAssignment{
 		ForkID:  forkID,
@@ -204,4 +212,35 @@ func (fs *ForkScheduler) Snapshot() (ClusterTopology, map[string]uint64) {
 		stats[forkID] = count
 	}
 	return fs.topology, stats
+}
+
+func (fs *ForkScheduler) nodeExistsLocked(nodeID string) bool {
+	for _, node := range fs.topology.Nodes {
+		if node.ID == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *ForkScheduler) ForceAssignment(forkID, nodeID string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if nodeID == "" {
+		delete(fs.overrides, forkID)
+		return nil
+	}
+	if !fs.nodeExistsLocked(nodeID) {
+		return fmt.Errorf("unknown_node:%s", nodeID)
+	}
+	if fs.overrides == nil {
+		fs.overrides = make(map[string]string)
+	}
+	fs.overrides[forkID] = nodeID
+	return nil
+}
+
+func (fs *ForkScheduler) ForceAssignmentForPrefix(prefix []byte, nodeID string) (string, error) {
+	forkID := deriveForkID(prefix)
+	return forkID, fs.ForceAssignment(forkID, nodeID)
 }

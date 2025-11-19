@@ -4,15 +4,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
+
+var errPredictionEntryNotFound = errors.New("prediction_entry_not_found")
 
 type ContextMatrix [][]float64
 
@@ -46,18 +46,20 @@ type PredictionResult struct {
 }
 
 type PredictionTable struct {
-	mu      sync.RWMutex
-	entries map[string]*PredictionEntry
-	path    string
-	merger  ProbabilityMerger
-	closed  bool
+	mu        sync.RWMutex
+	entries   map[string]*PredictionEntry
+	path      string
+	tableName string
+	merger    ProbabilityMerger
+	closed    bool
 }
 
-func newPredictionTable(dbPath string) (*PredictionTable, error) {
+func newPredictionTable(path string, tableName string) (*PredictionTable, error) {
 	p := &PredictionTable{
-		path:    filepath.Join(dbPath, "prediction_tables.json"),
-		entries: make(map[string]*PredictionEntry),
-		merger:  selectProbabilityMerger(""),
+		path:      path,
+		tableName: tableName,
+		entries:   make(map[string]*PredictionEntry),
+		merger:    selectProbabilityMerger(""),
 	}
 	if err := p.load(); err != nil {
 		return nil, err
@@ -161,7 +163,7 @@ func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]fl
 	defer p.mu.RUnlock()
 	entry, ok := p.entries[encodeKey(key)]
 	if !ok {
-		return nil, errors.New("prediction_entry_not_found")
+		return nil, errPredictionEntryNotFound
 	}
 	results := make([]PredictionResult, 0, len(entry.Values))
 	windowMerge := p.merger.Merge(windows)
@@ -217,7 +219,7 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 	defer p.mu.Unlock()
 	entry, ok := p.entries[encodeKey(key)]
 	if !ok {
-		return PredictionEntry{}, fmt.Errorf("prediction_entry_not_found")
+		return PredictionEntry{}, errPredictionEntryNotFound
 	}
 	targetEncoded := base64.StdEncoding.EncodeToString(target)
 	for idx := range entry.Values {
@@ -229,6 +231,37 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 		err := expected - score
 		entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + lr*err)
 		entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
+		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
+	}
+	entry.UpdatedAt = time.Now().UTC()
+	if err := p.persistLocked(); err != nil {
+		return *entry, err
+	}
+	return *entry, nil
+}
+
+func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, mode string, strength float64) (PredictionEntry, error) {
+	if strength == 0 {
+		strength = 1
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "bias"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.entries[encodeKey(key)]
+	if !ok {
+		return PredictionEntry{}, errPredictionEntryNotFound
+	}
+	for idx := range entry.Values {
+		bias := applyContextWeights(ctx, entry.Values[idx].ContextWeights) * strength
+		switch mode {
+		case "scale", "multiply":
+			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability * (1 + bias))
+		default:
+			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + bias)
+		}
 		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
 	entry.UpdatedAt = time.Now().UTC()
@@ -446,6 +479,95 @@ func parseWindowMatrixArg(raw string) ([][]float64, error) {
 		return nil, err
 	}
 	return matrix, nil
+}
+
+type keyWindowSpec struct {
+	Key     string      `json:"key"`
+	Windows [][]float64 `json:"windows"`
+}
+
+func parseKeyWindowMatrixArg(raw string) (map[string][][]float64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var specs []keyWindowSpec
+	if err := json.Unmarshal(data, &specs); err != nil {
+		return nil, err
+	}
+	result := make(map[string][][]float64, len(specs))
+	for _, spec := range specs {
+		if spec.Key == "" || len(spec.Windows) == 0 {
+			continue
+		}
+		result[spec.Key] = spec.Windows
+	}
+	return result, nil
+}
+
+type multiPredictionAggregate struct {
+	value []byte
+	total float64
+	count int
+}
+
+func normalizeMergeMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "sum":
+		return "sum"
+	case "max":
+		return "max"
+	default:
+		return "avg"
+	}
+}
+
+func mergePredictionResultSets(resultSets [][]PredictionResult, mode string) []PredictionResult {
+	if len(resultSets) == 0 {
+		return nil
+	}
+	mode = normalizeMergeMode(mode)
+	aggregates := make(map[string]*multiPredictionAggregate)
+	for _, set := range resultSets {
+		for _, res := range set {
+			key := string(res.Value)
+			agg, ok := aggregates[key]
+			if !ok {
+				agg = &multiPredictionAggregate{
+					value: append([]byte(nil), res.Value...),
+				}
+				aggregates[key] = agg
+			}
+			switch mode {
+			case "max":
+				if agg.count == 0 || res.Probability > agg.total {
+					agg.total = res.Probability
+				}
+			default:
+				agg.total += res.Probability
+			}
+			agg.count++
+		}
+	}
+	if len(aggregates) == 0 {
+		return nil
+	}
+	merged := make([]PredictionResult, 0, len(aggregates))
+	for _, agg := range aggregates {
+		prob := agg.total
+		if mode == "avg" && agg.count > 0 {
+			prob = prob / float64(agg.count)
+		}
+		merged = append(merged, PredictionResult{
+			Value:       append([]byte(nil), agg.value...),
+			Probability: clampProbability(prob),
+		})
+	}
+	sortPredictionResults(merged)
+	return merged
 }
 
 // BenchmarkMerger runs a light benchmark comparing CPU vs accelerated paths.

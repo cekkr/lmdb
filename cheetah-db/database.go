@@ -23,27 +23,28 @@ import (
 )
 
 type Database struct {
-	name            string
-	path            string
-	highestKey      atomic.Uint64
-	nextPairTableID atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
-	mainKeys        *MainKeysTable
-	valuesTables    sync.Map
-	recycleTables   sync.Map
-	pairTables      sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
-	fileManager     *FileManager
-	payloadCache    *payloadCache
-	mu              sync.Mutex
-	pairDir         string // Path alla cartella /pairs
-	nextPairIDPath  string // Path al file che memorizza il contatore
-	resources       *ResourceMonitor
-	settings        DatabaseConfig
-	branchCodec     pairBranchCodec
-	jumpDir         string
-	nextJumpIDPath  string
-	nextJumpID      atomic.Uint32
-	forkScheduler   *ForkScheduler
-	predictTable    *PredictionTable
+	name             string
+	path             string
+	highestKey       atomic.Uint64
+	nextPairTableID  atomic.Uint32 // Contatore per i nuovi ID delle tabelle pair
+	mainKeys         *MainKeysTable
+	valuesTables     sync.Map
+	recycleTables    sync.Map
+	pairTables       sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
+	fileManager      *FileManager
+	payloadCache     *payloadCache
+	mu               sync.Mutex
+	pairDir          string // Path alla cartella /pairs
+	nextPairIDPath   string // Path al file che memorizza il contatore
+	resources        *ResourceMonitor
+	settings         DatabaseConfig
+	branchCodec      pairBranchCodec
+	jumpDir          string
+	nextJumpIDPath   string
+	nextJumpID       atomic.Uint32
+	forkScheduler    *ForkScheduler
+	predictStore     *PredictionManager
+	clusterMessenger *ClusterMessenger
 }
 
 func resolvePairTableLimit(configured int) int {
@@ -269,12 +270,8 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
 		forkScheduler:  newForkScheduler(path),
 	}
-	predictTable, err := newPredictionTable(path)
-	if err != nil {
-		mkt.Close()
-		return nil, err
-	}
-	db.predictTable = predictTable
+	db.predictStore = newPredictionManager(path)
+	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
 
 	// Carica il contatore degli ID delle tabelle pair
 	if err := db.loadNextPairTableID(); err != nil {
@@ -320,8 +317,11 @@ func (db *Database) Close() error {
 	if db.fileManager != nil {
 		db.fileManager.Close()
 	}
-	if db.predictTable != nil {
-		db.predictTable.Close()
+	if db.predictStore != nil {
+		db.predictStore.Close()
+	}
+	if db.clusterMessenger != nil {
+		db.clusterMessenger.Stop()
 	}
 	return firstErr
 }
@@ -1359,6 +1359,12 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response = db.handlePredictBackend(args)
 	case command == "PREDICT_BENCH":
 		response = db.handlePredictBench(args)
+	case command == "PREDICT_CTX":
+		response, err = db.handlePredictContextAdjust(args)
+	case command == "CLUSTER_MOVE":
+		response, err = db.handleClusterMove(args)
+	case command == "CLUSTER_GOSSIP":
+		response, err = db.handleClusterGossip(args)
 	case command == "SYSTEM_STATS":
 		response = db.systemStatsResponse()
 	case command == "LOG_FLUSH":
@@ -2171,6 +2177,18 @@ func parseFileCheckpointArgs(raw string) (FileCheckpointOptions, error) {
 	return opts, nil
 }
 
+func (db *Database) getPredictionTableFromParams(params map[string]string) (*PredictionTable, string, error) {
+	if db.predictStore == nil {
+		return nil, "", errors.New("prediction_table_unavailable")
+	}
+	tableName := strings.TrimSpace(params["table"])
+	pt, err := db.predictStore.Get(tableName)
+	if err != nil {
+		return nil, "", err
+	}
+	return pt, tableName, nil
+}
+
 func (db *Database) handleClusterUpdate(args string) (string, error) {
 	if db.forkScheduler == nil {
 		return "ERROR,fork_scheduler_unavailable", nil
@@ -2201,6 +2219,9 @@ func (db *Database) handleClusterUpdate(args string) (string, error) {
 	}
 	if err := db.forkScheduler.UpdateTopology(topo); err != nil {
 		return "", err
+	}
+	if db.clusterMessenger != nil {
+		db.clusterMessenger.UpdateTopology(topo)
 	}
 	return fmt.Sprintf("SUCCESS,cluster_nodes=%d,replication=%d", len(topo.Nodes), topo.ReplicationFactor), nil
 }
@@ -2245,10 +2266,11 @@ func (db *Database) handleForkAssign(args string) (string, error) {
 }
 
 func (db *Database) handlePredictSet(args string) (string, error) {
-	if db.predictTable == nil {
-		return "ERROR,prediction_table_unavailable", nil
-	}
 	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
 	rawKey := params["key"]
 	rawValue := params["value"]
 	if rawKey == "" || rawValue == "" {
@@ -2278,25 +2300,26 @@ func (db *Database) handlePredictSet(args string) (string, error) {
 			return fmt.Sprintf("ERROR,invalid_weights_payload:%v", err), nil
 		}
 	}
-	entry, err := db.predictTable.SetPrediction(keyBytes, valueBytes, probability, weights)
+	entry, err := table.SetPrediction(keyBytes, valueBytes, probability, weights)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("SUCCESS,prediction_values=%d", len(entry.Values)), nil
+	return fmt.Sprintf("SUCCESS,table=%s,prediction_values=%d", tableName, len(entry.Values)), nil
 }
 
 func (db *Database) handlePredictQuery(args string) (string, error) {
-	if db.predictTable == nil {
-		return "ERROR,prediction_table_unavailable", nil
-	}
 	params := parseKeyValueArgs(args)
-	rawKey := params["key"]
-	if rawKey == "" {
-		return "ERROR,predict_query_requires_key", nil
-	}
-	keyBytes, err := parseValue(rawKey)
+	table, tableName, err := db.getPredictionTableFromParams(params)
 	if err != nil {
-		return err.Error(), nil
+		return "", err
+	}
+	rawKey := params["key"]
+	var keyBytes []byte
+	if rawKey != "" {
+		keyBytes, err = parseValue(rawKey)
+		if err != nil {
+			return err.Error(), nil
+		}
 	}
 	ctx, err := parseContextMatrixArg(params["ctx"])
 	if err != nil {
@@ -2306,22 +2329,50 @@ func (db *Database) handlePredictQuery(args string) (string, error) {
 	if err != nil {
 		return fmt.Sprintf("ERROR,invalid_windows:%v", err), nil
 	}
-	results, err := db.predictTable.Evaluate(keyBytes, ctx, windows)
+	keyList, err := parseKeyList(params["keys"])
 	if err != nil {
 		return err.Error(), nil
+	}
+	keyWindows, err := parseKeyWindowMatrixArg(params["key_windows"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_key_windows:%v", err), nil
+	}
+	mergeMode := params["merge"]
+	var targets [][]byte
+	if len(keyBytes) > 0 {
+		targets = append(targets, keyBytes)
+	}
+	if len(keyList) > 0 {
+		targets = append(targets, keyList...)
+	}
+	var results []PredictionResult
+	if len(targets) > 1 {
+		results, err = db.evaluateMultiKeyPredictions(table, targets, ctx, windows, keyWindows, mergeMode)
+		if err != nil {
+			return err.Error(), nil
+		}
+	} else {
+		if len(targets) == 0 {
+			return "ERROR,predict_query_requires_key", nil
+		}
+		results, err = table.Evaluate(targets[0], ctx, windows)
+		if err != nil {
+			return err.Error(), nil
+		}
 	}
 	var entries []string
 	for _, res := range results {
 		entries = append(entries, fmt.Sprintf("%x:%.4f", res.Value, res.Probability))
 	}
-	return fmt.Sprintf("SUCCESS,count=%d,backend=%s,items=%s", len(results), db.predictTable.CurrentMerger(), strings.Join(entries, ";")), nil
+	return fmt.Sprintf("SUCCESS,count=%d,backend=%s,table=%s,items=%s", len(results), table.CurrentMerger(), tableName, strings.Join(entries, ";")), nil
 }
 
 func (db *Database) handlePredictTrain(args string) (string, error) {
-	if db.predictTable == nil {
-		return "ERROR,prediction_table_unavailable", nil
-	}
 	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
 	rawKey := params["key"]
 	rawTarget := params["target"]
 	if rawKey == "" || rawTarget == "" {
@@ -2345,30 +2396,36 @@ func (db *Database) handlePredictTrain(args string) (string, error) {
 			learningRate = parsed
 		}
 	}
-	entry, err := db.predictTable.Train(keyBytes, targetBytes, ctx, learningRate)
+	entry, err := table.Train(keyBytes, targetBytes, ctx, learningRate)
 	if err != nil {
 		return err.Error(), nil
 	}
-	return fmt.Sprintf("SUCCESS,prediction_values=%d,lr=%.4f", len(entry.Values), learningRate), nil
+	return fmt.Sprintf("SUCCESS,table=%s,prediction_values=%d,lr=%.4f", tableName, len(entry.Values), learningRate), nil
 }
 
 func (db *Database) handlePredictBackend(args string) string {
-	if db.predictTable == nil {
-		return "ERROR,prediction_table_unavailable"
+	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return fmt.Sprintf("ERROR,%v", err)
 	}
-	mode := strings.TrimSpace(args)
+	mode := params["mode"]
+	if mode == "" && !strings.Contains(args, "=") {
+		mode = strings.TrimSpace(args)
+	}
 	if mode == "" {
-		return fmt.Sprintf("SUCCESS,backend=%s", db.predictTable.CurrentMerger())
+		return fmt.Sprintf("SUCCESS,table=%s,backend=%s", tableName, table.CurrentMerger())
 	}
-	selected := db.predictTable.SetMergerMode(mode)
-	return fmt.Sprintf("SUCCESS,backend=%s", selected)
+	selected := table.SetMergerMode(mode)
+	return fmt.Sprintf("SUCCESS,table=%s,backend=%s", tableName, selected)
 }
 
 func (db *Database) handlePredictBench(args string) string {
-	if db.predictTable == nil {
-		return "ERROR,prediction_table_unavailable"
-	}
 	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return fmt.Sprintf("ERROR,%v", err)
+	}
 	samples := 0
 	if raw := params["samples"]; raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
@@ -2384,12 +2441,46 @@ func (db *Database) handlePredictBench(args string) string {
 			vectorLen = v
 		}
 	}
-	results := db.predictTable.Benchmark(samples, vectorLen)
+	results := table.Benchmark(samples, vectorLen)
 	entries := make([]string, 0, len(results))
 	for backend, duration := range results {
 		entries = append(entries, fmt.Sprintf("%s=%s", backend, duration))
 	}
-	return fmt.Sprintf("SUCCESS,samples=%d,window=%d,bench=%s", samples, vectorLen, strings.Join(entries, "|"))
+	return fmt.Sprintf("SUCCESS,table=%s,samples=%d,window=%d,bench=%s", tableName, samples, vectorLen, strings.Join(entries, "|"))
+}
+
+func (db *Database) handlePredictContextAdjust(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
+	rawKey := params["key"]
+	if rawKey == "" {
+		return "ERROR,predict_ctx_requires_key", nil
+	}
+	keyBytes, err := parseValue(rawKey)
+	if err != nil {
+		return err.Error(), nil
+	}
+	ctx, err := parseContextMatrixArg(params["ctx"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_ctx:%v", err), nil
+	}
+	if ctx == nil {
+		return "ERROR,predict_ctx_requires_matrix", nil
+	}
+	strength := 1.0
+	if raw := params["strength"]; raw != "" {
+		if parsed, parseErr := strconv.ParseFloat(raw, 64); parseErr == nil {
+			strength = parsed
+		}
+	}
+	entry, err := table.ApplyContextAdjustment(keyBytes, ctx, params["mode"], strength)
+	if err != nil {
+		return err.Error(), nil
+	}
+	return fmt.Sprintf("SUCCESS,table=%s,prediction_values=%d", tableName, len(entry.Values)), nil
 }
 
 func parseInlineTopology(raw string) (ClusterTopology, error) {
@@ -2433,6 +2524,61 @@ func parseInlineTopology(raw string) (ClusterTopology, error) {
 	return topo, nil
 }
 
+func (db *Database) handleClusterMove(args string) (string, error) {
+	if db.forkScheduler == nil {
+		return "ERROR,fork_scheduler_unavailable", nil
+	}
+	params := parseKeyValueArgs(args)
+	nodeID := params["node"]
+	if nodeID == "" {
+		return "ERROR,cluster_move_requires_node", nil
+	}
+	forkID := strings.TrimSpace(params["fork"])
+	if forkID == "" {
+		var prefix []byte
+		if raw := params["prefix"]; raw != "" && raw != "*" {
+			value, err := parseValue(raw)
+			if err != nil {
+				return err.Error(), nil
+			}
+			prefix = value
+		}
+		forkID = deriveForkID(prefix)
+	}
+	if err := db.forkScheduler.ForceAssignment(forkID, nodeID); err != nil {
+		return fmt.Sprintf("ERROR,%v", err), nil
+	}
+	if db.clusterMessenger != nil {
+		db.clusterMessenger.NotifyForkMove(forkID, nodeID)
+	}
+	return fmt.Sprintf("SUCCESS,fork_id=%s,node=%s", forkID, nodeID), nil
+}
+
+func (db *Database) handleClusterGossip(args string) (string, error) {
+	trimmed := strings.TrimSpace(args)
+	if !strings.HasPrefix(trimmed, "json=") {
+		return "ERROR,gossip_requires_json", nil
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "json="))
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_gossip:%v", err), nil
+	}
+	var msg clusterMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return fmt.Sprintf("ERROR,invalid_gossip:%v", err), nil
+	}
+	switch msg.Kind {
+	case "fork_move":
+		if msg.ForkID != "" && msg.NodeID != "" && db.forkScheduler != nil {
+			if err := db.forkScheduler.ForceAssignment(msg.ForkID, msg.NodeID); err != nil {
+				return fmt.Sprintf("ERROR,%v", err), nil
+			}
+		}
+	}
+	return "SUCCESS,gossip_ack", nil
+}
+
 func parseKeyValueArgs(raw string) map[string]string {
 	fields := strings.Fields(raw)
 	result := make(map[string]string, len(fields))
@@ -2452,6 +2598,64 @@ func (db *Database) observeFork(prefix []byte) {
 		return
 	}
 	db.forkScheduler.AssignFork(prefix)
+}
+
+func parseKeyList(raw string) ([][]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ",")
+	keys := make([][]byte, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		keyBytes, err := parseValue(value)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, keyBytes)
+	}
+	return keys, nil
+}
+
+func (db *Database) evaluateMultiKeyPredictions(
+	table *PredictionTable,
+	keys [][]byte,
+	ctx ContextMatrix,
+	globalWindows [][]float64,
+	keyWindows map[string][][]float64,
+	mergeMode string,
+) ([]PredictionResult, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	resultSets := make([][]PredictionResult, 0, len(keys))
+	for _, key := range keys {
+		windowSpec := globalWindows
+		if keyWindows != nil {
+			if spec, ok := keyWindows[encodeKey(key)]; ok && len(spec) > 0 {
+				windowSpec = spec
+			}
+		}
+		results, err := table.Evaluate(key, ctx, windowSpec)
+		if err != nil {
+			if errors.Is(err, errPredictionEntryNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if len(results) == 0 {
+			continue
+		}
+		resultSets = append(resultSets, results)
+	}
+	if len(resultSets) == 0 {
+		return nil, nil
+	}
+	return mergePredictionResultSets(resultSets, mergeMode), nil
 }
 
 func summarizeArg(arg string) string {

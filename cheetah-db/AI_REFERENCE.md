@@ -84,6 +84,11 @@ Read and collect potential implementation to do in NEXT_STEPS.md
     live workloads and highlight hotspots pre-migration.
   Because the metadata persists next to the trie, resyncing a node only requires replaying WAL
   segments for the forks it owns rather than rehydrating the entire namespace.
+  - `CLUSTER_MOVE prefix=<bytes>|fork=<id> node=<nodeID>` forces a fork onto a specific node. The
+    gossip messenger (enabled via `CHEETAH_NODE_ID=<id>`) broadcasts the override so peers update
+    their schedulers, and `CLUSTER_GOSSIP` handles remote RPCs from other nodes. Heartbeats flow over
+    TCP to every peer declared in `CLUSTER_UPDATE`, so multi-node deployments can actively move hot
+    branches without manual restarts.
 
 ## Matrix-related tree predictions
 
@@ -133,7 +138,9 @@ matrix.
   (encode JSON -> base64) so sparse depth vectors stay compact.
 - `PREDICT_QUERY key=<value> [ctx=<base64 json>] [windows=<base64 json>]` evaluates a key with the
   provided context matrix and optional probability windows. Responses return ordered pairs as
-  `<value_hex>:<prob>` plus the backend name.
+  `<value_hex>:<prob>` plus the backend name. Supply `keys=a,b,c` for multi-window merges across
+  several prefixes, `key_windows=<base64 json>` for per-key probability windows, `merge=avg|sum|max`
+  to control aggregation, and `table=<name>` whenever multiple prediction tables coexist.
 - `PREDICT_TRAIN key=<value> target=<result> [ctx=...] [lr=0.01]` runs the recursive update loop so
   contexts fine-tune weights without rewriting payloads.
 - `PREDICT_BACKEND [cpu|gpu]` toggles between the CPU path and the simulated WebGPU merger
@@ -141,6 +148,9 @@ matrix.
   mirror WebGPU behaviour until native bindings are available.
 - `PREDICT_BENCH samples=<n> window=<len>` benchmarks CPU vs accelerated merges to decide when to
   enable GPU-style execution on a host.
+- `PREDICT_CTX key=<value> ctx=<base64 json> [mode=bias|scale] [strength=1] [table=<name>]` applies a
+  context-matrix adjustment to the stored probabilities without running a full training cycle,
+  enabling online bias corrections during ingest/serving.
 
 Context matrices + window specs are passed as base64-encoded JSON arrays so CLI whitespace stays
 stable. The probability merger truncates vectors to the shared byte-span before aggregating and
@@ -307,9 +317,9 @@ automatically normalizes outputs.
 
 ## Next Steps
 
-- Add shard-health gossip + RPC fan-out so the fork scheduler can place/move shards across multiple
-  cheetah-server instances instead of remaining a single-node planner.
-- Replace the simulated WebGPU merger with a real GPU/WebGPU compute backend (Vulkan/WGSL) and store
-  per-host benchmarks so the server can auto-select the right accelerator.
-- Hook prediction-table training into ingest so context matrices stay fresh without requiring manual
-  `PREDICT_TRAIN` batches.
+- Persist fork overrides + gossip snapshots so scheduler reassignments survive restarts and peers can
+  catch up after downtime.
+- Extend the messenger to stream actual shard payload diffs (values + prediction tables) so moving a
+  fork also migrates its data, not just metadata.
+- Integrate prediction-table updates into ingest/train loops (automatic `PREDICT_SET`/`PREDICT_CTX`
+  invocations) so context-aware tables stay current without manual CLI batches.
