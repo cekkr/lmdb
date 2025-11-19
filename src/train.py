@@ -35,6 +35,7 @@ from db_slm.evaluation import (
     VariantSeedPlanner,
     build_dependency_layer,
     run_inference_records,
+    ContextProbabilityProbe,
 )
 from db_slm.settings import DBSLMSettings, load_settings
 from db_slm.text_markers import append_end_marker
@@ -267,6 +268,39 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--cheetah-predict-key",
         default="meta:context_dimension_embeddings",
         help="Prediction-table key used by --cheetah-context-probe (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-eval-predict",
+        action="store_true",
+        help=(
+            "When set, evaluation probes issue a cheetah PREDICT_QUERY using dependency/context text "
+            "and log the resulting probabilities."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-eval-predict-table",
+        default="context_matrices",
+        help="Prediction-table name used during evaluation prediction probes (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-eval-predict-key",
+        default="meta:context_dimension_embeddings",
+        help="Prediction-table key used during evaluation prediction probes (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-eval-predict-source",
+        choices=("dependency", "prompt", "response", "reference", "generated", "context"),
+        default="dependency",
+        help=(
+            "Text source used to derive context matrices for evaluation prediction probes "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-eval-predict-limit",
+        type=int,
+        default=3,
+        help="Maximum prediction entries to log during evaluation prediction probes (default: %(default)s).",
     )
     return parser
 
@@ -578,6 +612,34 @@ def _probe_context_predictions(engine: DBSLMEngine, args: argparse.Namespace) ->
             continue
         for line in format_prediction_query(result, label=f"probe#{index}:{label}"):
             log(f"[train] {line}")
+
+
+def _build_eval_prediction_probe(
+    engine: DBSLMEngine,
+    args: argparse.Namespace,
+) -> tuple[ContextProbabilityProbe | None, str | None]:
+    enabled = getattr(args, "cheetah_eval_predict", False)
+    if not enabled:
+        return None, None
+    table = (getattr(args, "cheetah_eval_predict_table", None) or "context_matrices").strip()
+    key = getattr(args, "cheetah_eval_predict_key", None) or "meta:context_dimension_embeddings"
+    source = (getattr(args, "cheetah_eval_predict_source", "dependency") or "dependency").strip().lower()
+    limit = getattr(args, "cheetah_eval_predict_limit", 3)
+    probe = ContextProbabilityProbe(
+        engine,
+        table=table,
+        key=key,
+        max_entries=max(1, int(limit)),
+        log_prefix="[eval]",
+    )
+    if not probe.available():
+        log("[train] cheetah eval prediction probes unavailable (adapter disabled or context windows off).")
+        return None, None
+    log(
+        "[train] Evaluation prediction probes enabled via PREDICT_QUERY "
+        f"(table={table}, key={key}, source={source})."
+    )
+    return probe, source or "dependency"
 
 
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
@@ -1159,6 +1221,8 @@ class InferenceMonitor:
         decoder_cfg: DecoderConfig | None = None,
         variants_per_prompt: int = 1,
         seed_planner: VariantSeedPlanner | None = None,
+        prediction_probe: ContextProbabilityProbe | None = None,
+        prediction_source: str | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -1173,6 +1237,8 @@ class InferenceMonitor:
         self.decoder_cfg = decoder_cfg
         self.variants_per_prompt = max(1, variants_per_prompt)
         self.seed_planner = seed_planner
+        self.prediction_probe = prediction_probe
+        self.prediction_source = (prediction_source or "").strip().lower() if prediction_probe else None
         log_verbose(
             3,
             "[eval:v3] Inference monitor configured "
@@ -1216,6 +1282,8 @@ class InferenceMonitor:
             decoder_cfg=self.decoder_cfg,
             variants_per_prompt=self.variants_per_prompt,
             seed_planner=self.seed_planner,
+            prediction_probe=self.prediction_probe,
+            prediction_source=self.prediction_source,
         )
 
     def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
@@ -1412,6 +1480,7 @@ def main() -> None:
             run_metadata["context_window_embeddings"] = context_window_label
     _emit_cheetah_reports(engine, args)
     _probe_context_predictions(engine, args)
+    eval_prediction_probe, eval_prediction_source = _build_eval_prediction_probe(engine, args)
     if args.eval_variants is not None:
         if args.eval_variants < 1:
             parser.error("--eval-variants must be >= 1")
@@ -1497,6 +1566,8 @@ def main() -> None:
         decoder_cfg=decoder_cfg_override,
         variants_per_prompt=eval_variants,
         seed_planner=seed_planner,
+        prediction_probe=eval_prediction_probe,
+        prediction_source=eval_prediction_source,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -1518,6 +1589,8 @@ def main() -> None:
                 decoder_cfg=decoder_cfg_override,
                 variants_per_prompt=eval_variants,
                 seed_planner=seed_planner,
+                prediction_probe=eval_prediction_probe,
+                prediction_source=eval_prediction_source,
             )
             log(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
             log_verbose(
@@ -1539,6 +1612,8 @@ def main() -> None:
                 decoder_cfg=decoder_cfg_override,
                 variants_per_prompt=eval_variants,
                 seed_planner=seed_planner,
+                prediction_probe=eval_prediction_probe,
+                prediction_source=eval_prediction_source,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -1598,6 +1673,8 @@ def main() -> None:
                     decoder_cfg=decoder_cfg_override,
                     variants_per_prompt=eval_variants,
                     seed_planner=seed_planner,
+                    prediction_probe=eval_prediction_probe,
+                    prediction_source=eval_prediction_source,
                 )
                 monitor.refresh_dataset(chunk.eval_records)
         if processed_corpora == 0:

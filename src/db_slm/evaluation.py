@@ -25,6 +25,7 @@ from .text_markers import extract_complete_sentence
 from .prompt_tags import ensure_response_prompt_tag
 from helpers.char_tree_similarity import similarity_score
 from helpers.resource_monitor import ResourceMonitor
+from helpers.cheetah_cli import format_prediction_query, describe_bytes
 
 if TYPE_CHECKING:
     from helpers.resource_monitor import ResourceDelta
@@ -71,6 +72,103 @@ class EvaluationSampleResult:
     metrics: dict[str, float | int | None]
     flagged: bool = False
     variant: int = 1
+
+
+@dataclass(frozen=True)
+class PredictionProbeResult:
+    label: str
+    table: str
+    backend: str
+    entry_count: int
+    top_value: str | None
+    top_probability: float | None
+    log_lines: tuple[str, ...]
+
+
+class ContextProbabilityProbe:
+    """Runs context-matrix prediction queries via the cheetah hot-path adapter."""
+
+    def __init__(
+        self,
+        engine: DBSLMEngine,
+        *,
+        table: str,
+        key: str | None,
+        max_entries: int = 5,
+        log_prefix: str = "[prediction]",
+    ) -> None:
+        self._table = (table or "context_matrices").strip()
+        self._key = (key or "").strip() or None
+        self._max_entries = max(1, int(max_entries))
+        self._log_prefix = log_prefix.strip() or "[prediction]"
+        self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+        self._predict_query = getattr(engine.hot_path, "predict_query", None)
+        self._enabled = (
+            engine.context_windows.enabled()
+            and callable(self._matrix_builder)
+            and callable(self._predict_query)
+        )
+
+    def available(self) -> bool:
+        return self._enabled
+
+    def probe(
+        self,
+        label: str,
+        text: str,
+        *,
+        emit_log: bool = True,
+    ) -> PredictionProbeResult | None:
+        if not self._enabled:
+            return None
+        snippet = (text or "").strip()
+        if not snippet:
+            return None
+        matrix_fn = self._matrix_builder
+        if not callable(matrix_fn):
+            return None
+        matrix = matrix_fn(snippet)
+        if not matrix:
+            return None
+        query_fn = self._predict_query
+        if not callable(query_fn):
+            return None
+        try:
+            result = query_fn(
+                key=self._key,
+                context_matrix=matrix,
+                table=self._table,
+            )
+        except Exception as exc:
+            log(f"{self._log_prefix} {label}: prediction query failed ({exc}).")
+            return None
+        if result is None:
+            return None
+        lines = tuple(
+            format_prediction_query(
+                result,
+                label=label,
+                max_entries=self._max_entries,
+            )
+        )
+        if emit_log:
+            for line in lines:
+                log(f"{self._log_prefix} {line}")
+        top_value = None
+        top_probability = None
+        if result.entries:
+            entry = result.entries[0]
+            top_value = describe_bytes(entry.value)
+            top_probability = entry.probability
+        return PredictionProbeResult(
+            label=label,
+            table=result.table,
+            backend=result.backend,
+            entry_count=result.count,
+            top_value=top_value,
+            top_probability=top_probability,
+            log_lines=lines,
+        )
 
 
 _STRONG_DEP_GROUPS = {
@@ -412,6 +510,54 @@ def _format_context_tokens(context: dict[str, str]) -> str:
     return ", ".join(parts)
 
 
+def _dependency_summary_text(layer: DependencyLayer | None, limit: int = 24) -> str:
+    if not layer:
+        return ""
+    segments: list[str] = []
+    if layer.strong_token_groups:
+        for bucket in sorted(layer.strong_token_groups):
+            tokens = layer.strong_token_groups[bucket][: max(1, min(4, limit))]
+            if not tokens:
+                continue
+            segments.append(f"{bucket}:{' '.join(tokens)}")
+    if layer.arcs:
+        arc_parts: list[str] = []
+        for arc in layer.arcs[:limit]:
+            lemma = arc.lemma or arc.token
+            head = arc.head or "ROOT"
+            dep = arc.dep or "dep"
+            arc_parts.append(f"{lemma}->{head}/{dep}")
+        if arc_parts:
+            segments.append(" ".join(arc_parts))
+    return "\n".join(segments)
+
+
+def _prediction_probe_text(
+    record: EvaluationRecord,
+    generated: str,
+    source: str,
+) -> str:
+    mode = (source or "").strip().lower()
+    if mode == "prompt":
+        return record.prompt
+    if mode in {"reference", "response"}:
+        return record.response
+    if mode == "generated":
+        return generated
+    if mode == "context":
+        return _format_context_tokens(record.context_tokens)
+    if mode == "dependency":
+        sections: list[str] = []
+        prompt_summary = _dependency_summary_text(record.prompt_dependencies)
+        if prompt_summary:
+            sections.append(f"prompt:\n{prompt_summary}")
+        response_summary = _dependency_summary_text(record.response_dependencies)
+        if response_summary:
+            sections.append(f"response:\n{response_summary}")
+        return "\n".join(sections).strip()
+    return ""
+
+
 def _consume_future_retry_budget(record_key: str) -> bool:
     """Return True if the sample should be skipped because the budget is exhausted."""
     remaining = _flagged_retry_budget.get(record_key)
@@ -675,6 +821,8 @@ def run_inference_records(
     decoder_cfg: DecoderConfig | None = None,
     variants_per_prompt: int = 1,
     seed_planner: VariantSeedPlanner | None = None,
+    prediction_probe: ContextProbabilityProbe | None = None,
+    prediction_source: str | None = None,
 ) -> list[EvaluationSampleResult]:
     if not records:
         return []
@@ -694,6 +842,7 @@ def run_inference_records(
         description = window_summary.describe()
         if description:
             log(f"[eval] Context window embeddings active: {description}")
+    probe_source = (prediction_source or "").strip().lower() if prediction_probe else ""
     results: list[EvaluationSampleResult] = []
     pending: list[dict[str, Any]] = []
     queue_rng = seed_planner.queue_rng if seed_planner else random
@@ -815,6 +964,17 @@ def run_inference_records(
             _schedule_future_retries(record_key)
         else:
             _clear_future_retries(record_key)
+        if prediction_probe and probe_source:
+            probe_text = _prediction_probe_text(record, generated, probe_source)
+            if probe_text:
+                probe_result = prediction_probe.probe(
+                    f"{tag}:{probe_source}",
+                    probe_text,
+                )
+                if probe_result:
+                    if probe_result.top_probability is not None:
+                        metrics["prediction_top_probability"] = probe_result.top_probability
+                    metrics["prediction_entry_count"] = probe_result.entry_count
         context_label = _format_context_tokens(record.context_tokens)
         log(
             "[eval] {tag}: context={context} lexical={lex:.2f} rougeL={rouge:.2f} "

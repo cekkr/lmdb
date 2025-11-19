@@ -186,6 +186,16 @@ automatically normalizes outputs.
   snippet (respecting `--context-dimensions`) and issues `PREDICT_QUERY` against the selected table
   (defaults to `context_matrices` / `meta:context_dimension_embeddings`). Probe results are logged
   before ingest begins, giving a quick snapshot of the active context-matrix weights.
+- Evaluation probes can now stream these prediction queries automatically. Pass
+  `--cheetah-eval-predict` to `train.py` and every held-out sample (token thresholds + chunk holdouts)
+  will derive a context matrix from the configured source (`dependency`, `prompt`, `response`,
+  `generated`, or `context`) and log the resulting probabilities via `PREDICT_QUERY`. Adjust
+  `--cheetah-eval-predict-limit` to cap the number of entries per sample.
+- `run.py` mirrors the same behaviour: set `--cheetah-predict-log` to emit a prediction-table summary
+  after every prompt/response. The worker grabs either the conversation history, the framed prompt,
+  or the decoded response (`--cheetah-predict-source history|prompt|response`), builds the context
+  matrix, and attaches the formatted result to the CLI log stream so interactive debugging can lean
+  on the cheetah prediction tables.
 
 ### Indexing Defaults & Jump Nodes
 

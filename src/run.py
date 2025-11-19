@@ -12,6 +12,7 @@ from db_slm.inference_shared import issue_prompt
 from db_slm.settings import load_settings
 from db_slm.text_markers import append_end_marker
 from db_slm.prompt_tags import ensure_response_prompt_tag
+from db_slm.evaluation import ContextProbabilityProbe
 
 from helpers.cheetah_cli import (
     collect_namespace_summary_lines,
@@ -124,6 +125,36 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
             "(default: %(default)s). Set to 0 or a negative value to disable trimming."
         ),
     )
+    parser.add_argument(
+        "--cheetah-predict-log",
+        action="store_true",
+        help="After each response, issue a cheetah PREDICT_QUERY using the selected text source.",
+    )
+    parser.add_argument(
+        "--cheetah-predict-table",
+        default="context_matrices",
+        help="Prediction-table name used when --cheetah-predict-log is set (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-predict-key",
+        default="meta:context_dimension_embeddings",
+        help="Prediction-table key used when --cheetah-predict-log is set (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-predict-source",
+        choices=("history", "prompt", "response"),
+        default="history",
+        help=(
+            "Text source converted into context matrices for interactive prediction probes "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-predict-limit",
+        type=int,
+        default=3,
+        help="Maximum prediction entries to log per turn when --cheetah-predict-log is set (default: %(default)s).",
+    )
     return parser
 
 
@@ -188,6 +219,11 @@ class PromptWorker:
         cheetah_summary_depth: int,
         cheetah_summary_branches: int,
         cheetah_system_stats: bool,
+        cheetah_predict_log: bool,
+        cheetah_predict_table: str,
+        cheetah_predict_key: str,
+        cheetah_predict_source: str,
+        cheetah_predict_limit: int,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
         self._requests = self._ctx.Queue()
@@ -209,6 +245,11 @@ class PromptWorker:
                 cheetah_summary_depth,
                 cheetah_summary_branches,
                 cheetah_system_stats,
+                cheetah_predict_log,
+                cheetah_predict_table,
+                cheetah_predict_key,
+                cheetah_predict_source,
+                cheetah_predict_limit,
             ),
         )
         self._process.start()
@@ -221,7 +262,7 @@ class PromptWorker:
         self.context_label = ready.get("context_dimensions")
         self.window_label = ready.get("context_window_embeddings")
 
-    def request(self, prompt: str) -> str:
+    def request(self, prompt: str) -> tuple[str, list[str]]:
         self._next_id += 1
         message_id = self._next_id
         self._requests.put({"type": "prompt", "prompt": prompt, "id": message_id})
@@ -233,7 +274,8 @@ class PromptWorker:
                 raise RuntimeError(msg["error"])
             response = msg.get("response", "")
             self.conversation_id = msg.get("conversation_id", self.conversation_id)
-            return response
+            lines = msg.get("prediction_lines") or []
+            return response, list(lines)
 
     def history(self) -> str:
         self._next_id += 1
@@ -277,6 +319,22 @@ class PromptWorker:
             self._process.kill()
 
 
+def _prediction_text_for_turn(
+    engine: DBSLMEngine,
+    conversation_id: str,
+    prompt: str,
+    response: str,
+    source: str,
+) -> str:
+    mode = (source or "").strip().lower()
+    if mode == "prompt":
+        return prompt
+    if mode == "response":
+        return response
+    history = engine.memory.context_window(conversation_id)
+    return history or ""
+
+
 def _decoder_worker(
     request_q: multiprocessing.Queue,
     response_q: multiprocessing.Queue,
@@ -291,6 +349,11 @@ def _decoder_worker(
     cheetah_summary_depth: int,
     cheetah_summary_branches: int,
     cheetah_system_stats: bool,
+    cheetah_predict_log: bool,
+    cheetah_predict_table: str,
+    cheetah_predict_key: str,
+    cheetah_predict_source: str,
+    cheetah_predict_limit: int,
 ) -> None:
     engine: DBSLMEngine | None = None
     try:
@@ -308,6 +371,21 @@ def _decoder_worker(
             conv_id = engine.start_conversation(user, agent)
         dims_label = format_context_dimensions(engine.context_dimensions)
         window_label = engine.context_windows.describe()
+        prediction_probe: ContextProbabilityProbe | None = None
+        prediction_source = (cheetah_predict_source or "history").strip().lower()
+        if cheetah_predict_log:
+            probe_candidate = ContextProbabilityProbe(
+                engine,
+                table=(cheetah_predict_table or "context_matrices").strip(),
+                key=cheetah_predict_key or "meta:context_dimension_embeddings",
+                max_entries=max(1, int(cheetah_predict_limit or 1)),
+                log_prefix="[run]",
+            )
+            if probe_candidate.available():
+                prediction_probe = probe_candidate
+            else:
+                prediction_source = ""
+        turn_index = 0
         cheetah_lines: list[str] = []
         if cheetah_system_stats:
             cheetah_lines.extend(collect_system_stats_lines(engine.hot_path))
@@ -320,6 +398,16 @@ def _decoder_worker(
                     branch_limit=cheetah_summary_branches,
                 )
             )
+        if cheetah_predict_log:
+            if prediction_probe:
+                cheetah_lines.append(
+                    "cheetah predict enabled: "
+                    f"table={cheetah_predict_table}, key={cheetah_predict_key}, source={prediction_source or 'history'}"
+                )
+            else:
+                cheetah_lines.append(
+                    "cheetah predict probes unavailable: adapter disabled or context windows off."
+                )
         ready_payload = {
             "status": "ready",
             "conversation_id": conv_id,
@@ -341,15 +429,34 @@ def _decoder_worker(
                 msg_id = msg.get("id")
                 try:
                     conv_id, response = issue_prompt(engine, prompt, conv_id)
-                    response_q.put(
-                        {
-                            "type": "response",
-                            "id": msg_id,
-                            "prompt": prompt,
-                            "conversation_id": conv_id,
-                            "response": response,
-                        }
-                    )
+                    prediction_lines: list[str] = []
+                    if prediction_probe and prediction_source:
+                        probe_text = _prediction_text_for_turn(
+                            engine,
+                            conv_id,
+                            prompt,
+                            response,
+                            prediction_source,
+                        )
+                        if probe_text:
+                            turn_index += 1
+                            probe_result = prediction_probe.probe(
+                                f"turn{turn_index}:{prediction_source}",
+                                probe_text,
+                                emit_log=False,
+                            )
+                            if probe_result and probe_result.log_lines:
+                                prediction_lines = [f"[run] {line}" for line in probe_result.log_lines]
+                    payload = {
+                        "type": "response",
+                        "id": msg_id,
+                        "prompt": prompt,
+                        "conversation_id": conv_id,
+                        "response": response,
+                    }
+                    if prediction_lines:
+                        payload["prediction_lines"] = prediction_lines
+                    response_q.put(payload)
                 except Exception as exc:  # pragma: no cover - defensive barrier around child process
                     response_q.put({"type": "response", "id": msg_id, "error": str(exc)})
                 continue
@@ -393,9 +500,11 @@ def respond_once_worker(
         log("[run] Skipping empty prompt.")
         return
     framed_prompt = ensure_response_prompt_tag(framed_prompt, response_label)
-    response = worker.request(framed_prompt)
+    response, prediction_lines = worker.request(framed_prompt)
     log(f"user> {framed_prompt}")
     log(f"assistant> {response_formatter(response)}")
+    for line in prediction_lines:
+        log(line)
 
 
 def interactive_loop(
@@ -453,8 +562,10 @@ def interactive_loop(
             continue
         framed_prompt = ensure_response_prompt_tag(framed_prompt, response_label)
         log(f"user> {framed_prompt}")
-        response = worker.request(framed_prompt)
+        response, prediction_lines = worker.request(framed_prompt)
         log(f"assistant> {response_formatter(response)}")
+        for line in prediction_lines:
+            log(line)
         turns += 1
     log(f"[run] Conversation {worker.conversation_id} closed after {turns} turn(s).")
 
@@ -502,6 +613,11 @@ def main() -> None:
             cheetah_summary_depth=args.cheetah_summary_depth,
             cheetah_summary_branches=args.cheetah_summary_branches,
             cheetah_system_stats=args.cheetah_system_stats,
+            cheetah_predict_log=args.cheetah_predict_log,
+            cheetah_predict_table=args.cheetah_predict_table,
+            cheetah_predict_key=args.cheetah_predict_key,
+            cheetah_predict_source=args.cheetah_predict_source,
+            cheetah_predict_limit=args.cheetah_predict_limit,
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         window_label = worker.window_label or "n/a"

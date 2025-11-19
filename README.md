@@ -387,6 +387,15 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
   shard, e.g. `--cheetah-predict-table ctx_predictions` for custom namespaces.
 - Results are rendered with `helpers.cheetah_cli.format_prediction_query()`, so the log stream lists
   the backend, total hit count, and the top entries (`value_hex -> probability`) for inspection.
+- Supply `--cheetah-eval-predict` during training to stream a prediction query for every evaluation
+  sample. `--cheetah-eval-predict-source dependency` (default) converts the stored dependency layers
+  into probe text, but `prompt`, `response`, `generated`, and `context` sources are also available;
+  use `--cheetah-eval-predict-limit` to control the number of entries logged per sample.
+- `run.py` mirrors the same wiring via `--cheetah-predict-log`. Interactive sessions can now show
+  the prediction-table response derived from the conversation history (`--cheetah-predict-source
+  history`), the user prompt, or the latest assistant response after every turn. The worker process
+  issues the TCP command and streams the formatted lines back to the CLI so single-shot prompts
+  (`--prompt`) and REPL turns share the same context-probability diagnostics.
 - Example (run before ingest to inspect the current context-matrix state):
   ```bash
   python src/train.py datasets/emotion_data.json \
