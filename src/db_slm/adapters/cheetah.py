@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ipaddress
+import json
 import logging
 import os
 import socket
@@ -38,6 +39,7 @@ PAIR_SCAN_MAX_LIMIT = CHEETAH_PAIR_SCAN_MAX_LIMIT
 PAIR_SCAN_MIN_LIMIT = CHEETAH_PAIR_SCAN_MIN_LIMIT
 READLINE_IDLE_GRACE_SECONDS = 30.0
 _REDUCE_LIMIT_CACHE_TTL_SECONDS = 30.0
+_CONTEXT_MATRIX_TABLE = "context_matrices"
 
 
 def _detect_wsl() -> bool:
@@ -259,6 +261,55 @@ class CheetahClient:
                     removed = None
                 break
         return removed, response
+
+    def predict_set(
+        self,
+        key: bytes,
+        value: bytes,
+        *,
+        probability: float = 0.5,
+        table: str | None = None,
+        weights: Sequence[dict[str, object]] | None = None,
+    ) -> tuple[bool, str | None]:
+        prob = max(0.0, min(1.0, float(probability)))
+        args = [
+            f"key=x{key.hex()}",
+            f"value=x{value.hex()}",
+            f"prob={prob}",
+        ]
+        if table:
+            args.append(f"table={table}")
+        if weights:
+            encoded = base64.b64encode(
+                json.dumps(weights, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            args.append(f"weights={encoded}")
+        response = self._command(f"PREDICT_SET {' '.join(args)}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
+    def predict_ctx(
+        self,
+        key: bytes,
+        ctx_matrix: Sequence[Sequence[float]],
+        *,
+        table: str | None = None,
+        mode: str | None = None,
+        strength: float | None = None,
+    ) -> tuple[bool, str | None]:
+        if not ctx_matrix:
+            return True, "SKIP"
+        matrix_payload = base64.b64encode(
+            json.dumps(ctx_matrix, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        args = [f"key=x{key.hex()}", f"ctx={matrix_payload}"]
+        if mode:
+            args.append(f"mode={mode}")
+        if strength is not None:
+            args.append(f"strength={strength}")
+        if table:
+            args.append(f"table={table}")
+        response = self._command(f"PREDICT_CTX {' '.join(args)}")
+        return (response is not None and response.startswith("SUCCESS")), response
 
     def pair_summary(
         self,
@@ -1120,6 +1171,47 @@ class CheetahHotPathAdapter(HotPathAdapter):
                         )
                         raise CheetahError("failed to edit metadata payload")
                     self._register_pair(namespace, replacement_key, raw_value=raw_value)
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def refresh_context_predictions(
+        self,
+        metadata_key: str,
+        matrix: Sequence[Sequence[float]],
+        payload: str,
+    ) -> None:
+        if not self._enabled or not matrix:
+            return
+        raw_key = f"meta:{metadata_key}".encode("utf-8")
+        table_name = _CONTEXT_MATRIX_TABLE
+        try:
+            success, response = self._client.predict_set(
+                raw_key,
+                payload.encode("utf-8"),
+                probability=1.0,
+                table=table_name,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_set failed for metadata key=%s response=%s",
+                    metadata_key,
+                    response,
+                )
+                raise CheetahError("failed to upsert context prediction entry")
+            success, response = self._client.predict_ctx(
+                raw_key,
+                matrix,
+                table=table_name,
+                mode="bias",
+                strength=1.0,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_ctx failed for metadata key=%s response=%s",
+                    metadata_key,
+                    response,
+                )
+                raise CheetahError("failed to refresh context matrix weights")
         except CheetahError as exc:
             self._disable(exc)
 

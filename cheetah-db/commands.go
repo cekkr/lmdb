@@ -16,27 +16,35 @@ const maxValueSize = int(^uint32(0))
 // --- Metodi CRUD per Database ---
 
 func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
+	key, errStr, err := db.persistPayload(value, specifiedSize)
+	if errStr != "" {
+		return errStr, err
+	}
+	return fmt.Sprintf("SUCCESS,key=%d", key), nil
+}
+
+func (db *Database) persistPayload(value []byte, specifiedSize int) (uint64, string, error) {
 	valueSize := len(value)
 	if specifiedSize > 0 && valueSize != specifiedSize {
-		return fmt.Sprintf("ERROR,value_size_mismatch (expected %d, got %d)", specifiedSize, valueSize), nil
+		return 0, fmt.Sprintf("ERROR,value_size_mismatch (expected %d, got %d)", specifiedSize, valueSize), nil
 	}
 	if valueSize <= 0 || valueSize > maxValueSize {
-		return "ERROR,invalid_value_size", nil
+		return 0, "ERROR,invalid_value_size", nil
 	}
 
 	sizeField := uint32(valueSize)
 	location, err := db.getAvailableLocation(sizeField)
 	if err != nil {
-		return "ERROR,cannot_get_value_location", err
+		return 0, "ERROR,cannot_get_value_location", err
 	}
 
 	vTable, err := db.getValuesTable(sizeField, location.TableID)
 	if err != nil {
-		return "ERROR,cannot_load_values_table", err
+		return 0, "ERROR,cannot_load_values_table", err
 	}
 	offset := int64(location.EntryID) * int64(sizeField)
 	if _, err := vTable.WriteAt(value, offset); err != nil {
-		return "ERROR,value_write_failed", err
+		return 0, "ERROR,value_write_failed", err
 	}
 	db.cachePayload(sizeField, location, value)
 
@@ -46,11 +54,11 @@ func (db *Database) Insert(value []byte, specifiedSize int) (string, error) {
 	copy(entry[ValueSizeBytes:], location.Encode())
 
 	if err := db.mainKeys.WriteEntry(newKey, entry); err != nil {
-		db.highestKey.Add(^uint64(0)) // Rollback del contatore in caso di errore
-		return "ERROR,key_write_failed", err
+		db.highestKey.Add(^uint64(0))
+		return 0, "ERROR,key_write_failed", err
 	}
 
-	return fmt.Sprintf("SUCCESS,key=%d", newKey), nil
+	return newKey, "", nil
 }
 
 func (db *Database) Read(key uint64) (string, error) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -125,6 +126,47 @@ func (p *PredictionTable) ensureEntry(key string) *PredictionEntry {
 		p.entries[key] = entry
 	}
 	return entry
+}
+
+func (p *PredictionTable) ExportEntriesWithPrefix(prefix []byte) []PredictionEntry {
+	if len(prefix) == 0 {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	entries := make([]PredictionEntry, 0)
+	for _, entry := range p.entries {
+		keyBytes, err := base64.StdEncoding.DecodeString(entry.Key)
+		if err != nil {
+			continue
+		}
+		if !bytes.HasPrefix(keyBytes, prefix) {
+			continue
+		}
+		cloned := clonePredictionEntry(entry)
+		if cloned == nil {
+			continue
+		}
+		entries = append(entries, *cloned)
+	}
+	return entries
+}
+
+func (p *PredictionTable) ImportEntries(entries []PredictionEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, entry := range entries {
+		if entry.Key == "" {
+			continue
+		}
+		cloned := clonePredictionEntry(&entry)
+		cloned.UpdatedAt = time.Now().UTC()
+		p.entries[cloned.Key] = cloned
+	}
+	return p.persistLocked()
 }
 
 func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float64, weights []ContextWeight) (PredictionEntry, error) {
@@ -328,6 +370,44 @@ func clampProbability(value float64) float64 {
 
 func encodeKey(key []byte) string {
 	return base64.StdEncoding.EncodeToString(key)
+}
+
+func clonePredictionEntry(entry *PredictionEntry) *PredictionEntry {
+	if entry == nil {
+		return nil
+	}
+	cloned := &PredictionEntry{
+		Key:       entry.Key,
+		UpdatedAt: entry.UpdatedAt,
+	}
+	if len(entry.WindowHints) > 0 {
+		cloned.WindowHints = make([][]float64, len(entry.WindowHints))
+		for i, row := range entry.WindowHints {
+			cloned.WindowHints[i] = append([]float64(nil), row...)
+		}
+	}
+	if len(entry.Values) > 0 {
+		cloned.Values = make([]PredictionValue, len(entry.Values))
+		for i, value := range entry.Values {
+			cloned.Values[i] = PredictionValue{
+				Value:            value.Value,
+				BaseProbability:  value.BaseProbability,
+				LastUpdatedEpoch: value.LastUpdatedEpoch,
+			}
+			if len(value.ContextWeights) > 0 {
+				weights := make([]ContextWeight, len(value.ContextWeights))
+				for j, weight := range value.ContextWeights {
+					weights[j] = ContextWeight{
+						Depth:  weight.Depth,
+						Bias:   weight.Bias,
+						Vector: append([]float64(nil), weight.Vector...),
+					}
+				}
+				cloned.Values[i].ContextWeights = weights
+			}
+		}
+	}
+	return cloned
 }
 
 // ProbabilityMerger merges probability vectors coming from different windows.

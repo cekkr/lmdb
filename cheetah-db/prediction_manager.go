@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -40,6 +42,7 @@ func (pm *PredictionManager) sanitizeTableName(raw string) string {
 func (pm *PredictionManager) Get(table string) (*PredictionTable, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	pm.ensureTablesLocked()
 	if pm.tables == nil {
 		pm.tables = make(map[string]*PredictionTable)
 	}
@@ -65,4 +68,48 @@ func (pm *PredictionManager) Close() {
 		}
 	}
 	pm.tables = nil
+}
+
+func (pm *PredictionManager) ListTables() map[string]*PredictionTable {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.ensureTablesLocked()
+	result := make(map[string]*PredictionTable, len(pm.tables))
+	for name, table := range pm.tables {
+		result[name] = table
+	}
+	return result
+}
+
+func (pm *PredictionManager) ensureTablesLocked() {
+	if pm.tables == nil {
+		pm.tables = make(map[string]*PredictionTable)
+	}
+	entries, err := os.ReadDir(pm.basePath)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "prediction_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		base := strings.TrimSuffix(strings.TrimPrefix(name, "prediction_"), ".json")
+		if base == "" {
+			continue
+		}
+		if _, ok := pm.tables[base]; ok {
+			continue
+		}
+		path := filepath.Join(pm.basePath, name)
+		table, err := newPredictionTable(path, base)
+		if err != nil {
+			logErrorf("failed loading prediction table %s: %v", base, err)
+			continue
+		}
+		pm.tables[base] = table
+	}
 }

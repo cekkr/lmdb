@@ -46,6 +46,7 @@ type ForkScheduler struct {
 	ring        []ringNode
 	stats       map[string]uint64
 	overrides   map[string]string
+	samples     map[string][]byte
 }
 
 func newForkScheduler(dbPath string) *ForkScheduler {
@@ -58,6 +59,7 @@ func newForkScheduler(dbPath string) *ForkScheduler {
 		},
 		stats:     make(map[string]uint64),
 		overrides: make(map[string]string),
+		samples:   make(map[string][]byte),
 	}
 	_ = fs.load()
 	fs.rebuildRingLocked()
@@ -84,6 +86,9 @@ func (fs *ForkScheduler) load() error {
 	fs.topology = topo
 	if fs.overrides == nil {
 		fs.overrides = make(map[string]string)
+	}
+	if fs.samples == nil {
+		fs.samples = make(map[string][]byte)
 	}
 	fs.rebuildRingLocked()
 	return nil
@@ -150,6 +155,9 @@ func (fs *ForkScheduler) AssignFork(prefix []byte) ForkAssignment {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	forkID := deriveForkID(prefix)
+	if len(prefix) > 0 {
+		fs.samples[forkID] = append([]byte{}, prefix...)
+	}
 	nodes := fs.walkRingLocked(prefix, fs.topology.ReplicationFactor)
 	if target, ok := fs.overrides[forkID]; ok && target != "" {
 		nodes = []string{target}
@@ -228,6 +236,7 @@ func (fs *ForkScheduler) ForceAssignment(forkID, nodeID string) error {
 	defer fs.mu.Unlock()
 	if nodeID == "" {
 		delete(fs.overrides, forkID)
+		delete(fs.samples, forkID)
 		return nil
 	}
 	if !fs.nodeExistsLocked(nodeID) {
@@ -242,5 +251,22 @@ func (fs *ForkScheduler) ForceAssignment(forkID, nodeID string) error {
 
 func (fs *ForkScheduler) ForceAssignmentForPrefix(prefix []byte, nodeID string) (string, error) {
 	forkID := deriveForkID(prefix)
+	if len(prefix) > 0 {
+		fs.mu.Lock()
+		if fs.samples == nil {
+			fs.samples = make(map[string][]byte)
+		}
+		fs.samples[forkID] = append([]byte{}, prefix...)
+		fs.mu.Unlock()
+	}
 	return forkID, fs.ForceAssignment(forkID, nodeID)
+}
+
+func (fs *ForkScheduler) ObservedPrefix(forkID string) []byte {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	if prefix, ok := fs.samples[forkID]; ok && len(prefix) > 0 {
+		return append([]byte{}, prefix...)
+	}
+	return nil
 }

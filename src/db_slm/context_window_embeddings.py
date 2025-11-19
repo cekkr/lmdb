@@ -382,6 +382,21 @@ class ContextWindowEmbeddingManager:
         writer = getattr(self.hot_path, "write_metadata", None)
         if callable(writer):
             writer(self._METADATA_KEY, serialized)
+        updater = getattr(self.hot_path, "refresh_context_predictions", None)
+        if callable(updater):
+            matrix = [
+                list(proto.vector)
+                for proto in self._prototypes
+                if proto.count > 0 and proto.vector
+            ]
+            if matrix:
+                try:
+                    updater(self._METADATA_KEY, matrix, serialized)
+                except Exception as exc:
+                    log_verbose(
+                        2,
+                        f"[context-dim] Unable to refresh prediction tables: {exc}",
+                    )
         self._dirty = False
 
     def describe(self) -> str | None:

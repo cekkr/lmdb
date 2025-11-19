@@ -13,11 +13,13 @@ import (
 )
 
 type clusterMessage struct {
-	Kind      string `json:"kind"`
-	NodeID    string `json:"node_id"`
-	ForkID    string `json:"fork_id,omitempty"`
-	TargetID  string `json:"target_id,omitempty"`
-	Timestamp int64  `json:"timestamp"`
+	Kind      string               `json:"kind"`
+	NodeID    string               `json:"node_id"`
+	ForkID    string               `json:"fork_id,omitempty"`
+	TargetID  string               `json:"target_id,omitempty"`
+	SourceID  string               `json:"source_id,omitempty"`
+	Timestamp int64                `json:"timestamp"`
+	Payload   *forkTransferPayload `json:"payload,omitempty"`
 }
 
 type ClusterMessenger struct {
@@ -65,7 +67,7 @@ func (cm *ClusterMessenger) UpdateTopology(topo ClusterTopology) {
 	cm.startHeartbeatLocked()
 }
 
-func (cm *ClusterMessenger) NotifyForkMove(forkID, nodeID string) {
+func (cm *ClusterMessenger) NotifyForkMove(forkID, nodeID string, payload *forkTransferPayload) {
 	cm.mu.Lock()
 	peers := make([]ClusterNode, 0, len(cm.peers))
 	for _, node := range cm.peers {
@@ -77,6 +79,8 @@ func (cm *ClusterMessenger) NotifyForkMove(forkID, nodeID string) {
 		NodeID:    nodeID,
 		ForkID:    forkID,
 		Timestamp: time.Now().Unix(),
+		SourceID:  cm.localID,
+		Payload:   payload,
 	}
 	for _, peer := range peers {
 		go cm.sendMessage(peer, msg)

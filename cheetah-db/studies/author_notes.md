@@ -16,3 +16,6 @@ In case of prediction table, a value of a key, instead of referencing to a value
 It's important that results are stored by their values to not be too dispersive, these value contains every "weights dependency", where in a very similar and recursive way in its algorithm, weights that alters prediction probabilities are altered also by the current series of bytes that gave these results, and probably in some case also the other related results. 
 
 Remember a standolone implementation, but while studying new ideal Cheetah's algorithms, tables, query commands etc, take as reference main project for further implementation of new cheetah's features in it.
+
+### Last things
+- Implement in lmdb python code src/ the new Cheetah DB's prediction-tables and context-matrix features and queries 

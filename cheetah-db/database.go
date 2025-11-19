@@ -115,6 +115,17 @@ type PairReduceResult struct {
 	Payload []byte
 }
 
+type forkTriePayload struct {
+	Path    string `json:"path"`
+	Payload string `json:"payload"`
+}
+
+type forkTransferPayload struct {
+	Prefix      string                       `json:"prefix,omitempty"`
+	Entries     []forkTriePayload            `json:"entries,omitempty"`
+	Predictions map[string][]PredictionEntry `json:"predictions,omitempty"`
+}
+
 const (
 	pairEntryKeyOffset   = 1
 	pairEntryChildOffset = pairEntryKeyOffset + PairEntryKeySize
@@ -2011,6 +2022,17 @@ func (db *Database) readValuePayload(key uint64) ([]byte, error) {
 	return payload, nil
 }
 
+func (db *Database) insertPayloadBytes(value []byte) (uint64, error) {
+	key, errStr, err := db.persistPayload(value, 0)
+	if err != nil {
+		return 0, err
+	}
+	if errStr != "" {
+		return 0, errors.New(errStr)
+	}
+	return key, nil
+}
+
 func (db *Database) readValueSizeForKey(key uint64) (uint32, error) {
 	entry, err := db.mainKeys.ReadEntry(key)
 	if err != nil {
@@ -2533,23 +2555,29 @@ func (db *Database) handleClusterMove(args string) (string, error) {
 	if nodeID == "" {
 		return "ERROR,cluster_move_requires_node", nil
 	}
+	var prefix []byte
+	if raw := params["prefix"]; raw != "" && raw != "*" {
+		value, err := parseValue(raw)
+		if err != nil {
+			return err.Error(), nil
+		}
+		prefix = value
+	}
 	forkID := strings.TrimSpace(params["fork"])
 	if forkID == "" {
-		var prefix []byte
-		if raw := params["prefix"]; raw != "" && raw != "*" {
-			value, err := parseValue(raw)
-			if err != nil {
-				return err.Error(), nil
-			}
-			prefix = value
-		}
 		forkID = deriveForkID(prefix)
+	} else if len(prefix) == 0 {
+		prefix = db.forkScheduler.ObservedPrefix(forkID)
 	}
 	if err := db.forkScheduler.ForceAssignment(forkID, nodeID); err != nil {
 		return fmt.Sprintf("ERROR,%v", err), nil
 	}
 	if db.clusterMessenger != nil {
-		db.clusterMessenger.NotifyForkMove(forkID, nodeID)
+		var transfer *forkTransferPayload
+		if len(prefix) > 0 {
+			transfer = db.buildForkTransferPayload(prefix)
+		}
+		db.clusterMessenger.NotifyForkMove(forkID, nodeID, transfer)
 	}
 	return fmt.Sprintf("SUCCESS,fork_id=%s,node=%s", forkID, nodeID), nil
 }
@@ -2572,6 +2600,12 @@ func (db *Database) handleClusterGossip(args string) (string, error) {
 	case "fork_move":
 		if msg.ForkID != "" && msg.NodeID != "" && db.forkScheduler != nil {
 			if err := db.forkScheduler.ForceAssignment(msg.ForkID, msg.NodeID); err != nil {
+				return fmt.Sprintf("ERROR,%v", err), nil
+			}
+		}
+		localID := db.localNodeID()
+		if msg.Payload != nil && msg.NodeID == localID {
+			if err := db.applyForkTransferPayload(msg.Payload); err != nil {
 				return fmt.Sprintf("ERROR,%v", err), nil
 			}
 		}
@@ -2598,6 +2632,19 @@ func (db *Database) observeFork(prefix []byte) {
 		return
 	}
 	db.forkScheduler.AssignFork(prefix)
+}
+
+func (db *Database) localNodeID() string {
+	if db.clusterMessenger != nil {
+		return db.clusterMessenger.LocalID()
+	}
+	if env := strings.TrimSpace(os.Getenv("CHEETAH_NODE_ID")); env != "" {
+		return env
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return "local"
 }
 
 func parseKeyList(raw string) ([][]byte, error) {
@@ -2656,6 +2703,121 @@ func (db *Database) evaluateMultiKeyPredictions(
 		return nil, nil
 	}
 	return mergePredictionResultSets(resultSets, mergeMode), nil
+}
+
+func (db *Database) buildForkTransferPayload(prefix []byte) *forkTransferPayload {
+	if len(prefix) == 0 {
+		return nil
+	}
+	entries, err := db.collectForkTrieEntries(prefix)
+	if err != nil {
+		logErrorf("fork payload scan %x failed: %v", prefix, err)
+	}
+	predictions := db.collectPredictionForkEntries(prefix)
+	if len(entries) == 0 && len(predictions) == 0 {
+		return nil
+	}
+	payload := &forkTransferPayload{
+		Prefix: base64.StdEncoding.EncodeToString(prefix),
+	}
+	if len(entries) > 0 {
+		payload.Entries = entries
+	}
+	if len(predictions) > 0 {
+		payload.Predictions = predictions
+	}
+	return payload
+}
+
+func (db *Database) collectForkTrieEntries(prefix []byte) ([]forkTriePayload, error) {
+	limit := pairScanMaxLimit
+	var cursor []byte
+	entries := make([]forkTriePayload, 0)
+	for {
+		results, nextCursor, err := db.PairScan(prefix, limit, cursor)
+		if err != nil {
+			return entries, err
+		}
+		if len(results) == 0 {
+			break
+		}
+		for _, res := range results {
+			payload, err := db.readValuePayload(res.Key)
+			if err != nil {
+				return entries, err
+			}
+			entries = append(entries, forkTriePayload{
+				Path:    base64.StdEncoding.EncodeToString(res.Value),
+				Payload: base64.StdEncoding.EncodeToString(payload),
+			})
+		}
+		if len(nextCursor) == 0 || len(results) < limit {
+			break
+		}
+		cursor = nextCursor
+	}
+	return entries, nil
+}
+
+func (db *Database) collectPredictionForkEntries(prefix []byte) map[string][]PredictionEntry {
+	result := make(map[string][]PredictionEntry)
+	if db.predictStore == nil || len(prefix) == 0 {
+		return result
+	}
+	tables := db.predictStore.ListTables()
+	for name, table := range tables {
+		if table == nil {
+			continue
+		}
+		entries := table.ExportEntriesWithPrefix(prefix)
+		if len(entries) == 0 {
+			continue
+		}
+		result[name] = entries
+	}
+	return result
+}
+
+func (db *Database) applyForkTransferPayload(payload *forkTransferPayload) error {
+	if payload == nil {
+		return nil
+	}
+	for _, entry := range payload.Entries {
+		pathBytes, err := base64.StdEncoding.DecodeString(entry.Path)
+		if err != nil || len(pathBytes) == 0 {
+			continue
+		}
+		if _, err := db.getPairValue(pathBytes); err == nil {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(entry.Payload)
+		if err != nil {
+			return err
+		}
+		key, err := db.insertPayloadBytes(data)
+		if err != nil {
+			return err
+		}
+		if err := db.setPairValue(pathBytes, key); err != nil {
+			return err
+		}
+	}
+	if payload.Predictions == nil || db.predictStore == nil {
+		return nil
+	}
+	for name, entries := range payload.Predictions {
+		if len(entries) == 0 {
+			continue
+		}
+		table, err := db.predictStore.Get(name)
+		if err != nil {
+			return err
+		}
+		if err := table.ImportEntries(entries); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func summarizeArg(arg string) string {
