@@ -212,3 +212,4 @@ __marimo__/
 .DS_Store
 /cheetah_data
 cheetah-db/cheetah-server-linux
+cheetah-db/config.ini
