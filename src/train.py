@@ -270,6 +270,45 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Prediction-table key used by --cheetah-context-probe (default: %(default)s).",
     )
     parser.add_argument(
+        "--disable-cheetah-token-train",
+        action="store_true",
+        help="Skip training cheetah prediction tables during ingest (default: enabled when cheetah hot-path is active).",
+    )
+    parser.add_argument(
+        "--cheetah-token-table",
+        default="token_predictions",
+        help="Prediction table used for token-level training/inference (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-key",
+        default="meta:token_predictions",
+        help="Prediction key used for token-level training/inference (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-max-tokens",
+        type=int,
+        default=24,
+        help="Maximum number of response tokens mirrored into cheetah prediction training per sample (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-learning-rate",
+        type=float,
+        default=0.05,
+        help="Learning rate applied to cheetah PREDICT_TRAIN updates (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-value-cap",
+        type=int,
+        default=8192,
+        help="Maximum number of unique token entries to seed inside the cheetah prediction table during a run (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-weight",
+        type=float,
+        default=0.25,
+        help="Blending weight applied to cheetah prediction outputs during decoding (default: %(default)s).",
+    )
+    parser.add_argument(
         "--cheetah-eval-predict",
         action="store_true",
         help=(
@@ -642,6 +681,116 @@ def _build_eval_prediction_probe(
     return probe, source or "dependency"
 
 
+def _prediction_dependency_summary(layer: DependencyLayer | None, limit: int = 32) -> str:
+    if not layer:
+        return ""
+    parts: list[str] = []
+    for arc in layer.arcs[:limit]:
+        lemma = (arc.lemma or arc.token or "").strip()
+        head = (arc.head or "ROOT").strip()
+        dep = (arc.dep or "").strip()
+        if not lemma:
+            continue
+        parts.append(f"{lemma}->{head}/{dep}")
+    if layer.strong_token_groups:
+        grouped = []
+        for bucket, tokens in layer.strong_token_groups.items():
+            bucket_tokens = " ".join(tokens[:4])
+            if bucket_tokens:
+                grouped.append(f"{bucket}:{bucket_tokens}")
+        if grouped:
+            parts.append(" ".join(grouped))
+    return " ".join(parts)
+
+
+def _prediction_context_text(record: EvaluationRecord) -> str:
+    segments: list[str] = []
+    prompt = (record.prompt or "").strip()
+    if prompt:
+        segments.append(prompt)
+    if record.context_tokens:
+        ctx_line = " ".join(f"{key}:{value}" for key, value in record.context_tokens.items())
+        if ctx_line:
+            segments.append(ctx_line)
+    prompt_summary = _prediction_dependency_summary(record.prompt_dependencies)
+    if prompt_summary:
+        segments.append(prompt_summary)
+    return "\n".join(segment for segment in segments if segment).strip()
+
+
+def _encode_prediction_token(token_id: int) -> bytes:
+    return token_id.to_bytes(4, "big", signed=False)
+
+
+def _train_prediction_tables(
+    engine: DBSLMEngine,
+    records: Sequence[EvaluationRecord] | None,
+    args: argparse.Namespace,
+) -> None:
+    if not records or getattr(args, "disable_cheetah_token_train", False):
+        return
+    predict_train = getattr(engine.hot_path, "predict_train", None)
+    predict_set = getattr(engine.hot_path, "predict_set", None)
+    if (
+        not callable(predict_train)
+        or not callable(predict_set)
+        or isinstance(engine.hot_path, NullHotPathAdapter)
+    ):
+        return
+    if not engine.context_windows.enabled():
+        return
+    table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
+    key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
+    if not table or not key_label:
+        return
+    key_bytes = key_label.encode("utf-8")
+    max_tokens = max(1, int(getattr(args, "cheetah_token_max_tokens", 24)))
+    learning_rate = float(getattr(args, "cheetah_token_learning_rate", 0.05))
+    if learning_rate <= 0:
+        learning_rate = 0.01
+    value_cap = max(1, int(getattr(args, "cheetah_token_value_cap", 8192)))
+    seeded_tokens: set[int] = getattr(engine, "_prediction_seeded_tokens", set())
+    updates = 0
+    for record in records:
+        context_text = _prediction_context_text(record)
+        if not context_text:
+            continue
+        matrix = engine.context_windows.context_matrix_for_text(context_text)
+        if not matrix:
+            continue
+        token_ids = engine.tokenizer.encode(record.response or "", add_special_tokens=False)
+        if not token_ids:
+            continue
+        limit = min(max_tokens, len(token_ids))
+        for token_id in token_ids[:limit]:
+            value_bytes = _encode_prediction_token(token_id)
+            if token_id not in seeded_tokens:
+                if len(seeded_tokens) >= value_cap:
+                    continue
+                if not predict_set(
+                    key=key_bytes,
+                    value=value_bytes,
+                    probability=0.05,
+                    table=table,
+                ):
+                    continue
+                seeded_tokens.add(token_id)
+            success = predict_train(
+                key=key_bytes,
+                target=value_bytes,
+                context_matrix=matrix,
+                learning_rate=learning_rate,
+                table=table,
+            )
+            if success:
+                updates += 1
+    if updates:
+        setattr(engine, "_prediction_seeded_tokens", seeded_tokens)
+        log(
+            f"[train] cheetah prediction training: applied {updates} update(s) to table '{table}'."
+        )
+
+
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
     if raw is None or not raw.strip():
         base = Path("var/eval_logs")
@@ -746,6 +895,7 @@ class CorpusChunk:
     eval_records: list[EvaluationRecord]
     total_rows: int
     train_rows: int
+    prediction_records: list[EvaluationRecord] | None = None
 
 
 class TrainingProgressPrinter:
@@ -1137,7 +1287,15 @@ def _build_chunk(
     train_text = "\n\n".join(train_segments)
     total_rows = len(entries) or 1
     train_rows = len(train_segments) or 1
-    return CorpusChunk(label, train_text, holdout_records, total_rows=total_rows, train_rows=train_rows)
+    prediction_records = [record for _, record in entries]
+    return CorpusChunk(
+        label,
+        train_text,
+        holdout_records,
+        total_rows=total_rows,
+        train_rows=train_rows,
+        prediction_records=prediction_records,
+    )
 
 
 def _sample_holdouts(total_entries: int, fraction: float) -> set[int]:
@@ -1456,6 +1614,9 @@ def main() -> None:
         ngram_order=args.ngram_order,
         context_dimensions=context_dimensions,
         settings=settings,
+        prediction_table=args.cheetah_token_table,
+        prediction_key=args.cheetah_token_key,
+        prediction_weight=args.cheetah_token_weight,
     )
     cheetah_primary = settings.backend == "cheetah-db" and not settings.cheetah_mirror
     if cheetah_primary and isinstance(engine.hot_path, NullHotPathAdapter):
@@ -1677,6 +1838,8 @@ def main() -> None:
                     prediction_source=eval_prediction_source,
                 )
                 monitor.refresh_dataset(chunk.eval_records)
+            if chunk.prediction_records:
+                _train_prediction_tables(engine, chunk.prediction_records, args)
         if processed_corpora == 0:
             parser.error("No readable corpora found in the provided inputs")
 

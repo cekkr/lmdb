@@ -106,6 +106,28 @@ class HotPathAdapter(Protocol):
     ) -> PredictionQueryResult | None:
         """Query cheetah prediction tables (PREDICT_QUERY)."""
 
+    def predict_set(
+        self,
+        *,
+        key: bytes | str,
+        value: bytes | str,
+        probability: float = 0.5,
+        table: str | None = None,
+        weights: Sequence[dict[str, object]] | None = None,
+    ) -> bool:
+        """Seed or update a prediction entry (PREDICT_SET)."""
+
+    def predict_train(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        context_matrix: Sequence[Sequence[float]] | None,
+        learning_rate: float = 0.01,
+        table: str | None = None,
+    ) -> bool:
+        """Adjust prediction weights using the provided context matrix (PREDICT_TRAIN)."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -199,6 +221,28 @@ class NullHotPathAdapter:
         table: str | None = None,
     ) -> PredictionQueryResult | None:
         return None
+
+    def predict_set(
+        self,
+        *,
+        key: bytes | str,
+        value: bytes | str,
+        probability: float = 0.5,
+        table: str | None = None,
+        weights: Sequence[dict[str, object]] | None = None,
+    ) -> bool:
+        return False
+
+    def predict_train(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        context_matrix: Sequence[Sequence[float]] | None,
+        learning_rate: float = 0.01,
+        table: str | None = None,
+    ) -> bool:
+        return False
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

@@ -186,6 +186,13 @@ automatically normalizes outputs.
   snippet (respecting `--context-dimensions`) and issues `PREDICT_QUERY` against the selected table
   (defaults to `context_matrices` / `meta:context_dimension_embeddings`). Probe results are logged
   before ingest begins, giving a quick snapshot of the active context-matrix weights.
+- Training now streams structured prompts into `token_predictions`. As each JSON record is staged we
+  assemble the dependency summary, derive a context matrix, `PREDICT_SET` the next-token entry (4-byte
+  ID payloads), and `PREDICT_TRAIN` the corresponding weights. `--cheetah-token-*` knobs gate the
+  learning rate, cap, and table/key; `--disable-cheetah-token-train` skips the cycle entirely.
+- `Decoder` and `run.py` blend those predictions back into sampling. Every response computes a
+  matrix from the current conversation history, `PREDICT_QUERY` hits the configured table/key, and
+  the resulting probabilities mix into the Level 1 distribution using `--cheetah-token-weight`.
 - Evaluation probes can now stream these prediction queries automatically. Pass
   `--cheetah-eval-predict` to `train.py` and every held-out sample (token thresholds + chunk holdouts)
   will derive a context matrix from the configured source (`dependency`, `prompt`, `response`,

@@ -387,6 +387,16 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
   shard, e.g. `--cheetah-predict-table ctx_predictions` for custom namespaces.
 - Results are rendered with `helpers.cheetah_cli.format_prediction_query()`, so the log stream lists
   the backend, total hit count, and the top entries (`value_hex -> probability`) for inspection.
+- Trainers now mirror prompt/response pairs into cheetah prediction tables in real time. JSON
+  datasets feed the prompt text + dependency summaries through the context-window embedder, seed the
+  next-token entry with `PREDICT_SET`, and update weights via `PREDICT_TRAIN`. Tune the behavior with
+  `--cheetah-token-table`, `--cheetah-token-key`, `--cheetah-token-max-tokens`,
+  `--cheetah-token-learning-rate`, and `--cheetah-token-value-cap`, or opt out entirely with
+  `--disable-cheetah-token-train`.
+- Decoding blends those predictions back into sampling. `train.py` probes and `run.py` both honor
+  `--cheetah-token-table` / `--cheetah-token-key` and mix the cheetah probabilities using
+  `--cheetah-token-weight` (defaults to `0.25`). This keeps next-token hints synchronized between
+  training, evaluation, and the interactive REPL without extra wiring.
 - Supply `--cheetah-eval-predict` during training to stream a prediction query for every evaluation
   sample. `--cheetah-eval-predict-source dependency` (default) converts the stored dependency layers
   into probe text, but `prompt`, `response`, `generated`, and `context` sources are also available;

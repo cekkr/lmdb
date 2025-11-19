@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Optional
 import random
 
 from .db import DatabaseEnvironment
 from .context_dimensions import ContextDimension, ContextDimensionTracker
 from .level1 import LogProbQuantizer, NGramStore, TokenCandidate, Tokenizer
 from .level2 import BiasEngine, SessionCache
+from .adapters.base import HotPathAdapter
 
 
 @dataclass
@@ -31,6 +32,10 @@ class Decoder:
         bias: BiasEngine,
         *,
         context_dimensions: Sequence[ContextDimension] | None = None,
+        hot_path: HotPathAdapter | None = None,
+        prediction_table: str | None = None,
+        prediction_key: str | None = None,
+        prediction_weight: float = 0.0,
     ) -> None:
         self.db = db
         self.store = store
@@ -39,6 +44,10 @@ class Decoder:
         self.cache = cache
         self.bias = bias
         self.context_dimensions = list(context_dimensions or [])
+        self.hot_path = hot_path
+        self.prediction_table = (prediction_table or "").strip()
+        self.prediction_key = (prediction_key or "").strip()
+        self.prediction_weight = max(0.0, min(1.0, float(prediction_weight or 0.0)))
 
     def decode(
         self,
@@ -51,6 +60,7 @@ class Decoder:
         dimension_weights: Sequence[float] | None = None,
         banned_token_ids: Sequence[int] | None = None,
         commit_cache: bool = True,
+        prediction_matrix: Sequence[Sequence[float]] | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
@@ -66,6 +76,7 @@ class Decoder:
                 list(context_ids),
                 dimension_weights=dimension_weights,
             )
+        prediction_bias = self._prediction_distribution(prediction_matrix)
         for _ in range(config.max_tokens):
             order = min(self.store.order, len(context_ids) + 1)
             candidates = self._resolve_candidates(context_ids, order, profile["topk"])
@@ -82,6 +93,7 @@ class Decoder:
                 config,
                 context_snippet,
                 dimension_tracker,
+                prediction_bias,
             )
             if not adjusted:
                 break
@@ -109,6 +121,7 @@ class Decoder:
         config: DecoderConfig,
         context_snippet: str,
         dimension_tracker: ContextDimensionTracker | None,
+        prediction_bias: Optional[Dict[int, float]],
     ) -> Dict[int, float]:
         base: Dict[int, float] = {}
         bias_map = self.bias.lookup(conversation_id, context_snippet)
@@ -155,7 +168,7 @@ class Decoder:
             return {}
         for token_id in list(base.keys()):
             base[token_id] = base[token_id] / total
-        return base
+        return self._apply_prediction_bias(base, prediction_bias)
 
     def _resolve_candidates(
         self,
@@ -199,6 +212,68 @@ class Decoder:
             if running >= choice:
                 return token_id
         return cutoff_items[-1][0]
+
+    def _prediction_distribution(
+        self,
+        prediction_matrix: Sequence[Sequence[float]] | None,
+    ) -> Optional[Dict[int, float]]:
+        if (
+            prediction_matrix is None
+            or not prediction_matrix
+            or not self.hot_path
+            or not self.prediction_key
+            or not self.prediction_table
+            or self.prediction_weight <= 0.0
+        ):
+            return None
+        result = self.hot_path.predict_query(
+            key=self.prediction_key,
+            context_matrix=prediction_matrix,
+            table=self.prediction_table,
+        )
+        if result is None or not result.entries:
+            return None
+        distribution: Dict[int, float] = {}
+        total = 0.0
+        for entry in result.entries:
+            token_id = self._decode_prediction_token(entry.value)
+            if token_id is None:
+                continue
+            prob = max(0.0, float(entry.probability))
+            distribution[token_id] = prob
+            total += prob
+        if total <= 0.0 or not distribution:
+            return None
+        for token_id in list(distribution.keys()):
+            distribution[token_id] = distribution[token_id] / total
+        return distribution
+
+    def _apply_prediction_bias(
+        self,
+        base: Dict[int, float],
+        prediction_bias: Optional[Dict[int, float]],
+    ) -> Dict[int, float]:
+        if not prediction_bias or self.prediction_weight <= 0.0:
+            return base
+        blended: Dict[int, float] = dict(base)
+        weight = self.prediction_weight
+        for token_id, prob in prediction_bias.items():
+            existing = blended.get(token_id, 0.0)
+            blended[token_id] = (1.0 - weight) * existing + weight * prob
+        total = sum(blended.values())
+        if total <= 0:
+            return base
+        for token_id in list(blended.keys()):
+            blended[token_id] = blended[token_id] / total
+        return blended
+
+    @staticmethod
+    def _decode_prediction_token(raw_value: bytes) -> Optional[int]:
+        if not raw_value:
+            return None
+        if len(raw_value) == 4:
+            return int.from_bytes(raw_value, "big", signed=False)
+        return None
 
     def _load_bans(self, profile: str) -> set[int]:
         rows = self.db.query(

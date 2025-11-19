@@ -61,6 +61,10 @@ class DBSLMEngine:
         ngram_order: int = 3,
         context_dimensions: Sequence[ContextDimension] | None = None,
         settings: DBSLMSettings | None = None,
+        *,
+        prediction_table: str | None = None,
+        prediction_key: str | None = None,
+        prediction_weight: float = 0.0,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
@@ -93,6 +97,10 @@ class DBSLMEngine:
             self.cache,
             self.bias,
             context_dimensions=self.context_dimensions,
+            hot_path=self.hot_path,
+            prediction_table=(prediction_table or "").strip(),
+            prediction_key=(prediction_key or "").strip(),
+            prediction_weight=prediction_weight,
         )
         self.concepts = ConceptEngine(self.db, self.memory, self.quantizer)
         self.level1 = self.store  # backwards compatibility for callers expecting this attr
@@ -113,6 +121,10 @@ class DBSLMEngine:
         self._prompt_tag_enumerator: dict[str, int] = {}
         self._prompt_tag_retry_attempts = 3
         self.register_prompt_tags(_DEFAULT_PROMPT_TAG_TOKENS)
+        self._prediction_seeded_tokens: set[int] = set()
+        self.prediction_table = (prediction_table or "").strip()
+        self.prediction_key = (prediction_key or "").strip()
+        self.prediction_weight = max(0.0, min(1.0, float(prediction_weight or 0.0)))
 
     def register_prompt_tags(self, tag_tokens: Sequence[str]) -> None:
         """Allow callers to seed tokenizer/vocabulary with structured prompt tags."""
@@ -289,9 +301,11 @@ class DBSLMEngine:
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
         base_context = list(rolling_context)
         window_weights = None
+        prediction_matrix = None
         if self.context_windows.enabled():
             window_reference = bias_context or history_text
             window_weights = self.context_windows.weights_for_text(window_reference)
+            prediction_matrix = self.context_windows.context_matrix_for_text(window_reference)
 
         attempt_count = max(1, self._prompt_tag_retry_attempts)
         final_ids: List[int] = []
@@ -309,6 +323,7 @@ class DBSLMEngine:
                 dimension_weights=window_weights,
                 banned_token_ids=self._prompt_tag_token_ids,
                 commit_cache=False,
+                prediction_matrix=prediction_matrix,
             )
             decoded_text = self.tokenizer.decode(decoded_ids)
             attempt_segments = [segment for segment in prefix_segments if segment]

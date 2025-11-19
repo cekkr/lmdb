@@ -313,6 +313,26 @@ class CheetahClient:
         response = self._command(f"PREDICT_CTX {' '.join(args)}")
         return (response is not None and response.startswith("SUCCESS")), response
 
+    def predict_train(
+        self,
+        key: bytes,
+        target: bytes,
+        *,
+        context_matrix: Sequence[Sequence[float]] | None = None,
+        learning_rate: float | None = None,
+        table: str | None = None,
+    ) -> tuple[bool, str | None]:
+        args = [f"key=x{key.hex()}", f"target=x{target.hex()}"]
+        matrix_payload = self._encode_matrix_payload(context_matrix)
+        if matrix_payload:
+            args.append(f"ctx={matrix_payload}")
+        if learning_rate is not None:
+            args.append(f"lr={learning_rate}")
+        if table:
+            args.append(f"table={table}")
+        response = self._command(f"PREDICT_TRAIN {' '.join(args)}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
     def predict_query(
         self,
         *,
@@ -1649,6 +1669,72 @@ class CheetahHotPathAdapter(HotPathAdapter):
             self._disable(exc)
             return None
 
+    def predict_set(
+        self,
+        *,
+        key: bytes | str,
+        value: bytes | str,
+        probability: float = 0.5,
+        table: str | None = None,
+        weights: Sequence[dict[str, object]] | None = None,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        key_bytes = self._ensure_bytes(key)
+        value_bytes = self._ensure_bytes(value)
+        try:
+            success, response = self._client.predict_set(
+                key_bytes,
+                value_bytes,
+                probability=probability,
+                table=table,
+                weights=weights,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_set failed for key=%s table=%s response=%s",
+                    key,
+                    table,
+                    response,
+                )
+            return success
+        except CheetahError as exc:
+            self._disable(exc)
+            return False
+
+    def predict_train(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        context_matrix: Sequence[Sequence[float]] | None,
+        learning_rate: float = 0.01,
+        table: str | None = None,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        key_bytes = self._ensure_bytes(key)
+        target_bytes = self._ensure_bytes(target)
+        try:
+            success, response = self._client.predict_train(
+                key_bytes,
+                target_bytes,
+                context_matrix=context_matrix,
+                learning_rate=learning_rate,
+                table=table,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_train failed for key=%s table=%s response=%s",
+                    key,
+                    table,
+                    response,
+                )
+            return success
+        except CheetahError as exc:
+            self._disable(exc)
+            return False
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
@@ -1664,6 +1750,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
             raise CheetahError("failed to insert cheetah payload")
         self._register_pair(namespace, key, context_hash=context_hash)
         return key
+
+    @staticmethod
+    def _ensure_bytes(value: bytes | str) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8")
+        return bytes(value)
 
     def _register_pair(
         self,

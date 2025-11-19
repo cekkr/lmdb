@@ -155,6 +155,22 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=3,
         help="Maximum prediction entries to log per turn when --cheetah-predict-log is set (default: %(default)s).",
     )
+    parser.add_argument(
+        "--cheetah-token-table",
+        default="token_predictions",
+        help="Prediction table consulted during decoding (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-key",
+        default="meta:token_predictions",
+        help="Prediction key consulted during decoding (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-token-weight",
+        type=float,
+        default=0.25,
+        help="Blending weight applied to cheetah prediction outputs during decoding (default: %(default)s).",
+    )
     return parser
 
 
@@ -224,6 +240,9 @@ class PromptWorker:
         cheetah_predict_key: str,
         cheetah_predict_source: str,
         cheetah_predict_limit: int,
+        cheetah_token_table: str,
+        cheetah_token_key: str,
+        cheetah_token_weight: float,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
         self._requests = self._ctx.Queue()
@@ -250,6 +269,9 @@ class PromptWorker:
                 cheetah_predict_key,
                 cheetah_predict_source,
                 cheetah_predict_limit,
+                cheetah_token_table,
+                cheetah_token_key,
+                cheetah_token_weight,
             ),
         )
         self._process.start()
@@ -354,6 +376,9 @@ def _decoder_worker(
     cheetah_predict_key: str,
     cheetah_predict_source: str,
     cheetah_predict_limit: int,
+    cheetah_token_table: str,
+    cheetah_token_key: str,
+    cheetah_token_weight: float,
 ) -> None:
     engine: DBSLMEngine | None = None
     try:
@@ -362,6 +387,9 @@ def _decoder_worker(
             ngram_order=ngram_order,
             context_dimensions=context_dimensions,
             settings=settings,
+            prediction_table=cheetah_token_table,
+            prediction_key=cheetah_token_key,
+            prediction_weight=cheetah_token_weight,
         )
         conv_id = conversation
         if conv_id:
@@ -618,6 +646,9 @@ def main() -> None:
             cheetah_predict_key=args.cheetah_predict_key,
             cheetah_predict_source=args.cheetah_predict_source,
             cheetah_predict_limit=args.cheetah_predict_limit,
+            cheetah_token_table=args.cheetah_token_table,
+            cheetah_token_key=args.cheetah_token_key,
+            cheetah_token_weight=args.cheetah_token_weight,
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         window_label = worker.window_label or "n/a"
