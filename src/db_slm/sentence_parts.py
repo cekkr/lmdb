@@ -53,7 +53,7 @@ class RealtimeTokenizerProfiler:
         if not self._segment_lengths:
             return 220
         trimmed = sorted(self._segment_lengths)
-        median_idx = int(len(trimmed) * 1.0)
+        median_idx = int(len(trimmed) * 0.85)
         median_idx = min(max(median_idx, 0), len(trimmed) - 1)
         target = trimmed[median_idx]
         return max(80, min(int(target), 420))
