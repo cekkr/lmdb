@@ -48,6 +48,24 @@ class RawContinuationProjection:
 
 
 @dataclass(frozen=True)
+class PredictionValueResult:
+    """Single value returned from a cheetah prediction table query."""
+
+    value: bytes
+    probability: float
+
+
+@dataclass(frozen=True)
+class PredictionQueryResult:
+    """Result metadata returned by `PREDICT_QUERY`."""
+
+    table: str
+    backend: str
+    count: int
+    entries: Tuple[PredictionValueResult, ...]
+
+
+@dataclass(frozen=True)
 class NamespaceSummary:
     """Aggregate statistics for a namespace prefix."""
 
@@ -134,6 +152,8 @@ __all__ = [
     "RawCountsProjection",
     "RawProbabilityProjection",
     "RawContinuationProjection",
+    "PredictionValueResult",
+    "PredictionQueryResult",
     "NamespaceSummary",
     "CheetahSystemStats",
     "CHEETAH_DEFAULT_REDUCE_PAGE_SIZE",

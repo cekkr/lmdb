@@ -3,7 +3,11 @@ from __future__ import annotations
 from typing import Sequence
 
 from db_slm.adapters.base import HotPathAdapter
-from db_slm.cheetah_types import CheetahSystemStats, NamespaceSummary
+from db_slm.cheetah_types import (
+    CheetahSystemStats,
+    NamespaceSummary,
+    PredictionQueryResult,
+)
 
 
 def parse_summary_prefix(expr: str) -> bytes:
@@ -133,3 +137,30 @@ def collect_system_stats_lines(hot_path: HotPathAdapter) -> list[str]:
     if stats is None:
         return ["cheetah system stats unavailable (adapter disabled or command unsupported)"]
     return format_system_stats(stats)
+
+
+def format_prediction_query(
+    result: PredictionQueryResult | None,
+    *,
+    label: str | None = None,
+    max_entries: int = 5,
+) -> list[str]:
+    if result is None:
+        return ["cheetah prediction query unavailable (adapter disabled or query failed)"]
+    prefix = label or f"{result.table}"
+    lines = [
+        (
+            f"cheetah predict {prefix}: table={result.table}, backend={result.backend}, "
+            f"count={result.count}, showing<= {min(max_entries, len(result.entries))}"
+        )
+    ]
+    if not result.entries:
+        lines.append("  (no prediction entries returned)")
+        return lines
+    limit = max(1, max_entries)
+    for idx, entry in enumerate(result.entries[:limit], 1):
+        lines.append(f"  [{idx}] {describe_bytes(entry.value)} -> {entry.probability:.4f}")
+    remaining = len(result.entries) - limit
+    if remaining > 0:
+        lines.append(f"  ... {remaining} more entr{'y' if remaining == 1 else 'ies'} truncated")
+    return lines

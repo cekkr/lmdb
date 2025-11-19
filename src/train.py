@@ -44,6 +44,7 @@ from helpers.resource_monitor import ResourceMonitor
 from helpers.cheetah_cli import (
     collect_namespace_summary_lines,
     collect_system_stats_lines,
+    format_prediction_query,
 )
 if TYPE_CHECKING:
     from helpers.resource_monitor import ResourceDelta, ResourceSample
@@ -245,6 +246,27 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--cheetah-system-stats",
         action="store_true",
         help="Log cheetah SYSTEM_STATS before training (CPU/memory hints plus recommended workers).",
+    )
+    parser.add_argument(
+        "--cheetah-context-probe",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help=(
+            "Text snippet used to derive context-window embeddings (based on --context-dimensions) and "
+            "issue a PREDICT_QUERY against the cheetah prediction table before ingest. "
+            "Repeat to probe multiple snippets."
+        ),
+    )
+    parser.add_argument(
+        "--cheetah-predict-table",
+        default="context_matrices",
+        help="Prediction-table name used by --cheetah-context-probe (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-predict-key",
+        default="meta:context_dimension_embeddings",
+        help="Prediction-table key used by --cheetah-context-probe (default: %(default)s).",
     )
     return parser
 
@@ -505,6 +527,56 @@ def _emit_cheetah_reports(engine: DBSLMEngine, args: argparse.Namespace) -> None
             depth=depth,
             branch_limit=branch_limit,
         ):
+            log(f"[train] {line}")
+
+
+def _probe_context_predictions(engine: DBSLMEngine, args: argparse.Namespace) -> None:
+    samples = [sample for sample in getattr(args, "cheetah_context_probe", []) if sample]
+    if not samples:
+        return
+    if not engine.context_windows.enabled():
+        log("[train] cheetah context probes skipped: context windows disabled.")
+        return
+    matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+    if not callable(matrix_builder):
+        log("[train] cheetah context probes unavailable: context window manager missing context_matrix_for_text().")
+        return
+    predict_query = getattr(engine.hot_path, "predict_query", None)
+    if not callable(predict_query):
+        log("[train] cheetah context probes unavailable: adapter missing predict_query().")
+        return
+    table = (getattr(args, "cheetah_predict_table", None) or "context_matrices").strip()
+    key = getattr(args, "cheetah_predict_key", None) or "meta:context_dimension_embeddings"
+    log(
+        f"[train] Running {len(samples)} cheetah context probe(s) via PREDICT_QUERY "
+        f"(table={table}, key={key})."
+    )
+    for index, sample in enumerate(samples, 1):
+        snippet = (sample or "").strip()
+        label = snippet.splitlines()[0] if snippet else ""
+        if len(label) > 48:
+            label = f"{label[:45]}..."
+        matrix = matrix_builder(sample)
+        if not matrix:
+            log(
+                f"[train] cheetah context probe #{index}: unable to derive context matrix "
+                f"from sample '{label or '<empty>'}'."
+            )
+            continue
+        log(
+            f"[train] cheetah context probe #{index}: extracted {len(matrix)} window vector(s) "
+            f"from sample '{label or '<empty>'}'."
+        )
+        try:
+            result = predict_query(
+                key=key,
+                context_matrix=matrix,
+                table=table,
+            )
+        except Exception as exc:
+            log(f"[train] cheetah context probe #{index}: prediction query failed ({exc}).")
+            continue
+        for line in format_prediction_query(result, label=f"probe#{index}:{label}"):
             log(f"[train] {line}")
 
 
@@ -1339,6 +1411,7 @@ def main() -> None:
         if context_window_label:
             run_metadata["context_window_embeddings"] = context_window_label
     _emit_cheetah_reports(engine, args)
+    _probe_context_predictions(engine, args)
     if args.eval_variants is not None:
         if args.eval_variants < 1:
             parser.error("--eval-variants must be >= 1")

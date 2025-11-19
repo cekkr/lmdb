@@ -368,6 +368,31 @@ class ContextWindowEmbeddingManager:
             weights.append(max(0.25, min(2.0, combined)))
         return weights
 
+    def context_matrix_for_text(self, text: str) -> list[list[float]]:
+        """Return the raw context-window embedding vectors for a text snippet."""
+        if not self.enabled() or not text.strip():
+            return []
+        seed = self._seed_for_text(text)
+        infer_rng = random.Random(seed)
+        snippets = self.extractor.sample(
+            text,
+            windows_per_dimension=self.max_infer_windows,
+            rng=infer_rng,
+        )
+        if not snippets:
+            return []
+        vectors = self.embedder.embed([snippet.text for snippet in snippets])
+        matrix: list[list[float]] = []
+        for vector in vectors:
+            if not vector:
+                continue
+            try:
+                row = [float(value) for value in vector]
+            except (TypeError, ValueError):
+                continue
+            matrix.append(row)
+        return matrix
+
     def flush(self) -> None:
         if not self._dirty:
             return

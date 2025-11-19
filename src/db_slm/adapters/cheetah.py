@@ -21,6 +21,8 @@ from ..cheetah_types import (
     CHEETAH_PAIR_SCAN_MIN_LIMIT,
     CheetahSystemStats,
     NamespaceSummary,
+    PredictionQueryResult,
+    PredictionValueResult,
     RawContinuationProjection,
     RawContextProjection,
     RawCountsProjection,
@@ -311,6 +313,53 @@ class CheetahClient:
         response = self._command(f"PREDICT_CTX {' '.join(args)}")
         return (response is not None and response.startswith("SUCCESS")), response
 
+    def predict_query(
+        self,
+        *,
+        key: bytes | str | None = None,
+        keys: Sequence[bytes | str] | None = None,
+        context_matrix: Sequence[Sequence[float]] | None = None,
+        windows: Sequence[Sequence[float]] | None = None,
+        key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
+        merge_mode: str | None = None,
+        table: str | None = None,
+    ) -> PredictionQueryResult | None:
+        args: list[str] = []
+        if key:
+            formatted = self._format_prediction_value(key)
+            if not formatted:
+                return None
+            args.append(f"key={formatted}")
+        if keys:
+            formatted_keys = []
+            for candidate in keys:
+                encoded_value = self._format_prediction_value(candidate)
+                if encoded_value:
+                    formatted_keys.append(encoded_value)
+            if formatted_keys:
+                args.append(f"keys={','.join(formatted_keys)}")
+        ctx_payload = self._encode_matrix_payload(context_matrix)
+        if ctx_payload:
+            args.append(f"ctx={ctx_payload}")
+        window_payload = self._encode_matrix_payload(windows)
+        if window_payload:
+            args.append(f"windows={window_payload}")
+        key_window_payload = self._encode_key_windows_payload(key_windows)
+        if key_window_payload:
+            args.append(f"key_windows={key_window_payload}")
+        if merge_mode:
+            args.append(f"merge={merge_mode}")
+        if table:
+            trimmed = table.strip()
+            if trimmed:
+                args.append(f"table={trimmed}")
+        if not args:
+            return None
+        response = self._command(f"PREDICT_QUERY {' '.join(args)}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_predict_query_response(response)
+
     def pair_summary(
         self,
         prefix: bytes,
@@ -534,6 +583,42 @@ class CheetahClient:
         return header, payload
 
     @staticmethod
+    def _parse_predict_query_response(response: str) -> PredictionQueryResult | None:
+        if not response.startswith("SUCCESS"):
+            return None
+        header, payload = CheetahClient._split_response_sections(response)
+        meta = CheetahClient._split_response_fields(header)
+        table = meta.get("table", "").strip() or "<unknown>"
+        backend = meta.get("backend", "").strip() or "<unknown>"
+        count = CheetahClient._parse_int(meta.get("count"), default=0)
+        entries: list[PredictionValueResult] = []
+        if payload:
+            for item in payload.split(";"):
+                if not item:
+                    continue
+                try:
+                    value_hex, prob_text = item.split(":", 1)
+                except ValueError:
+                    continue
+                try:
+                    value = bytes.fromhex(value_hex)
+                except (ValueError, TypeError):
+                    continue
+                try:
+                    probability = float(prob_text)
+                except ValueError:
+                    continue
+                entries.append(PredictionValueResult(value=value, probability=probability))
+        if count <= 0:
+            count = len(entries)
+        return PredictionQueryResult(
+            table=table,
+            backend=backend,
+            count=count,
+            entries=tuple(entries),
+        )
+
+    @staticmethod
     def _extract_cursor(header: str) -> bytes | None:
         for part in header.split(","):
             if part.startswith("next_cursor="):
@@ -699,6 +784,66 @@ class CheetahClient:
         if raw is None:
             return False
         return raw.strip().lower() in {"1", "true", "yes"}
+
+    @staticmethod
+    def _normalize_prediction_value(value: bytes | str | bytearray) -> bytes:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        return str(value).encode("utf-8")
+
+    @classmethod
+    def _format_prediction_value(cls, value: bytes | str | bytearray) -> str | None:
+        normalized = cls._normalize_prediction_value(value)
+        if not normalized:
+            return None
+        return f"x{normalized.hex()}"
+
+    @staticmethod
+    def _encode_matrix_payload(matrix: Sequence[Sequence[float]] | None) -> str | None:
+        if not matrix:
+            return None
+        serializable: list[list[float]] = []
+        for row in matrix:
+            if not row:
+                continue
+            try:
+                serializable.append([float(component) for component in row])
+            except (TypeError, ValueError):
+                continue
+        if not serializable:
+            return None
+        payload = json.dumps(serializable, separators=(",", ":")).encode("utf-8")
+        return base64.b64encode(payload).decode("ascii")
+
+    @classmethod
+    def _encode_key_windows_payload(
+        cls,
+        specs: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None,
+    ) -> str | None:
+        if not specs:
+            return None
+        serialized: list[dict[str, object]] = []
+        for key, windows in specs:
+            formatted_key = cls._format_prediction_value(key)
+            if not formatted_key:
+                continue
+            if not windows:
+                continue
+            normalized_windows: list[list[float]] = []
+            for window in windows:
+                if not window:
+                    continue
+                try:
+                    normalized_windows.append([float(value) for value in window])
+                except (TypeError, ValueError):
+                    continue
+            if not normalized_windows:
+                continue
+            serialized.append({"key": formatted_key, "windows": normalized_windows})
+        if not serialized:
+            return None
+        payload = json.dumps(serialized, separators=(",", ":")).encode("utf-8")
+        return base64.b64encode(payload).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -1473,6 +1618,33 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return None
         try:
             return self._client.system_stats()
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def predict_query(
+        self,
+        *,
+        key: bytes | str | None = None,
+        keys: Sequence[bytes | str] | None = None,
+        context_matrix: Sequence[Sequence[float]] | None = None,
+        windows: Sequence[Sequence[float]] | None = None,
+        key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
+        merge_mode: str | None = None,
+        table: str | None = None,
+    ) -> PredictionQueryResult | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.predict_query(
+                key=key,
+                keys=keys,
+                context_matrix=context_matrix,
+                windows=windows,
+                key_windows=key_windows,
+                merge_mode=merge_mode,
+                table=table,
+            )
         except CheetahError as exc:
             self._disable(exc)
             return None

@@ -5,6 +5,7 @@ from typing import Iterable, Protocol, Sequence, Tuple
 from ..cheetah_types import (
     CheetahSystemStats,
     NamespaceSummary,
+    PredictionQueryResult,
     RawContinuationProjection,
     RawContextProjection,
     RawCountsProjection,
@@ -92,6 +93,19 @@ class HotPathAdapter(Protocol):
     def system_stats(self) -> CheetahSystemStats | None:
         """Return the latest SYSTEM_STATS snapshot, when available."""
 
+    def predict_query(
+        self,
+        *,
+        key: bytes | str | None = None,
+        keys: Sequence[bytes | str] | None = None,
+        context_matrix: Sequence[Sequence[float]] | None = None,
+        windows: Sequence[Sequence[float]] | None = None,
+        key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
+        merge_mode: str | None = None,
+        table: str | None = None,
+    ) -> PredictionQueryResult | None:
+        """Query cheetah prediction tables (PREDICT_QUERY)."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -171,6 +185,19 @@ class NullHotPathAdapter:
         return None
 
     def system_stats(self) -> CheetahSystemStats | None:
+        return None
+
+    def predict_query(
+        self,
+        *,
+        key: bytes | str | None = None,
+        keys: Sequence[bytes | str] | None = None,
+        context_matrix: Sequence[Sequence[float]] | None = None,
+        windows: Sequence[Sequence[float]] | None = None,
+        key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
+        merge_mode: str | None = None,
+        table: str | None = None,
+    ) -> PredictionQueryResult | None:
         return None
 
 
