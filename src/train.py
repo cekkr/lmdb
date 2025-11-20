@@ -527,7 +527,7 @@ def reset_cheetah_store(settings: DBSLMSettings) -> None:
         settings.cheetah_port,
         database=settings.cheetah_database,
         timeout=settings.cheetah_timeout_seconds,
-        idle_grace=max(settings.cheetah_timeout_seconds * 180.0, 60.0),
+        idle_grace=settings.cheetah_idle_grace_seconds,
     )
     if not client.connect():
         log(

@@ -17,9 +17,13 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   `DBSLM_BACKEND=cheetah-db`.
 - When `src/train.py --reset` talks to cheetah, it now shrinks `PAIR_SCAN` page sizes whenever a page
   stalls and raises the TCP idle-grace target to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)`
-  seconds. This avoids the `cheetah response timed out after 30.0s of inactivity` spam even when the
-  namespace is empty or the server sits on a slow disk; increase
-  `DBSLM_CHEETAH_TIMEOUT_SECONDS` further if remote cheetah instances still need more time.
+  seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`). This avoids the
+  `cheetah response timed out after 30.0s of inactivity` spam even when the namespace is empty or the
+  server sits on a slow disk; increase the timeout/idle-grace env vars further if remote cheetah
+  instances still need more time.
+- `CHEETAH_TCP_KEEPALIVE_SECONDS` (or `[server] keepalive_seconds` inside `config.ini`) enables OS
+  TCP keep-alives so idle sockets stay healthy during slow reducers or context-probe batches. The
+  server now enables keep-alives both at the listener and per accepted connection when this is set.
 - When training/decoding from inside WSL but pointing at a cheetah server running on Windows, the
   hot-path adapter auto-retries the Windows bridge IP discovered via `/etc/resolv.conf` whenever the
   configured `DBSLM_CHEETAH_HOST` resolves to loopback. Override `DBSLM_CHEETAH_HOST` with the exact

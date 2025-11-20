@@ -83,6 +83,8 @@ DBSLM_SQLITE_PATH=var/db_slm.sqlite3
 DBSLM_CHEETAH_HOST=127.0.0.1
 DBSLM_CHEETAH_PORT=4455
 DBSLM_CHEETAH_TIMEOUT_SECONDS=1.0
+# Uncomment to extend the per-request idle grace (defaults to max(timeout*180, 60)s)
+# DBSLM_CHEETAH_IDLE_GRACE_SECONDS=300
 # Uncomment to select a named database/namespace on shared cheetah instances:
 # DBSLM_CHEETAH_DATABASE=default
 ```

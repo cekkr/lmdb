@@ -262,6 +262,8 @@ SUCCESS,key=1_deleted
 
 - Prefer `screen` or `tmux` for long-lived sessions. Launch commands with explicit timeouts (≤30 min
   unless otherwise justified) so stalled reducers cannot block future sessions.
+- TCP keep-alives are configurable via `[server] keepalive_seconds` (or `CHEETAH_TCP_KEEPALIVE_SECONDS`).
+  Increase this window for WAN clients so idle sockets survive long reducer sweeps; set to `0` to rely on OS defaults.
 - `CHEETAH_HEADLESS=1` disables the interactive CLI while keeping the TCP listener up. When running in
   WSL or remote shells, pair it with `screen -dmS cheetahdb ...` and monitor `screen -ls` /
   `screen -wipe` before rebuilding.

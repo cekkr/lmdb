@@ -1922,7 +1922,12 @@ def build_cheetah_adapter(
     description = (
         f"cheetah-db://{settings.cheetah_host}:{settings.cheetah_port}/{settings.cheetah_database}"
     )
+    idle_grace = settings.cheetah_idle_grace_seconds
+    if idle_grace <= 0:
+        idle_grace = None
     if client is not None:
+        if idle_grace:
+            client.set_idle_grace(idle_grace)
         if not client.connect():
             logger.warning(
                 "cheetah hot-path backend unreachable (tried %s; last error: %s)",
@@ -1938,9 +1943,16 @@ def build_cheetah_adapter(
             settings.cheetah_port,
             database=settings.cheetah_database,
             timeout=settings.cheetah_timeout_seconds,
+            idle_grace=idle_grace,
         )
 
-    warm_client = client_factory()
+    warm_client = CheetahClient(
+        settings.cheetah_host,
+        settings.cheetah_port,
+        database=settings.cheetah_database,
+        timeout=settings.cheetah_timeout_seconds,
+        idle_grace=idle_grace,
+    )
     if not warm_client.connect():
         logger.warning(
             "cheetah hot-path backend unreachable (tried %s; last error: %s)",

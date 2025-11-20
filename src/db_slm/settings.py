@@ -34,6 +34,7 @@ class DBSLMSettings:
     cheetah_port: int
     cheetah_database: str
     cheetah_timeout_seconds: float
+    cheetah_idle_grace_seconds: float
     cheetah_mirror: bool
     tokenizer_backend: str
     tokenizer_json_path: str | None
@@ -63,6 +64,11 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     cheetah_port = int(read("DBSLM_CHEETAH_PORT", "4455"))
     cheetah_database = read("DBSLM_CHEETAH_DATABASE", "default")
     cheetah_timeout_seconds = float(read("DBSLM_CHEETAH_TIMEOUT_SECONDS", "1.0"))
+    idle_grace_raw = read("DBSLM_CHEETAH_IDLE_GRACE_SECONDS", "").strip()
+    if idle_grace_raw:
+        cheetah_idle_grace_seconds = max(0.0, float(idle_grace_raw))
+    else:
+        cheetah_idle_grace_seconds = max(cheetah_timeout_seconds * 180.0, 60.0)
     mirror_flag = read("DBSLM_CHEETAH_MIRROR", "0").lower()
     cheetah_mirror = mirror_flag in {"1", "true", "yes", "on"}
     tokenizer_backend = read("DBSLM_TOKENIZER_BACKEND", "regex").strip().lower()
@@ -83,6 +89,7 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         cheetah_port=cheetah_port,
         cheetah_database=cheetah_database,
         cheetah_timeout_seconds=cheetah_timeout_seconds,
+        cheetah_idle_grace_seconds=cheetah_idle_grace_seconds,
         cheetah_mirror=cheetah_mirror,
         tokenizer_backend=tokenizer_backend,
         tokenizer_json_path=tokenizer_json_path,
