@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Sequence, NoReturn
 
 from ..cheetah_types import (
     CHEETAH_DEFAULT_REDUCE_PAGE_SIZE,
@@ -109,6 +109,10 @@ _WSL_HOST_IP = _detect_wsl_host_ip() if _RUNNING_IN_WSL else None
 
 class CheetahError(RuntimeError):
     """Raised when the cheetah-db bridge encounters a fatal error."""
+
+
+class CheetahFatalError(CheetahError):
+    """Raised when the cheetah hot-path adapter becomes unusable."""
 
 
 class CheetahClient:
@@ -1098,7 +1102,10 @@ class _ThreadLocalCheetahClientPool:
         with self._lock:
             if self._clients:
                 client = self._clients[0]
-                return f"cheetah-db://{client.host}:{client.port}/{client.database}"
+                host = getattr(client, "host", "<unknown>")
+                port = getattr(client, "port", "<unknown>")
+                database = getattr(client, "database", "<unknown>")
+                return f"cheetah-db://{host}:{port}/{database}"
         return "<unknown>"
 
     def close_all(self) -> None:
@@ -1115,7 +1122,10 @@ class _ThreadLocalCheetahClientPool:
         with self._lock:
             self._clients.append(client)
             if not self._description:
-                self._description = f"cheetah-db://{client.host}:{client.port}/{client.database}"
+                host = getattr(client, "host", "<unknown>")
+                port = getattr(client, "port", "<unknown>")
+                database = getattr(client, "database", "<unknown>")
+                self._description = f"cheetah-db://{host}:{port}/{database}"
 
 
 class CheetahHotPathAdapter(HotPathAdapter):
@@ -1887,11 +1897,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return f"hash:{context_hash}"
         return None
 
-    def _disable(self, exc: Exception) -> None:
+    def _disable(self, exc: Exception) -> NoReturn:
         if self._enabled:
             logger.warning("Disabling cheetah hot-path adapter: %s", exc)
             self._enabled = False
             self._client_pool.close_all()
+        reason = str(exc) or exc.__class__.__name__
+        description = getattr(self, "_description", "cheetah")
+        raise CheetahFatalError(f"{reason} (adapter={description})") from exc
 
     @property
     def _client(self) -> CheetahClient:
@@ -1945,6 +1958,7 @@ def build_cheetah_adapter(
 __all__ = [
     "CheetahClient",
     "CheetahError",
+    "CheetahFatalError",
     "CheetahHotPathAdapter",
     "CheetahSerializer",
     "CountsPayload",

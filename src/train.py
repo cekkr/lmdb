@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Sequence, Tuple
 
 from db_slm import DBSLMEngine
 from db_slm.adapters.base import NullHotPathAdapter
-from db_slm.adapters.cheetah import CheetahClient
+from db_slm.adapters.cheetah import CheetahClient, CheetahFatalError
 from db_slm.context_dimensions import (
     DEFAULT_CONTEXT_DIMENSIONS,
     format_context_dimensions,
@@ -1871,4 +1871,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CheetahFatalError as exc:
+        log(
+            "[train] Fatal cheetah failure: "
+            f"{exc}. Consult cheetah-db/AI_REFERENCE.md and ensure the server is healthy."
+        )
+        sys.exit(1)
