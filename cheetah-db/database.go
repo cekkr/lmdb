@@ -1,4 +1,4 @@
-// database.go
+﻿// database.go
 package main
 
 import (
@@ -382,7 +382,7 @@ func (db *Database) loadNextPairTableID() error {
 	data, err := os.ReadFile(db.nextPairIDPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Il file non esiste, partiamo da 1 (0 +¿ la root)
+			// Il file non esiste, partiamo da 1 (0 +-+ la root)
 			db.nextPairTableID.Store(1)
 			return nil
 		}
@@ -413,7 +413,7 @@ func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 		return table, nil
 	}
 
-	// Il nome del file +¿ l'ID in esadecimale
+	// Il nome del file +-+ l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
 	newTable, err := NewPairTable(db.fileManager, tableID, path, db.branchCodec.branchCount)
 	if err != nil {
@@ -1453,16 +1453,7 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 	} else {
 		expandedPrefix = nil
 	}
-	workerCount := 1
-	if db.resources != nil {
-		workerCount = db.resources.RecommendedWorkers(256)
-	}
-	if workerCount < 1 {
-		workerCount = runtime.NumCPU()
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
+	workerCount := db.recommendedWorkerCount(acc.limit, pairScanDefaultLimit)
 	if err := db.parallelCollectPairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
 		return nil, nil, err
 	}
@@ -1500,16 +1491,7 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 	} else {
 		expandedPrefix = nil
 	}
-	workerCount := 1
-	if db.resources != nil {
-		workerCount = db.resources.RecommendedWorkers(pairScanDefaultLimit)
-	}
-	if workerCount < 1 {
-		workerCount = runtime.NumCPU()
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
+	workerCount := db.recommendedWorkerCount(branchLimit, pairScanDefaultLimit)
 	if err := db.parallelSummarizePairEntries(startTable, expandedPrefix, workerCount, acc); err != nil {
 		return nil, err
 	}
@@ -1930,21 +1912,17 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 	}
 
 	reduced := make([]PairReduceResult, len(scanResults))
-	workerCount := len(scanResults)
-	if db.resources != nil {
-		workerCount = db.resources.RecommendedWorkers(len(scanResults))
-	}
-	if workerCount == 0 {
-		workerCount = runtime.NumCPU() * 2
-	}
-	if workerCount > len(scanResults) {
-		workerCount = len(scanResults)
-	}
+	workerCount := db.recommendedWorkerCount(len(scanResults), len(scanResults))
 	if workerCount < 1 {
 		workerCount = 1
 	}
 
-	sem := make(chan struct{}, workerCount)
+	type reduceJob struct {
+		index int
+		item  PairScanResult
+	}
+
+	jobs := make(chan reduceJob, workerCount*2)
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
@@ -1960,34 +1938,40 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 		})
 	}
 
+	worker := func() {
+		defer wg.Done()
+		for job := range jobs {
+			if abort.Load() {
+				continue
+			}
+			payload, err := db.readValuePayload(job.item.Key)
+			if err != nil {
+				setErr(err)
+				continue
+			}
+			if abort.Load() {
+				continue
+			}
+			reduced[job.index] = PairReduceResult{
+				Value:   job.item.Value,
+				Key:     job.item.Key,
+				Payload: payload,
+			}
+		}
+	}
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
 	for idx, res := range scanResults {
 		if abort.Load() {
 			break
 		}
-		wg.Add(1)
-		go func(i int, res PairScanResult) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if abort.Load() {
-				return
-			}
-			payload, err := db.readValuePayload(res.Key)
-			if err != nil {
-				setErr(err)
-				return
-			}
-			if abort.Load() {
-				return
-			}
-			reduced[i] = PairReduceResult{
-				Value:   res.Value,
-				Key:     res.Key,
-				Payload: payload,
-			}
-		}(idx, res)
+		jobs <- reduceJob{index: idx, item: res}
 	}
-
+	close(jobs)
 	wg.Wait()
 	if firstErr != nil {
 		return nil, nil, firstErr
@@ -2056,6 +2040,38 @@ func normalizePairScanLimit(limit int) int {
 	default:
 		return limit
 	}
+}
+
+func (db *Database) recommendedWorkerCount(pendingHint int, fallback int) int {
+	target := pendingHint
+	if target <= 0 {
+		target = fallback
+	}
+	if target <= 0 {
+		target = pairScanDefaultLimit
+	}
+	if target <= 0 {
+		target = 1
+	}
+	if db.resources != nil {
+		if workers := db.resources.RecommendedWorkers(target); workers > 0 {
+			if workers > target {
+				return target
+			}
+			return workers
+		}
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = runtime.NumCPU()
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > target {
+		workers = target
+	}
+	return workers
 }
 
 func decodeAbsoluteKey(entry []byte) uint64 {
