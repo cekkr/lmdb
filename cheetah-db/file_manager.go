@@ -765,33 +765,94 @@ func (mf *ManagedFile) queueFlush(key uint64) {
 }
 
 func (mf *ManagedFile) flushSector(key uint64) {
+	mf.flushSectorInternal(key, false)
+}
+
+func (mf *ManagedFile) flushSectorImmediate(key uint64) {
+	mf.flushSectorInternal(key, true)
+}
+
+func (mf *ManagedFile) flushSectorInternal(key uint64, force bool) {
+	for {
+		delay, hasData := mf.flushDelayForKey(key)
+		if !hasData {
+			mf.clearPendingKey(key)
+			return
+		}
+		if force || delay <= 0 {
+			break
+		}
+		time.Sleep(delay)
+	}
+
 	if err := mf.ensureHandle(); err != nil {
+		mf.clearPendingKey(key)
 		return
 	}
 	mf.cacheMu.RLock()
 	entry, ok := mf.sectors[key]
 	dirty := ok && entry.dirty
 	var buf []byte
+	var flushedWrite int64
 	if dirty {
+		flushedWrite = atomic.LoadInt64(&entry.lastWrite)
 		buf = append([]byte(nil), entry.data...)
 	}
 	mf.cacheMu.RUnlock()
 	if !dirty {
-		mf.pendingMu.Lock()
-		delete(mf.pending, key)
-		mf.pendingMu.Unlock()
+		mf.clearPendingKey(key)
 		return
 	}
 	_, err := mf.file.WriteAt(buf, int64(key)*mf.sectorSize)
+	needsRetry := false
 	if err == nil {
 		mf.cacheMu.Lock()
 		if entry, ok := mf.sectors[key]; ok {
-			entry.dirty = false
+			if atomic.LoadInt64(&entry.lastWrite) == flushedWrite {
+				entry.dirty = false
+			} else if entry.dirty {
+				needsRetry = true
+			}
 		}
 		mf.cacheMu.Unlock()
+	} else {
+		needsRetry = true
 	}
+	mf.clearPendingKey(key)
+	if needsRetry {
+		mf.queueFlush(key)
+	}
+}
+
+func (mf *ManagedFile) flushDelayForKey(key uint64) (time.Duration, bool) {
+	if mf == nil {
+		return 0, false
+	}
+	mf.cacheMu.RLock()
+	entry, ok := mf.sectors[key]
+	if !ok || entry == nil || !entry.dirty {
+		mf.cacheMu.RUnlock()
+		return 0, false
+	}
+	var delay time.Duration
+	if mf.opts.FlushInterval > 0 {
+		last := atomic.LoadInt64(&entry.lastWrite)
+		if last > 0 {
+			elapsed := time.Since(time.Unix(0, last))
+			if elapsed < mf.opts.FlushInterval {
+				delay = mf.opts.FlushInterval - elapsed
+			}
+		}
+	}
+	mf.cacheMu.RUnlock()
+	return delay, true
+}
+
+func (mf *ManagedFile) clearPendingKey(key uint64) {
 	mf.pendingMu.Lock()
-	delete(mf.pending, key)
+	if mf.pending != nil {
+		delete(mf.pending, key)
+	}
 	mf.pendingMu.Unlock()
 }
 
@@ -811,7 +872,7 @@ func (mf *ManagedFile) Flush() {
 	}
 	mf.cacheMu.RUnlock()
 	for _, key := range dirtyKeys {
-		mf.flushSector(key)
+		mf.flushSectorImmediate(key)
 	}
 	if mf.file != nil {
 		_ = mf.file.Sync()
@@ -938,7 +999,7 @@ func (mf *ManagedFile) applyCachePolicy(now time.Time, cfg cachePolicyConfig, me
 }
 
 func (mf *ManagedFile) flushAndDrop(key uint64) bool {
-	mf.flushSector(key)
+	mf.flushSectorImmediate(key)
 	mf.cacheMu.Lock()
 	defer mf.cacheMu.Unlock()
 	if entry, ok := mf.sectors[key]; ok {
