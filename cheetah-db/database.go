@@ -2628,7 +2628,7 @@ func parseKeyValueArgs(raw string) map[string]string {
 }
 
 func (db *Database) observeFork(prefix []byte) {
-	if db.forkScheduler == nil {
+	if db.forkScheduler == nil || !db.forkScheduler.ObservingEnabled() {
 		return
 	}
 	db.forkScheduler.AssignFork(prefix)
