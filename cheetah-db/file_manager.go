@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"errors"
@@ -1128,6 +1128,13 @@ func (ma *movingAverage) add(amount float64, now time.Time, window time.Duration
 
 func min64(a, b int64) int64 {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
 		return a
 	}
 	return b

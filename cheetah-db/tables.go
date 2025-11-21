@@ -62,7 +62,7 @@ func (t *MainKeysTable) Close() {
 	t.file.Close()
 }
 
-// Metodi senza lock (per uso interno quando il lock ├¿ gi├á acquisito)
+// Metodi senza lock (per uso interno quando il lock Γö£┬┐ giΓö£├í acquisito)
 func (t *MainKeysTable) readEntryFromFile(key uint64) ([]byte, error) {
 	entry := make([]byte, MainKeysEntrySize)
 	_, err := t.file.ReadAt(entry, int64(key)*MainKeysEntrySize)
@@ -74,8 +74,18 @@ func (t *MainKeysTable) writeEntryToFile(key uint64, entry []byte) error {
 }
 
 // --- ValuesTable ---
+type writeTask struct {
+	offset int64
+	data   []byte
+}
+
 type ValuesTable struct {
-	file *ManagedFile
+	file       *ManagedFile
+	writeQueue chan writeTask
+	writeWG    sync.WaitGroup
+	pendingMu  sync.RWMutex
+	pending    map[int64][]byte
+	once       sync.Once
 }
 
 func NewValuesTable(manager *FileManager, path string) (*ValuesTable, error) {
@@ -88,18 +98,84 @@ func NewValuesTable(manager *FileManager, path string) (*ValuesTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ValuesTable{file: file}, nil
+	table := &ValuesTable{
+		file:       file,
+		writeQueue: make(chan writeTask, 1024),
+		pending:    make(map[int64][]byte),
+	}
+	table.writeWG.Add(1)
+	go table.writeLoop()
+	return table, nil
+}
+
+func (t *ValuesTable) writeLoop() {
+	defer t.writeWG.Done()
+	for task := range t.writeQueue {
+		if _, err := t.file.WriteAt(task.data, task.offset); err != nil {
+			logErrorf("ValuesTable async write failed at offset=%d: %v", task.offset, err)
+		}
+		t.pendingMu.Lock()
+		delete(t.pending, task.offset)
+		t.pendingMu.Unlock()
+	}
 }
 
 func (t *ValuesTable) WriteAt(p []byte, off int64) (n int, err error) {
-	return t.file.WriteAt(p, off)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	t.pendingMu.Lock()
+	t.pending[off] = buf
+	t.pendingMu.Unlock()
+	t.writeQueue <- writeTask{offset: off, data: buf}
+	return len(p), nil
 }
 
 func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) {
-	return t.file.ReadAt(p, off)
+	n, err = t.file.ReadAt(p, off)
+	if err != nil && err != io.EOF {
+		return n, err
+	}
+	t.pendingMu.RLock()
+	for offset, data := range t.pending {
+		start := offset
+		end := offset + int64(len(data))
+		readStart := off
+		readEnd := off + int64(len(p))
+		if end <= readStart || start >= readEnd {
+			continue
+		}
+		o := max64(start, readStart)
+		ol := min64(end, readEnd) - o
+		if ol <= 0 {
+			continue
+		}
+		srcStart := o - start
+		dstStart := o - readStart
+		copy(p[dstStart:dstStart+ol], data[srcStart:srcStart+ol])
+		if int64(n) < (o-readStart)+ol {
+			n = int((o - readStart) + ol)
+			if n > len(p) {
+				n = len(p)
+			}
+		}
+	}
+	t.pendingMu.RUnlock()
+	return n, err
 }
 
 func (t *ValuesTable) Close() {
+	if t == nil {
+		return
+	}
+	t.once.Do(func() {
+		if t.writeQueue != nil {
+			close(t.writeQueue)
+		}
+	})
+	t.writeWG.Wait()
 	if t.file != nil {
 		t.file.Close()
 	}
@@ -151,7 +227,7 @@ func (t *RecycleTable) Pop() ([]byte, bool) {
 
 	binary.BigEndian.PutUint16(counterBytes, count-1)
 	if _, err := t.file.WriteAt(counterBytes, 0); err != nil {
-		// Errore critico, ma l'indice ├¿ stato letto. Potremmo loggarlo.
+		// Errore critico, ma l'indice Γö£┬┐ stato letto. Potremmo loggarlo.
 	}
 	return locBytes, true
 }
@@ -222,7 +298,7 @@ func (t *PairTable) WriteEntry(branchIndex uint32, entry []byte) error {
 	return err
 }
 
-// IsEmpty controlla se il nodo non ha pi├╣ figli o chiavi terminali.
+// IsEmpty controlla se il nodo non ha piΓö£Γòú figli o chiavi terminali.
 func (t *PairTable) IsEmpty() (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
