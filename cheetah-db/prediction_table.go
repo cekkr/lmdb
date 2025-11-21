@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +24,11 @@ var errPredictionEntryNotFound = errors.New("prediction_entry_not_found")
 type ContextMatrix [][]float64
 
 const (
-	predictionFileMagic   = "CHPREDTB"
-	predictionFileVersion = uint16(1)
+	predictionFileMagic          = "CHPREDTB"
+	predictionFileVersion        = uint16(1)
+	defaultPredictFlushMillis    = 75
+	minPredictFlushMillis        = 10
+	defaultPredictPurgeThreshold = 1e-4
 )
 
 // PredictionValue stores the base probability and context weights for a result.
@@ -64,19 +68,58 @@ type PredictionTable struct {
 	tableName string
 	merger    ProbabilityMerger
 	closed    bool
+	dirty     bool
+	dirtyAll  bool
+	dirtyKeys map[string]struct{}
+
+	persistDelay   time.Duration
+	purgeThreshold float64
+	flushStop      chan struct{}
+	flushWG        sync.WaitGroup
+}
+
+func predictFlushInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_FLUSH_MILLIS"))
+	if raw == "" {
+		return time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	if value < minPredictFlushMillis {
+		value = minPredictFlushMillis
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func predictPurgeThreshold() float64 {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_PURGE_THRESHOLD"))
+	if raw == "" {
+		return defaultPredictPurgeThreshold
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value <= 0 {
+		return defaultPredictPurgeThreshold
+	}
+	return value
 }
 
 func newPredictionTable(path string, legacyPath string, tableName string) (*PredictionTable, error) {
 	p := &PredictionTable{
-		path:      path,
-		legacy:    legacyPath,
-		tableName: tableName,
-		entries:   make(map[string]*PredictionEntry),
-		merger:    selectProbabilityMerger(""),
+		path:           path,
+		legacy:         legacyPath,
+		tableName:      tableName,
+		entries:        make(map[string]*PredictionEntry),
+		merger:         selectProbabilityMerger(""),
+		persistDelay:   predictFlushInterval(),
+		purgeThreshold: predictPurgeThreshold(),
+		flushStop:      make(chan struct{}),
 	}
 	if err := p.load(); err != nil {
 		return nil, err
 	}
+	p.startFlushWorker()
 	return p, nil
 }
 
@@ -350,12 +393,123 @@ func (p *PredictionTable) persistLocked() error {
 
 func (p *PredictionTable) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
+	p.mu.Unlock()
+	close(p.flushStop)
+	p.flushWG.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.dirty {
+		return nil
+	}
 	return p.persistLocked()
+}
+
+func (p *PredictionTable) startFlushWorker() {
+	if p.persistDelay <= 0 {
+		p.persistDelay = time.Duration(defaultPredictFlushMillis) * time.Millisecond
+	}
+	p.flushWG.Add(1)
+	go p.flushLoop()
+}
+
+func (p *PredictionTable) flushLoop() {
+	defer p.flushWG.Done()
+	ticker := time.NewTicker(p.persistDelay)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.flushStop:
+			p.flushDirty(true)
+			return
+		case <-ticker.C:
+			p.flushDirty(false)
+		}
+	}
+}
+
+func (p *PredictionTable) markDirtyLocked(key string) {
+	p.dirty = true
+	if key == "" {
+		p.dirtyAll = true
+		p.dirtyKeys = nil
+	} else if !p.dirtyAll {
+		if p.dirtyKeys == nil {
+			p.dirtyKeys = make(map[string]struct{})
+		}
+		p.dirtyKeys[key] = struct{}{}
+	}
+}
+
+func (p *PredictionTable) flushDirty(force bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !force && (!p.dirty || p.closed) {
+		return
+	}
+	if p.purgeThreshold > 0 {
+		p.pruneDirtyEntriesLocked()
+	}
+	if err := p.persistLocked(); err != nil {
+		logErrorf("prediction table %s flush failed: %v", p.tableName, err)
+		return
+	}
+	p.dirty = false
+	p.dirtyAll = false
+	p.dirtyKeys = nil
+}
+
+func (p *PredictionTable) pruneDirtyEntriesLocked() {
+	if p.purgeThreshold <= 0 || len(p.entries) == 0 {
+		return
+	}
+	if p.dirtyAll || len(p.dirtyKeys) == 0 {
+		for _, entry := range p.entries {
+			pruneEntryContextWeights(entry, p.purgeThreshold)
+		}
+		return
+	}
+	for key := range p.dirtyKeys {
+		if entry, ok := p.entries[key]; ok {
+			pruneEntryContextWeights(entry, p.purgeThreshold)
+		}
+	}
+}
+
+func pruneEntryContextWeights(entry *PredictionEntry, threshold float64) {
+	if entry == nil || len(entry.Values) == 0 || threshold <= 0 {
+		return
+	}
+	for idx := range entry.Values {
+		weights := entry.Values[idx].ContextWeights
+		if len(weights) == 0 {
+			continue
+		}
+		kept := make([]ContextWeight, 0, len(weights))
+		for _, weight := range weights {
+			if contextWeightMagnitude(weight) < threshold {
+				continue
+			}
+			kept = append(kept, weight)
+		}
+		if len(kept) == len(weights) {
+			entry.Values[idx].ContextWeights = weights
+			continue
+		}
+		entry.Values[idx].ContextWeights = kept
+	}
+}
+
+func contextWeightMagnitude(weight ContextWeight) float64 {
+	total := math.Abs(weight.Bias)
+	for _, value := range weight.Vector {
+		total += math.Abs(value)
+	}
+	return total
 }
 
 func (p *PredictionTable) ensureEntry(key string) *PredictionEntry {
@@ -408,7 +562,8 @@ func (p *PredictionTable) ImportEntries(entries []PredictionEntry) error {
 		cloned.UpdatedAt = time.Now().UTC()
 		p.entries[cloned.Key] = cloned
 	}
-	return p.persistLocked()
+	p.markDirtyLocked("")
+	return nil
 }
 
 func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float64, weights []ContextWeight) (PredictionEntry, error) {
@@ -436,9 +591,7 @@ func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float
 		})
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 
@@ -518,9 +671,7 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 
@@ -549,9 +700,7 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
 	entry.UpdatedAt = time.Now().UTC()
-	if err := p.persistLocked(); err != nil {
-		return *entry, err
-	}
+	p.markDirtyLocked(entry.Key)
 	return *entry, nil
 }
 

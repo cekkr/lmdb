@@ -116,6 +116,11 @@ matrix.
   with the same tooling used for `values_*.table` (e.g., `PAIR_SUMMARY` forklifts, fork transfers).
   Key/value pairs stay contiguous, which keeps hot prediction shards cache-friendly and compatible
   with the fixed-byte assumptions elsewhere in the engine.
+- Prediction table writes now happen asynchronously: inserts/edits return once the in-memory payload
+  is stored, and a background worker flushes batches every `CHEETAH_PREDICT_FLUSH_MILLIS`
+  (defaults to 75 ms). The worker also drops negligible context-weight blobs automatically; tune the
+  cleanup threshold via `CHEETAH_PREDICT_PURGE_THRESHOLD` to keep early-cycle noise from bloating the
+  tables. Shutdown waits for the queue to drain so fork transfers still see durable snapshots.
 
 ### Prediction table contract
 
