@@ -10,9 +10,10 @@ import socket
 import struct
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Iterable, Sequence, NoReturn
 
 from ..cheetah_types import (
@@ -1160,6 +1161,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._description = self._client_pool.describe()
         self._reduce_page_limit = DEFAULT_REDUCE_PAGE_SIZE
         self._reduce_page_limit_deadline = 0.0
+        self._async_workers = max(4, min(32, (os.cpu_count() or 4)))
+        self._async_executor = ThreadPoolExecutor(
+            max_workers=self._async_workers,
+            thread_name_prefix="cheetah_hotpath",
+        )
+        self._async_lock = threading.Lock()
+        self._async_futures: deque[Future] = deque()
+        self._async_max_pending = self._async_workers * 4
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -1185,18 +1194,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
         try:
             key = self._lookup_key(namespace, context_hash=context_hash)
             if key is None:
-                self._insert(namespace, context_hash, payload)
+                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
             else:
-                success, response = self._client.edit(key, payload)
-                if not success:
-                    logger.warning(
-                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                self._submit_async(
+                    lambda key=key, payload=payload: self._edit_or_reinsert(
                         namespace,
                         context_hash,
                         key,
-                        response,
+                        payload,
                     )
-                    self._insert(namespace, context_hash, payload)
+                )
         except CheetahError as exc:
             self._disable(exc)
 
@@ -1208,18 +1215,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
         try:
             key = self._lookup_key(namespace, context_hash=context_hash)
             if key is None:
-                self._insert(namespace, context_hash, payload)
+                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
             else:
-                success, response = self._client.edit(key, payload)
-                if not success:
-                    logger.warning(
-                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                self._submit_async(
+                    lambda key=key, payload=payload: self._edit_or_reinsert(
                         namespace,
                         context_hash,
                         key,
-                        response,
+                        payload,
                     )
-                    self._insert(namespace, context_hash, payload)
+                )
         except CheetahError as exc:
             self._disable(exc)
 
@@ -1236,18 +1241,16 @@ class CheetahHotPathAdapter(HotPathAdapter):
         try:
             key = self._lookup_key(namespace, context_hash=context_hash)
             if key is None:
-                self._insert(namespace, context_hash, payload)
+                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
             else:
-                success, response = self._client.edit(key, payload)
-                if not success:
-                    logger.warning(
-                        "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+                self._submit_async(
+                    lambda key=key, payload=payload: self._edit_or_reinsert(
                         namespace,
                         context_hash,
                         key,
-                        response,
+                        payload,
                     )
-                    self._insert(namespace, context_hash, payload)
+                )
         except CheetahError as exc:
             self._disable(exc)
 
@@ -1261,18 +1264,18 @@ class CheetahHotPathAdapter(HotPathAdapter):
             try:
                 key = self._lookup_key(namespace, context_hash=identifier)
                 if key is None:
-                    self._insert(namespace, identifier, payload)
+                    self._submit_async(
+                        lambda identifier=identifier, payload=payload: self._insert(namespace, identifier, payload)
+                    )
                 else:
-                    success, response = self._client.edit(key, payload)
-                    if not success:
-                        logger.warning(
-                            "cheetah edit failed for namespace=%s identifier=%s key=%s response=%s; reinserting",
+                    self._submit_async(
+                        lambda key=key, identifier=identifier, payload=payload: self._edit_or_reinsert(
                             namespace,
                             identifier,
                             key,
-                            response,
+                            payload,
                         )
-                        self._insert(namespace, identifier, payload)
+                    )
             except CheetahError as exc:
                 self._disable(exc)
                 return
@@ -1901,10 +1904,68 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if self._enabled:
             logger.warning("Disabling cheetah hot-path adapter: %s", exc)
             self._enabled = False
+            self._shutdown_async()
             self._client_pool.close_all()
         reason = str(exc) or exc.__class__.__name__
         description = getattr(self, "_description", "cheetah")
         raise CheetahFatalError(f"{reason} (adapter={description})") from exc
+
+    def _submit_async(self, action: Callable[[], None]) -> None:
+        executor = getattr(self, "_async_executor", None)
+        if executor is None:
+            action()
+            return
+        future = executor.submit(action)
+        future.add_done_callback(self._async_completion)
+        with self._async_lock:
+            self._async_futures.append(future)
+            while len(self._async_futures) > self._async_max_pending:
+                old = self._async_futures.popleft()
+                self._await_future(old)
+
+    def _async_completion(self, future: Future) -> None:
+        exc = future.exception()
+        if exc:
+            logger.error("cheetah async publish failed: %s", exc)
+
+    def _await_future(self, future: Future | None) -> None:
+        if future is None:
+            return
+        try:
+            future.result()
+        except Exception as exc:  # pragma: no cover - log transport errors
+            logger.error("cheetah async publish failed: %s", exc)
+
+    def _shutdown_async(self) -> None:
+        executor = getattr(self, "_async_executor", None)
+        if executor is None:
+            return
+        with self._async_lock:
+            pending = list(self._async_futures)
+            self._async_futures.clear()
+        for future in pending:
+            self._await_future(future)
+        executor.shutdown(wait=True)
+        self._async_executor = None
+
+    def _edit_or_reinsert(
+        self,
+        namespace: str,
+        context_hash: str,
+        key: int,
+        payload: bytes,
+    ) -> None:
+        success, response = self._client.edit(key, payload)
+        if success:
+            return
+        logger.warning(
+            "cheetah edit failed for namespace=%s context_hash=%s key=%s response=%s; reinserting",
+            namespace,
+            context_hash,
+            key,
+            response,
+        )
+        self._insert(namespace, context_hash, payload)
 
     @property
     def _client(self) -> CheetahClient:
