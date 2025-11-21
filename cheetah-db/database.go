@@ -349,7 +349,7 @@ func (db *Database) getValuesTable(size uint32, tableID uint32) (*ValuesTable, e
 		return table.(*ValuesTable), nil
 	}
 	path := filepath.Join(db.path, fmt.Sprintf("values_%s.table", key))
-	newTable, err := NewValuesTable(path)
+	newTable, err := NewValuesTable(db.fileManager, path)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +369,7 @@ func (db *Database) getRecycleTable(size uint32) (*RecycleTable, error) {
 		return table.(*RecycleTable), nil
 	}
 	path := filepath.Join(db.path, fmt.Sprintf("values_%d.recycle.table", size))
-	newTable, err := NewRecycleTable(path)
+	newTable, err := NewRecycleTable(db.fileManager, path)
 	if err != nil {
 		return nil, err
 	}

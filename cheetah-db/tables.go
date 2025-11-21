@@ -1,4 +1,4 @@
-// tables.go
+﻿// tables.go
 package main
 
 import (
@@ -62,7 +62,7 @@ func (t *MainKeysTable) Close() {
 	t.file.Close()
 }
 
-// Metodi senza lock (per uso interno quando il lock è già acquisito)
+// Metodi senza lock (per uso interno quando il lock ├¿ gi├á acquisito)
 func (t *MainKeysTable) readEntryFromFile(key uint64) ([]byte, error) {
 	entry := make([]byte, MainKeysEntrySize)
 	_, err := t.file.ReadAt(entry, int64(key)*MainKeysEntrySize)
@@ -75,12 +75,16 @@ func (t *MainKeysTable) writeEntryToFile(key uint64, entry []byte) error {
 
 // --- ValuesTable ---
 type ValuesTable struct {
-	file *os.File
-	mu   sync.RWMutex
+	file *ManagedFile
 }
 
-func NewValuesTable(path string) (*ValuesTable, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+func NewValuesTable(manager *FileManager, path string) (*ValuesTable, error) {
+	opts := ManagedFileOptions{
+		CacheEnabled:     false,
+		SectorSize:       defaultSectorSize,
+		MaxCachedSectors: 0,
+	}
+	file, err := NewManagedFile(manager, path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -88,36 +92,43 @@ func NewValuesTable(path string) (*ValuesTable, error) {
 }
 
 func (t *ValuesTable) WriteAt(p []byte, off int64) (n int, err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	return t.file.WriteAt(p, off)
 }
 
 func (t *ValuesTable) ReadAt(p []byte, off int64) (n int, err error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	return t.file.ReadAt(p, off)
 }
 
 func (t *ValuesTable) Close() {
-	t.file.Close()
+	if t.file != nil {
+		t.file.Close()
+	}
 }
 
 // --- RecycleTable ---
 type RecycleTable struct {
-	file *os.File
+	file *ManagedFile
 	mu   sync.Mutex
 }
 
-func NewRecycleTable(path string) (*RecycleTable, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+func NewRecycleTable(manager *FileManager, path string) (*RecycleTable, error) {
+	opts := ManagedFileOptions{
+		CacheEnabled:     false,
+		SectorSize:       defaultSectorSize,
+		MaxCachedSectors: 0,
+	}
+	file, err := NewManagedFile(manager, path, opts)
 	if err != nil {
 		return nil, err
 	}
 	return &RecycleTable{file: file}, nil
 }
 
-func (t *RecycleTable) Close() { t.file.Close() }
+func (t *RecycleTable) Close() {
+	if t.file != nil {
+		t.file.Close()
+	}
+}
 
 func (t *RecycleTable) Pop() ([]byte, bool) {
 	t.mu.Lock()
@@ -140,7 +151,7 @@ func (t *RecycleTable) Pop() ([]byte, bool) {
 
 	binary.BigEndian.PutUint16(counterBytes, count-1)
 	if _, err := t.file.WriteAt(counterBytes, 0); err != nil {
-		// Errore critico, ma l'indice è stato letto. Potremmo loggarlo.
+		// Errore critico, ma l'indice ├¿ stato letto. Potremmo loggarlo.
 	}
 	return locBytes, true
 }
@@ -211,7 +222,7 @@ func (t *PairTable) WriteEntry(branchIndex uint32, entry []byte) error {
 	return err
 }
 
-// IsEmpty controlla se il nodo non ha più figli o chiavi terminali.
+// IsEmpty controlla se il nodo non ha pi├╣ figli o chiavi terminali.
 func (t *PairTable) IsEmpty() (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
