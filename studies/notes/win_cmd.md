@@ -41,4 +41,3 @@ Remember that you have to run in parallel cheetah-db server with other scripts, 
 You can fallback on tmux, but for keeping alive a screen session detaching it you have to do: screen -d -m -S session_name "your_command_here".
 Example: screen -d -m -S web_server "python3 -m http.server 8000"
 Save and check logs in real time (every 30 seconds circa in long term cases, for preventing excessive number of calls), prevent stucks (no more outputs), infinity loops and running test no longer than 30 minutes.
-

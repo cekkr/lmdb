@@ -3,10 +3,12 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -255,15 +257,25 @@ func (t *RecycleTable) Push(locationBytes []byte) error {
 // /
 // / --- PairTable (TreeTable Node) ---
 // /
-type PairTable struct {
-	id   uint32
-	path string
-	file *ManagedFile
-	mu   sync.RWMutex
-	span int
+type pairTableTracker interface {
+	OnPairTableOpen(*PairTable)
+	OnPairTableClose(*PairTable)
 }
 
-func NewPairTable(manager *FileManager, tableID uint32, path string, branchCount int) (*PairTable, error) {
+type PairTable struct {
+	id       uint32
+	path     string
+	manager  *FileManager
+	tracker  pairTableTracker
+	opts     ManagedFileOptions
+	fileMu   sync.Mutex
+	file     *ManagedFile
+	mu       sync.RWMutex
+	span     int
+	lastUsed atomic.Int64
+}
+
+func NewPairTable(manager *FileManager, tracker pairTableTracker, tableID uint32, path string, branchCount int) (*PairTable, error) {
 	prealloc := int64(branchCount) * int64(PairEntrySize)
 	opts := ManagedFileOptions{
 		PreallocateSize:  prealloc,
@@ -276,33 +288,95 @@ func NewPairTable(manager *FileManager, tableID uint32, path string, branchCount
 	if err != nil {
 		return nil, err
 	}
-	return &PairTable{id: tableID, path: path, file: file, span: branchCount}, nil
+	table := &PairTable{
+		id:      tableID,
+		path:    path,
+		manager: manager,
+		tracker: tracker,
+		opts:    opts,
+		file:    file,
+		span:    branchCount,
+	}
+	table.touch()
+	if tracker != nil {
+		tracker.OnPairTableOpen(table)
+	}
+	return table, nil
+}
+
+func (t *PairTable) touch() {
+	if t == nil {
+		return
+	}
+	t.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (t *PairTable) ensureFile() (*ManagedFile, error) {
+	if t == nil {
+		return nil, fmt.Errorf("pair table not initialized")
+	}
+	t.fileMu.Lock()
+	defer t.fileMu.Unlock()
+	if t.file != nil {
+		t.touch()
+		return t.file, nil
+	}
+	file, err := NewManagedFile(t.manager, t.path, t.opts)
+	if err != nil {
+		return nil, err
+	}
+	t.file = file
+	t.touch()
+	if t.tracker != nil {
+		t.tracker.OnPairTableOpen(t)
+	}
+	return t.file, nil
+}
+
+func (t *PairTable) ReleaseFile() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fileMu.Lock()
+	if t.file != nil {
+		t.file.Close()
+		t.file = nil
+		if t.tracker != nil {
+			t.tracker.OnPairTableClose(t)
+		}
+	}
+	t.fileMu.Unlock()
 }
 
 func (t *PairTable) ReadEntry(branchIndex uint32) ([]byte, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
+	file, err := t.ensureFile()
+	if err != nil {
+		return nil, err
+	}
 	entry := make([]byte, PairEntrySize)
 	offset := int64(branchIndex) * int64(PairEntrySize)
-	_, err := t.file.ReadAt(entry, offset)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, err = file.ReadAt(entry, offset)
 	return entry, err
 }
 
 func (t *PairTable) WriteEntry(branchIndex uint32, entry []byte) error {
+	file, err := t.ensureFile()
+	if err != nil {
+		return err
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
 	offset := int64(branchIndex) * int64(PairEntrySize)
-	_, err := t.file.WriteAt(entry, offset)
+	_, err = file.WriteAt(entry, offset)
 	return err
 }
 
 // IsEmpty controlla se il nodo non ha piΓö£Γòú figli o chiavi terminali.
 func (t *PairTable) IsEmpty() (bool, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	info, err := os.Stat(t.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -315,7 +389,13 @@ func (t *PairTable) IsEmpty() (bool, error) {
 	}
 
 	buffer := make([]byte, info.Size())
-	if _, err := t.file.ReadAt(buffer, 0); err != nil && err != io.EOF {
+	file, err := t.ensureFile()
+	if err != nil {
+		return false, err
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if _, err := file.ReadAt(buffer, 0); err != nil && err != io.EOF {
 		return false, err
 	}
 
@@ -328,19 +408,20 @@ func (t *PairTable) IsEmpty() (bool, error) {
 }
 
 func (t *PairTable) Close() {
-	if t.file != nil {
-		t.file.Close()
-	}
+	t.ReleaseFile()
 }
 
 // Snapshot returns a full copy of the current table state so callers can scan without holding locks.
 func (t *PairTable) Snapshot() ([]byte, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	size := int64(t.span) * int64(PairEntrySize)
 	buf := make([]byte, size)
-	if _, err := t.file.ReadAt(buf, 0); err != nil && err != io.EOF {
+	file, err := t.ensureFile()
+	if err != nil {
+		return nil, err
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if _, err := file.ReadAt(buf, 0); err != nil && err != io.EOF {
 		return nil, err
 	}
 	return buf, nil

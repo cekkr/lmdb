@@ -2,6 +2,7 @@
 package main
 
 import (
+	"container/list"
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
@@ -32,6 +33,7 @@ type Database struct {
 	recycleTables    sync.Map
 	pairTables       sync.Map // Cache per i nodi della TreeTable, ora indicizzata da uint32
 	fileManager      *FileManager
+	pairTableCache   *pairTableCache
 	payloadCache     *payloadCache
 	mu               sync.Mutex
 	pairDir          string // Path alla cartella /pairs
@@ -45,6 +47,89 @@ type Database struct {
 	forkScheduler    *ForkScheduler
 	predictStore     *PredictionManager
 	clusterMessenger *ClusterMessenger
+}
+
+type pairTableCache struct {
+	limit   int
+	lru     *list.List
+	mu      sync.Mutex
+	entries map[uint32]*list.Element
+}
+
+type pairTableCacheEntry struct {
+	id    uint32
+	table *PairTable
+}
+
+func newPairTableCache(limit int) *pairTableCache {
+	if limit <= 0 {
+		return nil
+	}
+	return &pairTableCache{
+		limit:   limit,
+		lru:     list.New(),
+		entries: make(map[uint32]*list.Element),
+	}
+}
+
+func (c *pairTableCache) OnPairTableOpen(table *PairTable) {
+	if c == nil || table == nil {
+		return
+	}
+	var victims []*PairTable
+	c.mu.Lock()
+	if elem, ok := c.entries[table.id]; ok {
+		c.lru.MoveToBack(elem)
+	} else {
+		elem = c.lru.PushBack(pairTableCacheEntry{id: table.id, table: table})
+		c.entries[table.id] = elem
+	}
+	victims = c.collectEvictionsLocked()
+	c.mu.Unlock()
+	for _, victim := range victims {
+		victim.ReleaseFile()
+	}
+}
+
+func (c *pairTableCache) OnPairTableClose(table *PairTable) {
+	if c == nil || table == nil {
+		return
+	}
+	c.mu.Lock()
+	if elem, ok := c.entries[table.id]; ok {
+		c.lru.Remove(elem)
+		delete(c.entries, table.id)
+	}
+	c.mu.Unlock()
+}
+
+func (c *pairTableCache) Touch(table *PairTable) {
+	if c == nil || table == nil {
+		return
+	}
+	c.mu.Lock()
+	if elem, ok := c.entries[table.id]; ok {
+		c.lru.MoveToBack(elem)
+	}
+	c.mu.Unlock()
+}
+
+func (c *pairTableCache) collectEvictionsLocked() []*PairTable {
+	if c == nil || c.limit <= 0 {
+		return nil
+	}
+	var victims []*PairTable
+	for c.lru.Len() > c.limit {
+		front := c.lru.Front()
+		if front == nil {
+			break
+		}
+		entry := front.Value.(pairTableCacheEntry)
+		c.lru.Remove(front)
+		delete(c.entries, entry.id)
+		victims = append(victims, entry.table)
+	}
+	return victims
 }
 
 func resolvePairTableLimit(configured int) int {
@@ -266,7 +351,8 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		return nil, err
 	}
 
-	fileManager := NewFileManager(resolvePairTableLimit(maxPairTables), monitor)
+	pairLimit := resolvePairTableLimit(maxPairTables)
+	fileManager := NewFileManager(pairLimit, monitor)
 	db := &Database{
 		name:           name,
 		path:           path,
@@ -276,6 +362,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		payloadCache:   newPayloadCacheFromConfig(cfg),
 		resources:      monitor,
 		fileManager:    fileManager,
+		pairTableCache: newPairTableCache(pairLimit),
 		settings:       cfg,
 		branchCodec:    codec,
 		jumpDir:        jumpDir,
@@ -406,21 +493,30 @@ func (db *Database) getNewPairTableID() (uint32, error) {
 // getPairTable ora accetta un uint32 ID.
 func (db *Database) getPairTable(tableID uint32) (*PairTable, error) {
 	if table, ok := db.loadPairTable(tableID); ok {
+		if db.pairTableCache != nil {
+			db.pairTableCache.Touch(table)
+		}
 		return table, nil
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if table, ok := db.loadPairTable(tableID); ok {
+		if db.pairTableCache != nil {
+			db.pairTableCache.Touch(table)
+		}
 		return table, nil
 	}
 
 	// Il nome del file +-+ l'ID in esadecimale
 	path := filepath.Join(db.pairDir, fmt.Sprintf("%x.table", tableID))
-	newTable, err := NewPairTable(db.fileManager, tableID, path, db.branchCodec.branchCount)
+	newTable, err := NewPairTable(db.fileManager, db.pairTableCache, tableID, path, db.branchCodec.branchCount)
 	if err != nil {
 		return nil, err
 	}
 	db.storePairTable(tableID, newTable)
+	if db.pairTableCache != nil {
+		db.pairTableCache.Touch(newTable)
+	}
 	return newTable, nil
 }
 
