@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+var errJumpNodeMissing = errors.New("jump_node_missing")
 
 type JumpNode struct {
 	ID          uint32
@@ -66,6 +69,9 @@ func (db *Database) loadJump(id uint32) (*JumpNode, error) {
 	path := db.jumpPath(id)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+		}
 		return nil, err
 	}
 	if len(data) < 9 {

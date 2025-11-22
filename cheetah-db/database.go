@@ -82,6 +82,7 @@ const (
 	defaultPairTableLimit         = 1024
 	minPairTableLimit             = 64
 	pairTableSafetyMargin         = 128
+	maxJumpReloadAttempts         = 8
 )
 
 var errPairNotFound = errors.New("pair not found")
@@ -463,14 +464,29 @@ func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey 
 	if err != nil {
 		return err
 	}
-	entry, err := table.ReadEntry(index)
-	if err != nil {
-		return err
+	var entry []byte
+	retries := 0
+	for {
+		if retries >= maxJumpReloadAttempts {
+			return fmt.Errorf("jump reload limit exceeded (insert table=%d index=%d)", tableID, index)
+		}
+		entry, err = table.ReadEntry(index)
+		if err != nil {
+			return err
+		}
+		if entryHasJump(entry) {
+			if err := db.insertThroughJump(tableID, table, index, entry, key, offset+len(chunk), absKey); err != nil {
+				if shouldRetryJump(err) {
+					retries++
+					continue
+				}
+				return err
+			}
+			return nil
+		}
+		break
 	}
 	nextOffset := offset + len(chunk)
-	if entryHasJump(entry) {
-		return db.insertThroughJump(tableID, table, index, entry, key, nextOffset, absKey)
-	}
 	if isLast {
 		setEntryTerminal(entry, absKey)
 		if err := table.WriteEntry(index, entry); err != nil {
@@ -636,16 +652,46 @@ func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64
 	if err != nil {
 		return 0, err
 	}
-	entry, err := table.ReadEntry(index)
-	if err != nil {
-		return 0, err
-	}
-	if len(entry) == 0 {
-		return 0, errPairNotFound
-	}
 	nextOffset := offset + len(chunk)
-	if entryHasJump(entry) {
-		return db.lookupThroughJump(entry, key, nextOffset)
+	var entry []byte
+	retries := 0
+	for {
+		if retries >= maxJumpReloadAttempts {
+			return 0, fmt.Errorf("jump reload limit exceeded (lookup table=%d index=%d)", tableID, index)
+		}
+		entry, err = table.ReadEntry(index)
+		if err != nil {
+			return 0, err
+		}
+		if len(entry) == 0 {
+			return 0, errPairNotFound
+		}
+		if entryHasJump(entry) {
+			node, loadErr := db.loadJump(entryJumpID(entry))
+			if loadErr != nil {
+				if shouldRetryJump(loadErr) {
+					retries++
+					continue
+				}
+				return 0, loadErr
+			}
+			remainder := key[nextOffset:]
+			if !bytes.HasPrefix(remainder, node.Bytes) {
+				return 0, errPairNotFound
+			}
+			childOffset := nextOffset + len(node.Bytes)
+			if childOffset == len(key) {
+				if node.HasTerminal {
+					return node.TerminalKey, nil
+				}
+				return 0, errPairNotFound
+			}
+			if node.NextTableID == 0 {
+				return 0, errPairNotFound
+			}
+			return db.lookupPairAt(node.NextTableID, key, childOffset)
+		}
+		break
 	}
 	if isLast {
 		if entryHasTerminal(entry) {
@@ -657,28 +703,6 @@ func (db *Database) lookupPairAt(tableID uint32, key []byte, offset int) (uint64
 		return db.lookupPairAt(entryChildID(entry), key, nextOffset)
 	}
 	return 0, errPairNotFound
-}
-
-func (db *Database) lookupThroughJump(entry []byte, key []byte, offset int) (uint64, error) {
-	node, err := db.loadJump(entryJumpID(entry))
-	if err != nil {
-		return 0, err
-	}
-	remainder := key[offset:]
-	if !bytes.HasPrefix(remainder, node.Bytes) {
-		return 0, errPairNotFound
-	}
-	offset += len(node.Bytes)
-	if offset == len(key) {
-		if node.HasTerminal {
-			return node.TerminalKey, nil
-		}
-		return 0, errPairNotFound
-	}
-	if node.NextTableID == 0 {
-		return 0, errPairNotFound
-	}
-	return db.lookupPairAt(node.NextTableID, key, offset)
 }
 
 func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (uint32, []byte, error) {
@@ -699,12 +723,31 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 		if err != nil {
 			return 0, path, err
 		}
-		entry, err := table.ReadEntry(index)
-		if err != nil {
-			return 0, path, err
-		}
-		if len(entry) == 0 {
-			return 0, path, errPairNotFound
+		var entry []byte
+		var node *JumpNode
+		retries := 0
+		for {
+			if retries >= maxJumpReloadAttempts {
+				return 0, path, fmt.Errorf("jump reload limit exceeded (resolve scan prefix %x)", prefix)
+			}
+			entry, err = table.ReadEntry(index)
+			if err != nil {
+				return 0, path, err
+			}
+			if len(entry) == 0 {
+				return 0, path, errPairNotFound
+			}
+			if entryHasJump(entry) {
+				node, err = db.loadJump(entryJumpID(entry))
+				if err != nil {
+					if shouldRetryJump(err) {
+						retries++
+						continue
+					}
+					return 0, path, err
+				}
+			}
+			break
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
@@ -712,18 +755,12 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 			acc.add(append([]byte{}, path...), decodeAbsoluteKey(entry))
 		}
 		if entryHasJump(entry) {
-			node, err := db.loadJump(entryJumpID(entry))
-			if err != nil {
-				return 0, path, err
-			}
 			jumpBytes := node.Bytes
 			path = append(path, jumpBytes...)
 			remaining := targetLen - offset
 			switch {
 			case remaining > len(jumpBytes):
-				segment := jumpBytes
-				compare := pref[offset : offset+len(jumpBytes)]
-				if !bytes.Equal(segment, compare) {
+				if !bytes.Equal(jumpBytes, pref[offset:offset+len(jumpBytes)]) {
 					return 0, path, errPairNotFound
 				}
 				offset += len(jumpBytes)
@@ -737,6 +774,7 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 				}
 			default:
 				pref = append(pref, jumpBytes...)
+				offset += len(jumpBytes)
 			}
 			if offset == targetLen && acc != nil && node.HasTerminal {
 				acc.add(append([]byte{}, path...), node.TerminalKey)
@@ -777,12 +815,31 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 		if err != nil {
 			return 0, path, err
 		}
-		entry, err := table.ReadEntry(index)
-		if err != nil {
-			return 0, path, err
-		}
-		if len(entry) == 0 {
-			return 0, path, errPairNotFound
+		var entry []byte
+		var node *JumpNode
+		retries := 0
+		for {
+			if retries >= maxJumpReloadAttempts {
+				return 0, path, fmt.Errorf("jump reload limit exceeded (resolve summary prefix %x)", prefix)
+			}
+			entry, err = table.ReadEntry(index)
+			if err != nil {
+				return 0, path, err
+			}
+			if len(entry) == 0 {
+				return 0, path, errPairNotFound
+			}
+			if entryHasJump(entry) {
+				node, err = db.loadJump(entryJumpID(entry))
+				if err != nil {
+					if shouldRetryJump(err) {
+						retries++
+						continue
+					}
+					return 0, path, err
+				}
+			}
+			break
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
@@ -792,10 +849,6 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 			}
 		}
 		if entryHasJump(entry) {
-			node, err := db.loadJump(entryJumpID(entry))
-			if err != nil {
-				return 0, path, err
-			}
 			jumpBytes := node.Bytes
 			path = append(path, jumpBytes...)
 			remaining := targetLen - offset
@@ -815,6 +868,7 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 				}
 			default:
 				pref = append(pref, jumpBytes...)
+				offset += len(jumpBytes)
 			}
 			if offset == targetLen && node.HasTerminal {
 				if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), node.TerminalKey); err != nil {
@@ -856,16 +910,32 @@ func (db *Database) deletePairAt(tableID uint32, key []byte, offset int) (bool, 
 	if err != nil {
 		return false, false, err
 	}
-	entry, err := table.ReadEntry(index)
-	if err != nil {
-		return false, false, err
-	}
-	if len(entry) == 0 {
-		return false, false, errPairNotFound
-	}
 	nextOffset := offset + len(chunk)
-	if entryHasJump(entry) {
-		return db.deleteWithinJump(table, index, entry, key, nextOffset)
+	var entry []byte
+	retries := 0
+	for {
+		if retries >= maxJumpReloadAttempts {
+			return false, false, fmt.Errorf("jump reload limit exceeded (delete table=%d index=%d)", tableID, index)
+		}
+		entry, err = table.ReadEntry(index)
+		if err != nil {
+			return false, false, err
+		}
+		if len(entry) == 0 {
+			return false, false, errPairNotFound
+		}
+		if entryHasJump(entry) {
+			deleted, empty, derr := db.deleteWithinJump(table, index, entry, key, nextOffset)
+			if derr != nil {
+				if shouldRetryJump(derr) {
+					retries++
+					continue
+				}
+				return false, false, derr
+			}
+			return deleted, empty, nil
+		}
+		break
 	}
 	if isLast {
 		if !entryHasTerminal(entry) {
@@ -1002,70 +1072,81 @@ func (db *Database) promoteChildToJump(parentTableID uint32, branchIndex uint32,
 }
 
 func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint64, uint32, []uint32, []uint32, bool, error) {
-	current := tableID
-	path := make([]byte, 0)
-	tables := make([]uint32, 0, 4)
-	jumps := make([]uint32, 0, 2)
-	var terminal bool
-	var terminalKey uint64
-	var nextTableID uint32
-	for {
-		tables = append(tables, current)
-		table, err := db.getPairTable(current)
-		if err != nil {
-			return nil, false, 0, 0, nil, nil, false, err
-		}
-		branchCount := table.BranchCount()
-		var branchEntry []byte
-		branchIndex := -1
-		nonEmpty := 0
-		for i := 0; i < branchCount; i++ {
-			e, err := table.ReadEntry(uint32(i))
+	for attempts := 0; attempts < maxJumpReloadAttempts; attempts++ {
+		current := tableID
+		path := make([]byte, 0)
+		tables := make([]uint32, 0, 4)
+		jumps := make([]uint32, 0, 2)
+		var terminal bool
+		var terminalKey uint64
+		var nextTableID uint32
+		retry := false
+		for {
+			tables = append(tables, current)
+			table, err := db.getPairTable(current)
 			if err != nil {
 				return nil, false, 0, 0, nil, nil, false, err
 			}
-			if len(e) == 0 || entryIsEmpty(e) {
-				continue
+			branchCount := table.BranchCount()
+			var branchEntry []byte
+			branchIndex := -1
+			nonEmpty := 0
+			for i := 0; i < branchCount; i++ {
+				e, err := table.ReadEntry(uint32(i))
+				if err != nil {
+					return nil, false, 0, 0, nil, nil, false, err
+				}
+				if len(e) == 0 || entryIsEmpty(e) {
+					continue
+				}
+				nonEmpty++
+				branchEntry = e
+				branchIndex = i
+				if nonEmpty > 1 {
+					return nil, false, 0, 0, nil, nil, false, nil
+				}
 			}
-			nonEmpty++
-			branchEntry = e
-			branchIndex = i
-			if nonEmpty > 1 {
+			if nonEmpty == 0 {
 				return nil, false, 0, 0, nil, nil, false, nil
 			}
-		}
-		if nonEmpty == 0 {
-			return nil, false, 0, 0, nil, nil, false, nil
-		}
-		chunk, ok := db.branchCodec.decode(uint32(branchIndex))
-		if !ok {
-			return nil, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
-		}
-		path = append(path, chunk...)
-		terminal = entryHasTerminal(branchEntry)
-		if terminal {
-			terminalKey = decodeAbsoluteKey(branchEntry)
-		}
-		if entryHasJump(branchEntry) {
-			jumpID := entryJumpID(branchEntry)
-			node, err := db.loadJump(jumpID)
-			if err != nil {
-				return nil, false, 0, 0, nil, nil, false, err
+			chunk, ok := db.branchCodec.decode(uint32(branchIndex))
+			if !ok {
+				return nil, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
 			}
-			path = append(path, node.Bytes...)
-			terminal = node.HasTerminal
-			terminalKey = node.TerminalKey
-			nextTableID = node.NextTableID
-			jumps = append(jumps, jumpID)
+			path = append(path, chunk...)
+			terminal = entryHasTerminal(branchEntry)
+			if terminal {
+				terminalKey = decodeAbsoluteKey(branchEntry)
+			}
+			if entryHasJump(branchEntry) {
+				jumpID := entryJumpID(branchEntry)
+				node, err := db.loadJump(jumpID)
+				if err != nil {
+					if shouldRetryJump(err) {
+						retry = true
+						break
+					}
+					return nil, false, 0, 0, nil, nil, false, err
+				}
+				path = append(path, node.Bytes...)
+				terminal = node.HasTerminal
+				terminalKey = node.TerminalKey
+				nextTableID = node.NextTableID
+				jumps = append(jumps, jumpID)
+				return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
+			}
+			if entryHasChild(branchEntry) {
+				current = entryChildID(branchEntry)
+				continue
+			}
+			nextTableID = 0
 			return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
 		}
-		if entryHasChild(branchEntry) {
-			current = entryChildID(branchEntry)
+		if retry {
 			continue
 		}
-		nextTableID = 0
-		return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
 	}
+	return nil, false, 0, 0, nil, nil, false, fmt.Errorf("jump reload limit exceeded (collect single branch table=%d)", tableID)
 }
 
 // ExecuteCommand analizza ed esegue un comando.
@@ -1763,9 +1844,32 @@ func (db *Database) walkPairSummary(
 		if abort != nil && abort.Load() {
 			return nil
 		}
-		entry, err := table.ReadEntry(branch)
-		if err != nil {
-			return err
+		var entry []byte
+		var node *JumpNode
+		ready := false
+		for attempts := 0; attempts < maxJumpReloadAttempts; attempts++ {
+			entry, err = table.ReadEntry(branch)
+			if err != nil {
+				return err
+			}
+			if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
+				ready = true
+				break
+			}
+			if entryHasJump(entry) {
+				node, err = db.loadJump(entryJumpID(entry))
+				if err != nil {
+					if shouldRetryJump(err) {
+						continue
+					}
+					return err
+				}
+			}
+			ready = true
+			break
+		}
+		if !ready {
+			return fmt.Errorf("jump reload limit exceeded (summary walk table=%d branch=%d)", task.tableID, branch)
 		}
 		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
 			continue
@@ -1792,10 +1896,6 @@ func (db *Database) walkPairSummary(
 			tasks <- pairSummaryTask{tableID: childID, path: value}
 		}
 		if entryHasJump(entry) {
-			node, err := db.loadJump(entryJumpID(entry))
-			if err != nil {
-				return err
-			}
 			extended := append(append([]byte{}, value...), node.Bytes...)
 			if node.HasTerminal {
 				if err := db.recordSummaryTerminal(acc, extended, node.TerminalKey); err != nil {
@@ -1841,9 +1941,32 @@ func (db *Database) walkPairTable(
 		if abort != nil && abort.Load() {
 			return nil
 		}
-		entry, err := table.ReadEntry(branch)
-		if err != nil {
-			return err
+		var entry []byte
+		var node *JumpNode
+		ready := false
+		for attempts := 0; attempts < maxJumpReloadAttempts; attempts++ {
+			entry, err = table.ReadEntry(branch)
+			if err != nil {
+				return err
+			}
+			if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
+				ready = true
+				break
+			}
+			if entryHasJump(entry) {
+				node, err = db.loadJump(entryJumpID(entry))
+				if err != nil {
+					if shouldRetryJump(err) {
+						continue
+					}
+					return err
+				}
+			}
+			ready = true
+			break
+		}
+		if !ready {
+			return fmt.Errorf("jump reload limit exceeded (scan walk table=%d branch=%d)", task.tableID, branch)
 		}
 		if len(entry) == 0 || (!entryHasTerminal(entry) && !entryHasChild(entry) && !entryHasJump(entry)) {
 			continue
@@ -1860,10 +1983,6 @@ func (db *Database) walkPairTable(
 			}
 		}
 		if entryHasJump(entry) {
-			node, err := db.loadJump(entryJumpID(entry))
-			if err != nil {
-				return err
-			}
 			extended := append(append([]byte{}, value...), node.Bytes...)
 			if node.HasTerminal {
 				if acc.add(extended, node.TerminalKey) && abort != nil && acc.limit > 0 {
@@ -2941,6 +3060,10 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func shouldRetryJump(err error) bool {
+	return err != nil && errors.Is(err, errJumpNodeMissing)
 }
 
 func makePayloadCacheKey(size uint32, location ValueLocationIndex) payloadCacheKey {
