@@ -1169,6 +1169,19 @@ class CheetahHotPathAdapter(HotPathAdapter):
         self._async_lock = threading.Lock()
         self._async_futures: deque[Future] = deque()
         self._async_max_pending = self._async_workers * 4
+        attempts = os.environ.get("CHEETAH_PAIR_REGISTER_ATTEMPTS", "").strip()
+        try:
+            parsed_attempts = int(attempts) if attempts else 4
+        except ValueError:
+            parsed_attempts = 4
+        self._pair_register_attempts = max(1, parsed_attempts)
+        backoff_raw = os.environ.get("CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS", "").strip()
+        try:
+            self._pair_register_backoff = max(
+                0.05, float(backoff_raw) if backoff_raw else 0.25
+            )
+        except ValueError:
+            self._pair_register_backoff = 0.25
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -1781,18 +1794,58 @@ class CheetahHotPathAdapter(HotPathAdapter):
         raw_value: bytes | None = None,
     ) -> None:
         value = self._pair_value(namespace, context_hash=context_hash, raw_value=raw_value)
-        success, response = self._client.pair_set(value, key)
-        if not success:
-            identifier = self._normalize_identifier(context_hash=context_hash, raw_value=raw_value)
-            logger.error(
-                "cheetah pair_set failed for namespace=%s identifier=%s key=%s response=%s",
-                namespace,
-                identifier or "<unknown>",
-                key,
-                response,
-            )
-            raise CheetahError("failed to register cheetah pair mapping")
-        self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
+        identifier = self._normalize_identifier(context_hash=context_hash, raw_value=raw_value)
+        attempts = getattr(self, "_pair_register_attempts", 1)
+        backoff = getattr(self, "_pair_register_backoff", 0.25)
+        client = self._client
+        last_response: str | None = None
+        for attempt in range(1, attempts + 1):
+            success, response = client.pair_set(value, key)
+            if success:
+                if attempt > 1:
+                    logger.info(
+                        "cheetah pair_set recovered after %d attempt(s) for namespace=%s identifier=%s",
+                        attempt,
+                        namespace,
+                        identifier or "<unknown>",
+                    )
+                self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
+                return
+            last_response = response
+            if self._confirm_pair_registration(value, key):
+                logger.warning(
+                    "cheetah pair_set missing acknowledgement for namespace=%s identifier=%s key=%s; "
+                    "confirmed via PAIR_GET after %d attempt(s)",
+                    namespace,
+                    identifier or "<unknown>",
+                    key,
+                    attempt,
+                )
+                self._set_cache(namespace, key, context_hash=context_hash, raw_value=raw_value)
+                return
+            if attempt < attempts:
+                delay = min(backoff * attempt, 2.0)
+                logger.warning(
+                    "cheetah pair_set attempt %d/%d failed for namespace=%s identifier=%s key=%s response=%s; "
+                    "retrying in %.2fs",
+                    attempt,
+                    attempts,
+                    namespace,
+                    identifier or "<unknown>",
+                    key,
+                    response,
+                    delay,
+                )
+                time.sleep(delay)
+        logger.error(
+            "cheetah pair_set failed after %d attempt(s) for namespace=%s identifier=%s key=%s response=%s",
+            attempts,
+            namespace,
+            identifier or "<unknown>",
+            key,
+            last_response,
+        )
+        raise CheetahError("failed to register cheetah pair mapping")
 
     def _register_vector_alias(self, key: int, token_ids: Sequence[int]) -> None:
         if not token_ids:
@@ -1899,6 +1952,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if context_hash is not None:
             return f"hash:{context_hash}"
         return None
+
+    def _confirm_pair_registration(self, value: bytes, key: int) -> bool:
+        """Verify whether a failed PAIR_SET actually stuck on the backend."""
+        try:
+            existing = self._client.pair_get(value)
+        except CheetahError:
+            return False
+        return existing == key
 
     def _disable(self, exc: Exception) -> NoReturn:
         if self._enabled:

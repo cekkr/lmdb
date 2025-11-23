@@ -42,6 +42,7 @@ Read and collect potential implementation to do in NEXT_STEPS.md
 - `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
   MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
   exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
+- The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,
   `probabilities`, and `continuations`, eliminating the extra `READ` hop per entry.

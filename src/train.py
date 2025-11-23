@@ -303,6 +303,12 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Maximum number of unique token entries to seed inside the cheetah prediction table during a run (default: %(default)s).",
     )
     parser.add_argument(
+        "--cheetah-token-progress-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between cheetah prediction training progress logs (default: %(default)s).",
+    )
+    parser.add_argument(
         "--cheetah-token-weight",
         type=float,
         default=0.25,
@@ -727,7 +733,11 @@ def _train_prediction_tables(
     records: Sequence[EvaluationRecord] | None,
     args: argparse.Namespace,
 ) -> None:
-    if not records or getattr(args, "disable_cheetah_token_train", False):
+    if getattr(args, "disable_cheetah_token_train", False):
+        log("[train] cheetah prediction training skipped: disabled via --disable-cheetah-token-train.")
+        return
+    if not records:
+        log("[train] cheetah prediction training skipped: no evaluation records available.")
         return
     predict_train = getattr(engine.hot_path, "predict_train", None)
     predict_set = getattr(engine.hot_path, "predict_set", None)
@@ -736,12 +746,16 @@ def _train_prediction_tables(
         or not callable(predict_set)
         or isinstance(engine.hot_path, NullHotPathAdapter)
     ):
+        log("[train] cheetah prediction training unavailable: hot-path adapter disabled.")
         return
     if not engine.context_windows.enabled():
+        log("[train] cheetah prediction training skipped: context windows disabled.")
         return
+    record_list = list(records)
     table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
     key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
     if not table or not key_label:
+        log("[train] cheetah prediction training skipped: missing table/key configuration.")
         return
     key_bytes = key_label.encode("utf-8")
     max_tokens = max(1, int(getattr(args, "cheetah_token_max_tokens", 24)))
@@ -749,9 +763,19 @@ def _train_prediction_tables(
     if learning_rate <= 0:
         learning_rate = 0.01
     value_cap = max(1, int(getattr(args, "cheetah_token_value_cap", 8192)))
+    total_records = len(record_list)
+    log(
+        "[train] cheetah prediction training: staging "
+        f"{total_records} record(s) for table '{table}' "
+        f"(key='{key_label}', lr={learning_rate:.4f}, max_tokens={max_tokens}, value_cap={value_cap})."
+    )
     seeded_tokens: set[int] = getattr(engine, "_prediction_seeded_tokens", set())
     updates = 0
-    for record in records:
+    progress_interval = float(getattr(args, "cheetah_token_progress_interval", 60))
+    if progress_interval <= 0:
+        progress_interval = 60.0
+    last_progress = time.monotonic()
+    for index, record in enumerate(record_list, 1):
         context_text = _prediction_context_text(record)
         if not context_text:
             continue
@@ -784,11 +808,20 @@ def _train_prediction_tables(
             )
             if success:
                 updates += 1
+        if index % 250 == 0 or (time.monotonic() - last_progress) >= progress_interval:
+            log(
+                "[train] cheetah prediction training progress: "
+                f"{index}/{total_records} record(s) processed, "
+                f"{updates} update(s) applied, {len(seeded_tokens)} token(s) seeded."
+            )
+            last_progress = time.monotonic()
     if updates:
         setattr(engine, "_prediction_seeded_tokens", seeded_tokens)
         log(
             f"[train] cheetah prediction training: applied {updates} update(s) to table '{table}'."
         )
+    else:
+        log(f"[train] cheetah prediction training: no eligible updates for table '{table}'.")
 
 
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
