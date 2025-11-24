@@ -73,7 +73,8 @@ from the database.
   to `0` to disable it. Heavy reducers now queue via `PAIR_REDUCE_ASYNC`, and the Python adapter
   polls `PAIR_REDUCE_FETCH` every few seconds so sockets stay active. Tune `CHEETAH_REDUCE_ASYNC`
   (set to `0` for the legacy synchronous call) and
-  `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to change the cadence.
+  `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to change the cadence. While waiting, the adapter logs job
+  state/percentage so stalled reducers are obvious in the trainer output.
 - During ingest the Python pipeline streams new context metadata and Top-K probability slices into
   cheetah so the decoder can read them without re-querying SQLite, satisfying the adapter roadmap in
   `cheetah-db/README.md`.

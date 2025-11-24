@@ -47,7 +47,9 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   `PAIR_REDUCE_STATUS` reports progress (percent + state), and `PAIR_REDUCE_FETCH` streams the final
   payloads once the job completes. The Python adapter polls every few seconds (configurable via
   `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS`) so sockets never sit idle, and `CHEETAH_REDUCE_ASYNC=0`
-  forces a legacy synchronous fallback when debugging.
+  forces a legacy synchronous fallback when debugging. PENDING responses now include
+  `reducer=...`, `progress=...`, and `completed/total` counters so clients can surface live progress
+  indicators instead of appearing stalled.
 - The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,

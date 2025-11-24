@@ -135,6 +135,9 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
   token immediately, and lets clients poll `PAIR_REDUCE_STATUS`/`PAIR_REDUCE_FETCH` to monitor
   progress or stream the final payloads once the job completes.
+- `PAIR_REDUCE_FETCH` replies with `PENDING,...,progress=<percent>,completed=<n>,total=<n>` while a
+  job is still running so adapters can emit keep-alive logs; once the reducer finishes the response
+  mirrors the synchronous `PAIR_REDUCE` payload (including `next_cursor` when more pages remain).
 - `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
   sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
   fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of

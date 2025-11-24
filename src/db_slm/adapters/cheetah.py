@@ -284,21 +284,88 @@ class CheetahClient:
         if not job_id:
             self._async_reducers = False
             return None
-        return self._await_reduce_job(job_id)
+        target = self._describe_reduce_target(mode, prefix)
+        logger.warning(
+            "cheetah pair_reduce job %s queued (%s limit=%s cursor=%s)",
+            job_id,
+            target,
+            limit or "default",
+            "set" if cursor else "none",
+        )
+        return self._await_reduce_job(job_id, mode, target)
 
     def _await_reduce_job(
-        self, job_id: str
+        self, job_id: str, mode: str, target_label: str
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        last_progress: float | None = None
+        last_completed: int | None = None
+        last_state: str | None = None
+        last_log = 0.0
+        log_interval = max(30.0, self._reduce_poll_interval * 6.0)
         while True:
             response = self._command(f"PAIR_REDUCE_FETCH {job_id}")
             if not response:
                 return None
             if response.startswith("SUCCESS"):
+                if last_state:
+                    logger.warning(
+                        "cheetah reducer job %s (%s %s) completed",
+                        job_id,
+                        mode,
+                        target_label,
+                    )
                 return self._parse_pair_reduce_response(response)
             if response.startswith("PENDING"):
+                state = self._extract_response_field(response, "state") or "running"
+                reducer = self._extract_response_field(response, "reducer") or mode
+                progress = self._extract_float_field(response, "progress")
+                completed = self._extract_int_field(response, "completed")
+                total = self._extract_int_field(response, "total")
+                now = time.monotonic()
+                should_log = False
+                if state != last_state:
+                    should_log = True
+                elif (
+                    progress is not None
+                    and last_progress is not None
+                    and progress - last_progress >= 5.0
+                ):
+                    should_log = True
+                elif completed is not None and completed != last_completed:
+                    should_log = True
+                elif now - last_log >= log_interval:
+                    should_log = True
+                if should_log:
+                    percent_label = f"{progress:.1f}%" if progress is not None else "?"
+                    if completed is not None and total:
+                        extra = f"{completed}/{total}"
+                    else:
+                        extra = "in-progress"
+                    logger.warning(
+                        "cheetah reducer job %s (%s %s) state=%s progress=%s (%s)",
+                        job_id,
+                        reducer,
+                        target_label,
+                        state,
+                        percent_label,
+                        extra,
+                    )
+                    last_log = now
+                last_state = state
+                if progress is not None:
+                    last_progress = progress
+                if completed is not None:
+                    last_completed = completed
                 time.sleep(self._reduce_poll_interval)
                 continue
             if response.startswith("ERROR"):
+                logger.warning(
+                    "cheetah reducer job %s (%s %s) failed: %s",
+                    job_id,
+                    mode,
+                    target_label,
+                    response,
+                )
                 return None
             return None
 
@@ -319,6 +386,16 @@ class CheetahClient:
                 command = f"{command} 0"
             command = f"{command} x{cursor.hex()}"
         return command
+
+    @staticmethod
+    def _describe_reduce_target(mode: str, prefix: bytes) -> str:
+        if not prefix:
+            return f"{mode} *"
+        try:
+            label = prefix.decode("utf-8")
+        except UnicodeDecodeError:
+            label = f"x{prefix.hex()}"
+        return f"{mode} {label}"
 
     def pair_purge(
         self,
@@ -736,6 +813,26 @@ class CheetahClient:
             if trimmed.startswith(prefix):
                 return trimmed.split("=", 1)[1]
         return None
+
+    @staticmethod
+    def _extract_int_field(response: str, key: str) -> int | None:
+        value = CheetahClient._extract_response_field(response, key)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_float_field(response: str, key: str) -> float | None:
+        value = CheetahClient._extract_response_field(response, key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
 
     @staticmethod
     def _parse_pair_summary_response(prefix: bytes, response: str) -> NamespaceSummary | None:

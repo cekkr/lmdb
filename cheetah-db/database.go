@@ -2322,8 +2322,17 @@ func (db *Database) handleReduceJobFetch(jobID string) string {
 		}
 		return "ERROR,job_failed"
 	default:
+		_, completed, total, _ := job.progressSnapshot()
 		progress := job.progressPercent()
-		return fmt.Sprintf("PENDING,job=%s,state=%s,progress=%.2f", jobID, job.stateString(), progress)
+		return fmt.Sprintf(
+			"PENDING,job=%s,reducer=%s,state=%s,progress=%.2f,completed=%d,total=%d",
+			jobID,
+			job.mode,
+			job.stateString(),
+			progress,
+			completed,
+			total,
+		)
 	}
 }
 
