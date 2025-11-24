@@ -17,7 +17,8 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   `DBSLM_BACKEND=cheetah-db`.
 - When `src/train.py --reset` talks to cheetah, it now shrinks `PAIR_SCAN` page sizes whenever a page
   stalls and raises the TCP idle-grace target to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)`
-  seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`). This avoids the
+  seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`, clamp via
+  `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS`). This avoids the
   `cheetah response timed out after 30.0s of inactivity` spam even when the namespace is empty or the
   server sits on a slow disk; increase the timeout/idle-grace env vars further if remote cheetah
   instances still need more time.
@@ -42,6 +43,7 @@ Read and collect potential implementation to do in NEXT_STEPS.md
 - `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
   MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
   exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
+- Reducer pages that stall now trigger automatic retries on the Python side before the adapter is disabled. The idle window is capped at roughly five minutes via `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS` (set to `0` to disable the clamp), and `CHEETAH_REDUCER_RETRY_ATTEMPTS` plus `CHEETAH_REDUCER_RETRY_DELAY_SECONDS` tune how many times the client replays the failed `PAIR_REDUCE` request across noisy or high-latency links.
 - The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,

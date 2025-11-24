@@ -69,6 +69,16 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         cheetah_idle_grace_seconds = max(0.0, float(idle_grace_raw))
     else:
         cheetah_idle_grace_seconds = max(cheetah_timeout_seconds * 180.0, 60.0)
+    idle_grace_cap_raw = read("DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS", "").strip()
+    if idle_grace_cap_raw:
+        try:
+            idle_grace_cap = max(0.0, float(idle_grace_cap_raw))
+        except ValueError:
+            idle_grace_cap = 0.0
+    else:
+        idle_grace_cap = 300.0
+    if idle_grace_cap > 0.0 and cheetah_idle_grace_seconds > idle_grace_cap:
+        cheetah_idle_grace_seconds = idle_grace_cap
     mirror_flag = read("DBSLM_CHEETAH_MIRROR", "0").lower()
     cheetah_mirror = mirror_flag in {"1", "true", "yes", "on"}
     tokenizer_backend = read("DBSLM_TOKENIZER_BACKEND", "regex").strip().lower()

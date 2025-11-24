@@ -1182,6 +1182,19 @@ class CheetahHotPathAdapter(HotPathAdapter):
             )
         except ValueError:
             self._pair_register_backoff = 0.25
+        reducer_retry_raw = os.environ.get("CHEETAH_REDUCER_RETRY_ATTEMPTS", "").strip()
+        try:
+            parsed_reducer_retry = int(reducer_retry_raw) if reducer_retry_raw else 3
+        except ValueError:
+            parsed_reducer_retry = 3
+        self._reducer_retry_attempts = max(1, parsed_reducer_retry)
+        reducer_delay_raw = os.environ.get("CHEETAH_REDUCER_RETRY_DELAY_SECONDS", "").strip()
+        try:
+            self._reducer_retry_delay = max(
+                0.0, float(reducer_delay_raw) if reducer_delay_raw else 5.0
+            )
+        except ValueError:
+            self._reducer_retry_delay = 5.0
 
     # ------------------------------------------------------------------ #
     # HotPathAdapter API
@@ -1454,6 +1467,42 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 break
         return trimmed
 
+    def _pair_reduce_with_retry(
+        self,
+        mode: str,
+        namespace: bytes,
+        *,
+        limit: int,
+        cursor: bytes | None,
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        namespace_label = namespace.decode("utf-8", "replace")
+        namespace_label = namespace_label.rstrip(":") or "<root>"
+        attempts = self._reducer_retry_attempts
+        delay = self._reducer_retry_delay
+        client = self._client
+        for attempt in range(1, attempts + 1):
+            result = client.pair_reduce(
+                mode,
+                namespace,
+                limit=limit,
+                cursor=cursor,
+            )
+            if result is not None:
+                return result
+            wait = delay if attempt < attempts else 0.0
+            logger.warning(
+                "cheetah pair_reduce %s namespace=%s attempt %s/%s timed out; %s",
+                mode,
+                namespace_label,
+                attempt,
+                attempts,
+                "retrying" if wait else "giving up",
+            )
+            client.close()
+            if wait > 0:
+                time.sleep(wait)
+        return None
+
     def iter_counts(self, order: int) -> list[RawCountsProjection]:
         if not self._enabled:
             return []
@@ -1463,7 +1512,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         cursor: bytes | None = None
         page_limit = self._recommended_reduce_page_size()
         while True:
-            result = self._client.pair_reduce(
+            result = self._pair_reduce_with_retry(
                 "counts",
                 namespace_bytes,
                 limit=page_limit,
@@ -1513,7 +1562,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         cursor: bytes | None = None
         page_limit = self._recommended_reduce_page_size()
         while True:
-            result = self._client.pair_reduce(
+            result = self._pair_reduce_with_retry(
                 "probabilities",
                 namespace_bytes,
                 limit=page_limit,
@@ -1561,7 +1610,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         cursor: bytes | None = None
         page_limit = self._recommended_reduce_page_size()
         while True:
-            result = self._client.pair_reduce(
+            result = self._pair_reduce_with_retry(
                 "continuations",
                 namespace_bytes,
                 limit=page_limit,

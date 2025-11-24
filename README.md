@@ -66,6 +66,13 @@ from the database.
 - The `DBSLM_CHEETAH_HOST/PORT/DATABASE/TIMEOUT_SECONDS` variables (see `.env.example`) point the
   adapter at the right instance; the default matches the server exposed by `cheetah-db/main.go`. Use
   a real address (127.0.0.1, LAN IP, Windows bridge IP inside WSL) rather than `0.0.0.0`.
+- Idle responses are now capped at ~5 minutes on the Python side even when
+  `DBSLM_CHEETAH_TIMEOUT_SECONDS` is raised for slow disks. Override
+  `DBSLM_CHEETAH_IDLE_GRACE_SECONDS` for an explicit window or set
+  `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS` (defaults to `300`) to clamp the derived value; set the cap
+  to `0` to disable it. Timed-out reducers are retried automatically before the hot-path adapter is
+  disabled �?" tune `CHEETAH_REDUCER_RETRY_ATTEMPTS` and
+  `CHEETAH_REDUCER_RETRY_DELAY_SECONDS` when working across high-latency links.
 - During ingest the Python pipeline streams new context metadata and Top-K probability slices into
   cheetah so the decoder can read them without re-querying SQLite, satisfying the adapter roadmap in
   `cheetah-db/README.md`.
@@ -85,6 +92,7 @@ DBSLM_CHEETAH_PORT=4455
 DBSLM_CHEETAH_TIMEOUT_SECONDS=1.0
 # Uncomment to extend the per-request idle grace (defaults to max(timeout*180, 60)s)
 # DBSLM_CHEETAH_IDLE_GRACE_SECONDS=300
+DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS=300
 # Uncomment to select a named database/namespace on shared cheetah instances:
 # DBSLM_CHEETAH_DATABASE=default
 ```

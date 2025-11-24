@@ -204,6 +204,7 @@ class TelemetryMonitor(threading.Thread):
             settings.cheetah_port,
             database=settings.cheetah_database,
             timeout=settings.cheetah_timeout_seconds,
+            idle_grace=settings.cheetah_idle_grace_seconds,
         )
         self._queue_path = Path(settings.quality_queue_path)
 
