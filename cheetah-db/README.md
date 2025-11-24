@@ -113,6 +113,10 @@ EDIT:<size> <abs_key> <payload> # overwrite payload in-place
 PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
 PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors supported)
 PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
+PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]
+                                # enqueue reducer job and return a job identifier
+PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
+PAIR_REDUCE_FETCH <job_id>      # fetch reducer results once completed (PENDING while running)
 PAIR_SUMMARY <prefix> [depth] [branch_limit]
                                 # aggregate namespace statistics (payload totals, branch fan-out)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
@@ -128,6 +132,9 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
   additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
+- `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
+  token immediately, and lets clients poll `PAIR_REDUCE_STATUS`/`PAIR_REDUCE_FETCH` to monitor
+  progress or stream the final payloads once the job completes.
 - `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
   sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
   fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of

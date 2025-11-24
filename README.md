@@ -70,9 +70,10 @@ from the database.
   `DBSLM_CHEETAH_TIMEOUT_SECONDS` is raised for slow disks. Override
   `DBSLM_CHEETAH_IDLE_GRACE_SECONDS` for an explicit window or set
   `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS` (defaults to `300`) to clamp the derived value; set the cap
-  to `0` to disable it. Timed-out reducers are retried automatically before the hot-path adapter is
-  disabled �?" tune `CHEETAH_REDUCER_RETRY_ATTEMPTS` and
-  `CHEETAH_REDUCER_RETRY_DELAY_SECONDS` when working across high-latency links.
+  to `0` to disable it. Heavy reducers now queue via `PAIR_REDUCE_ASYNC`, and the Python adapter
+  polls `PAIR_REDUCE_FETCH` every few seconds so sockets stay active. Tune `CHEETAH_REDUCE_ASYNC`
+  (set to `0` for the legacy synchronous call) and
+  `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to change the cadence.
 - During ingest the Python pipeline streams new context metadata and Top-K probability slices into
   cheetah so the decoder can read them without re-querying SQLite, satisfying the adapter roadmap in
   `cheetah-db/README.md`.
@@ -93,6 +94,8 @@ DBSLM_CHEETAH_TIMEOUT_SECONDS=1.0
 # Uncomment to extend the per-request idle grace (defaults to max(timeout*180, 60)s)
 # DBSLM_CHEETAH_IDLE_GRACE_SECONDS=300
 DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS=300
+CHEETAH_REDUCE_ASYNC=1
+CHEETAH_REDUCE_POLL_INTERVAL_SECONDS=5
 # Uncomment to select a named database/namespace on shared cheetah instances:
 # DBSLM_CHEETAH_DATABASE=default
 ```

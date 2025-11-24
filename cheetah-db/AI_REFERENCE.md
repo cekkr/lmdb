@@ -43,7 +43,11 @@ Read and collect potential implementation to do in NEXT_STEPS.md
 - `CheetahHotPathAdapter` mirrors raw follower counts (`PAIR_REDUCE counts`) and decoder metadata so
   MKNS rebuilds and session-cache profiles can run entirely over TCP. `NGramStore.topk_hit_ratio()`
   exposes coverage so you can watch cheetah eventually serve ≥90% of decoder requests.
-- Reducer pages that stall now trigger automatic retries on the Python side before the adapter is disabled. The idle window is capped at roughly five minutes via `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS` (set to `0` to disable the clamp), and `CHEETAH_REDUCER_RETRY_ATTEMPTS` plus `CHEETAH_REDUCER_RETRY_DELAY_SECONDS` tune how many times the client replays the failed `PAIR_REDUCE` request across noisy or high-latency links.
+- Heavy reducer workloads now use the asynchronous queue: `PAIR_REDUCE_ASYNC` enqueues the request,
+  `PAIR_REDUCE_STATUS` reports progress (percent + state), and `PAIR_REDUCE_FETCH` streams the final
+  payloads once the job completes. The Python adapter polls every few seconds (configurable via
+  `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS`) so sockets never sit idle, and `CHEETAH_REDUCE_ASYNC=0`
+  forces a legacy synchronous fallback when debugging.
 - The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,

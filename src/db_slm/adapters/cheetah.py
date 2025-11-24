@@ -141,6 +141,14 @@ class CheetahClient:
         self._last_errors: list[str] = []
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        async_raw = os.environ.get("CHEETAH_REDUCE_ASYNC", "1").strip().lower()
+        self._async_reducers = async_raw not in {"0", "false", "no", "off"}
+        poll_raw = os.environ.get("CHEETAH_REDUCE_POLL_INTERVAL_SECONDS", "").strip()
+        try:
+            poll_interval = float(poll_raw) if poll_raw else 5.0
+        except ValueError:
+            poll_interval = 5.0
+        self._reduce_poll_interval = max(1.0, poll_interval)
 
     # ------------------------------------------------------------------ #
     # Public helpers
@@ -234,18 +242,83 @@ class CheetahClient:
         limit: int = 0,
         cursor: bytes | None = None,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        if self._async_reducers:
+            result = self._pair_reduce_async(mode, prefix, limit=limit, cursor=cursor)
+            if result is not None:
+                return result
+        return self._pair_reduce_sync(mode, prefix, limit=limit, cursor=cursor)
+
+    def _pair_reduce_sync(
+        self,
+        mode: str,
+        prefix: bytes,
+        *,
+        limit: int,
+        cursor: bytes | None,
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        command = self._format_pair_reduce_command("PAIR_REDUCE", mode, prefix, limit, cursor)
+        response = self._command(command)
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_pair_reduce_response(response)
+
+    def _pair_reduce_async(
+        self,
+        mode: str,
+        prefix: bytes,
+        *,
+        limit: int,
+        cursor: bytes | None,
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        command = self._format_pair_reduce_command("PAIR_REDUCE_ASYNC", mode, prefix, limit, cursor)
+        response = self._command(command)
+        if not response:
+            return None
+        lowered = response.lower()
+        if lowered.startswith("error,unknown_command") or "async_reducer_unavailable" in lowered:
+            self._async_reducers = False
+            return None
+        if not response.startswith("SUCCESS"):
+            return None
+        job_id = self._extract_response_field(response, "job")
+        if not job_id:
+            self._async_reducers = False
+            return None
+        return self._await_reduce_job(job_id)
+
+    def _await_reduce_job(
+        self, job_id: str
+    ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
+        while True:
+            response = self._command(f"PAIR_REDUCE_FETCH {job_id}")
+            if not response:
+                return None
+            if response.startswith("SUCCESS"):
+                return self._parse_pair_reduce_response(response)
+            if response.startswith("PENDING"):
+                time.sleep(self._reduce_poll_interval)
+                continue
+            if response.startswith("ERROR"):
+                return None
+            return None
+
+    def _format_pair_reduce_command(
+        self,
+        command_name: str,
+        mode: str,
+        prefix: bytes,
+        limit: int,
+        cursor: bytes | None,
+    ) -> str:
         arg = "*" if not prefix else f"x{prefix.hex()}"
-        command = f"PAIR_REDUCE {mode} {arg}"
+        command = f"{command_name} {mode} {arg}"
         if limit != 0:
             command = f"{command} {limit}"
         if cursor:
             if limit == 0:
                 command = f"{command} 0"
             command = f"{command} x{cursor.hex()}"
-        response = self._command(command)
-        if not response or not response.startswith("SUCCESS"):
-            return None
-        return self._parse_pair_reduce_response(response)
+        return command
 
     def pair_purge(
         self,
@@ -653,6 +726,15 @@ class CheetahClient:
                         return bytes.fromhex(token[1:])
                     except ValueError:
                         return None
+        return None
+
+    @staticmethod
+    def _extract_response_field(response: str, key: str) -> str | None:
+        prefix = f"{key}="
+        for part in response.split(","):
+            trimmed = part.strip()
+            if trimmed.startswith(prefix):
+                return trimmed.split("=", 1)[1]
         return None
 
     @staticmethod

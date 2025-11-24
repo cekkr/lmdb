@@ -1,9 +1,9 @@
-﻿// database.go
+// database.go
 package main
 
 import (
-	"container/list"
 	"bytes"
+	"container/list"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -47,6 +47,7 @@ type Database struct {
 	forkScheduler    *ForkScheduler
 	predictStore     *PredictionManager
 	clusterMessenger *ClusterMessenger
+	reduceJobs       *reduceJobManager
 }
 
 type pairTableCache struct {
@@ -368,6 +369,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		jumpDir:        jumpDir,
 		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
 		forkScheduler:  newForkScheduler(path),
+		reduceJobs:     newReduceJobManager(),
 	}
 	db.predictStore = newPredictionManager(path)
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
@@ -1452,41 +1454,46 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		fields := strings.Fields(args)
-		if len(fields) < 2 {
-			response = "ERROR,pair_reduce_requires_mode_and_prefix"
+		mode, prefix, limit, cursor, errResp, parseErr := parsePairReduceArgs(fields)
+		if errResp != "" {
+			response = errResp
 			break
 		}
-		mode := strings.ToLower(fields[0])
-		var prefix []byte
-		if fields[1] != "*" {
-			prefix, err = parseValue(fields[1])
-			if err != nil {
-				response = err.Error()
-				err = nil
-				break
-			}
-		}
-		limit := 0
-		if len(fields) > 2 {
-			limit, err = strconv.Atoi(fields[2])
-			if err != nil {
-				response = "ERROR,invalid_limit"
-				err = nil
-				break
-			}
-		}
-		var cursor []byte
-		if len(fields) > 3 {
-			if fields[3] != "*" {
-				cursor, err = parseValue(fields[3])
-				if err != nil {
-					response = err.Error()
-					err = nil
-					break
-				}
-			}
+		if parseErr != nil {
+			err = parseErr
+			break
 		}
 		response, err = db.handlePairReduce(mode, prefix, limit, cursor)
+	case command == "PAIR_REDUCE_ASYNC":
+		if args == "" {
+			response = "ERROR,pair_reduce_requires_args"
+			break
+		}
+		fields := strings.Fields(args)
+		mode, prefix, limit, cursor, errResp, parseErr := parsePairReduceArgs(fields)
+		if errResp != "" {
+			response = errResp
+			break
+		}
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		response, err = db.handleAsyncReduce(mode, prefix, limit, cursor)
+	case command == "PAIR_REDUCE_FETCH":
+		jobID := strings.TrimSpace(args)
+		if jobID == "" {
+			response = "ERROR,missing_job_id"
+			break
+		}
+		response = db.handleReduceJobFetch(jobID)
+	case command == "PAIR_REDUCE_STATUS":
+		jobID := strings.TrimSpace(args)
+		if jobID == "" {
+			response = "ERROR,missing_job_id"
+			break
+		}
+		response = db.handleReduceJobStatus(jobID)
 	case command == "PAIR_SUMMARY":
 		if args == "" {
 			response = "ERROR,pair_summary_requires_prefix"
@@ -2104,10 +2111,43 @@ func (db *Database) walkPairTable(
 	return nil
 }
 
+func parsePairReduceArgs(fields []string) (string, []byte, int, []byte, string, error) {
+	if len(fields) < 2 {
+		return "", nil, 0, nil, "ERROR,pair_reduce_requires_mode_and_prefix", nil
+	}
+	mode := strings.ToLower(fields[0])
+	var prefix []byte
+	var err error
+	if fields[1] != "*" {
+		prefix, err = parseValue(fields[1])
+		if err != nil {
+			return "", nil, 0, nil, err.Error(), nil
+		}
+	}
+	limit := 0
+	if len(fields) > 2 && strings.TrimSpace(fields[2]) != "" {
+		limit, err = strconv.Atoi(fields[2])
+		if err != nil {
+			return "", nil, 0, nil, "ERROR,invalid_limit", nil
+		}
+	}
+	var cursor []byte
+	if len(fields) > 3 {
+		cursorField := strings.TrimSpace(fields[3])
+		if cursorField != "" && cursorField != "*" {
+			cursor, err = parseValue(cursorField)
+			if err != nil {
+				return "", nil, 0, nil, err.Error(), nil
+			}
+		}
+	}
+	return mode, prefix, limit, cursor, "", nil
+}
+
 func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {
 	switch mode {
 	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor)
+		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, nil)
 		if err != nil {
 			return "", err
 		}
@@ -2117,7 +2157,7 @@ func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, curs
 	}
 }
 
-func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) ([]PairReduceResult, []byte, error) {
+func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, progress func(done int, total int)) ([]PairReduceResult, []byte, error) {
 	scanResults, nextCursor, err := db.PairScan(prefix, limit, cursor)
 	if err != nil {
 		return nil, nil, err
@@ -2126,7 +2166,11 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 		return nil, nextCursor, nil
 	}
 
-	reduced := make([]PairReduceResult, len(scanResults))
+	total := len(scanResults)
+	if progress != nil {
+		progress(0, total)
+	}
+	reduced := make([]PairReduceResult, total)
 	workerCount := db.recommendedWorkerCount(len(scanResults), len(scanResults))
 	if workerCount < 1 {
 		workerCount = 1
@@ -2142,6 +2186,8 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 	var firstErr error
 	var errOnce sync.Once
 	var abort atomic.Bool
+	var completed atomic.Int32
+	var lastProgress atomic.Int64
 
 	setErr := func(e error) {
 		if e == nil {
@@ -2172,6 +2218,22 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 				Key:     job.item.Key,
 				Payload: payload,
 			}
+			if progress != nil {
+				done := int(completed.Add(1))
+				if done >= total {
+					progress(done, total)
+					continue
+				}
+				now := time.Now().UnixNano()
+				last := lastProgress.Load()
+				if last == 0 || now-last >= int64(250*time.Millisecond) {
+					if lastProgress.CompareAndSwap(last, now) {
+						progress(done, total)
+					}
+				}
+			} else {
+				completed.Add(1)
+			}
 		}
 	}
 
@@ -2193,6 +2255,76 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte) (
 	}
 
 	return reduced, nextCursor, nil
+}
+
+func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, cursor []byte) (*reduceJob, error) {
+	if db.reduceJobs == nil {
+		return nil, fmt.Errorf("async reducer unavailable")
+	}
+	job := db.reduceJobs.newJob(mode)
+	go func(j *reduceJob) {
+		j.markRunning()
+		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, func(done int, total int) {
+			j.updateProgress(done, total)
+		})
+		if err != nil {
+			j.markFailed(err)
+			return
+		}
+		j.markCompleted(results, nextCursor)
+	}(job)
+	return job, nil
+}
+
+func (db *Database) handleAsyncReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {
+	switch mode {
+	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
+		job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("SUCCESS,reducer=%s,job=%s,state=queued", mode, job.id), nil
+	default:
+		return "ERROR,unknown_reducer_mode", nil
+	}
+}
+
+func (db *Database) handleReduceJobStatus(jobID string) string {
+	if db.reduceJobs == nil {
+		return "ERROR,async_reducer_unavailable"
+	}
+	job := db.reduceJobs.getJob(jobID)
+	if job == nil {
+		return "ERROR,reduce_job_not_found"
+	}
+	progress := job.progressPercent()
+	return fmt.Sprintf("SUCCESS,job=%s,state=%s,progress=%.2f", jobID, job.stateString(), progress)
+}
+
+func (db *Database) handleReduceJobFetch(jobID string) string {
+	if db.reduceJobs == nil {
+		return "ERROR,async_reducer_unavailable"
+	}
+	job := db.reduceJobs.getJob(jobID)
+	if job == nil {
+		return "ERROR,reduce_job_not_found"
+	}
+	state, results, nextCursor, err := job.resultSnapshot()
+	switch state {
+	case reduceJobCompleted:
+		response := formatPairReduceResponse(results, job.mode, nextCursor)
+		db.reduceJobs.deleteJob(jobID)
+		return response
+	case reduceJobFailed:
+		db.reduceJobs.deleteJob(jobID)
+		if err != nil {
+			return fmt.Sprintf("ERROR,job_failed:%v", err)
+		}
+		return "ERROR,job_failed"
+	default:
+		progress := job.progressPercent()
+		return fmt.Sprintf("PENDING,job=%s,state=%s,progress=%.2f", jobID, job.stateString(), progress)
+	}
 }
 
 func (db *Database) readValuePayload(key uint64) ([]byte, error) {
