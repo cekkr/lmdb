@@ -1685,11 +1685,54 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 type pairScanTask struct {
 	tableID uint32
 	prefix  []byte
+	cursor  []byte
 }
 
 type pairSummaryTask struct {
 	tableID uint32
 	path    []byte
+}
+
+func comparePrefixToCursor(prefix []byte, cursor []byte) int {
+	if len(cursor) == 0 {
+		return 1
+	}
+	limit := len(prefix)
+	if len(cursor) < limit {
+		limit = len(cursor)
+	}
+	cmp := bytes.Compare(prefix[:limit], cursor[:limit])
+	if cmp != 0 {
+		return cmp
+	}
+	if len(prefix) == len(cursor) {
+		return 0
+	}
+	if len(prefix) < len(cursor) {
+		return -1
+	}
+	return 1
+}
+
+func nextCursorForPrefix(prefix []byte, cursor []byte) ([]byte, bool) {
+	if len(cursor) == 0 {
+		return nil, false
+	}
+	limit := len(prefix)
+	if len(cursor) < limit {
+		limit = len(cursor)
+	}
+	cmp := bytes.Compare(prefix[:limit], cursor[:limit])
+	if cmp < 0 {
+		return nil, true
+	}
+	if cmp > 0 {
+		return nil, false
+	}
+	if len(prefix) < len(cursor) {
+		return cursor, false
+	}
+	return nil, false
 }
 
 type pairSummaryAccumulator struct {
@@ -1852,7 +1895,11 @@ func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, wo
 	var abort atomic.Bool
 
 	pending.Add(1)
-	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...)}
+	var initialCursor []byte
+	if len(acc.cursor) > 0 {
+		initialCursor = append([]byte{}, acc.cursor...)
+	}
+	tasks <- pairScanTask{tableID: tableID, prefix: append([]byte{}, prefix...), cursor: initialCursor}
 	go func() {
 		pending.Wait()
 		close(tasks)
@@ -2032,6 +2079,16 @@ func (db *Database) walkPairTable(
 	abort *atomic.Bool,
 ) error {
 	defer pending.Done()
+	cursor := task.cursor
+	if len(cursor) > 0 && len(task.prefix) > 0 {
+		cmp := comparePrefixToCursor(task.prefix, cursor)
+		if cmp < 0 {
+			return nil
+		}
+		if cmp > 0 {
+			cursor = nil
+		}
+	}
 	table, err := db.getPairTable(task.tableID)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2079,6 +2136,14 @@ func (db *Database) walkPairTable(
 			continue
 		}
 		value := append(append([]byte{}, task.prefix...), chunk...)
+		childCursor := cursor
+		if childCursor != nil {
+			var skip bool
+			childCursor, skip = nextCursorForPrefix(value, childCursor)
+			if skip {
+				continue
+			}
+		}
 		if entryHasTerminal(entry) {
 			if acc.add(value, decodeAbsoluteKey(entry)) && abort != nil && acc.limit > 0 {
 				abort.Store(true)
@@ -2093,9 +2158,17 @@ func (db *Database) walkPairTable(
 					return nil
 				}
 			}
+			jumpCursor := childCursor
+			if jumpCursor != nil {
+				var skip bool
+				jumpCursor, skip = nextCursorForPrefix(extended, jumpCursor)
+				if skip {
+					continue
+				}
+			}
 			if node.NextTableID != 0 {
 				pending.Add(1)
-				tasks <- pairScanTask{tableID: node.NextTableID, prefix: extended}
+				tasks <- pairScanTask{tableID: node.NextTableID, prefix: extended, cursor: jumpCursor}
 			}
 			continue
 		}
@@ -2105,7 +2178,7 @@ func (db *Database) walkPairTable(
 				continue
 			}
 			pending.Add(1)
-			tasks <- pairScanTask{tableID: childID, prefix: append([]byte{}, value...)}
+			tasks <- pairScanTask{tableID: childID, prefix: append([]byte{}, value...), cursor: childCursor}
 		}
 	}
 	return nil

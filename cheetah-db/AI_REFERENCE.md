@@ -50,6 +50,10 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   forces a legacy synchronous fallback when debugging. PENDING responses now include
   `reducer=...`, `progress=...`, and `completed/total` counters so clients can surface live progress
   indicators instead of appearing stalled.
+- `PAIR_SCAN`/`PAIR_REDUCE` paging is cursor-aware again: when a client supplies `next_cursor`, the
+  server skips entire subtrees that fall lexicographically below that cursor so the next reducer page
+  no longer re-walks millions of keys just to reach the next chunk. Iterating large namespaces is now
+  proportional to the number of rows returned, not the total namespace size.
 - The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,
