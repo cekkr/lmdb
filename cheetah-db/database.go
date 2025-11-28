@@ -1697,40 +1697,24 @@ func comparePrefixToCursor(prefix []byte, cursor []byte) int {
 	if len(cursor) == 0 {
 		return 1
 	}
-	limit := len(prefix)
-	if len(cursor) < limit {
-		limit = len(cursor)
-	}
-	cmp := bytes.Compare(prefix[:limit], cursor[:limit])
-	if cmp != 0 {
-		return cmp
-	}
-	if len(prefix) == len(cursor) {
+	if bytes.HasPrefix(cursor, prefix) {
 		return 0
 	}
-	if len(prefix) < len(cursor) {
-		return -1
+	if bytes.HasPrefix(prefix, cursor) {
+		return 1
 	}
-	return 1
+	return bytes.Compare(prefix, cursor)
 }
 
 func nextCursorForPrefix(prefix []byte, cursor []byte) ([]byte, bool) {
 	if len(cursor) == 0 {
 		return nil, false
 	}
-	limit := len(prefix)
-	if len(cursor) < limit {
-		limit = len(cursor)
-	}
-	cmp := bytes.Compare(prefix[:limit], cursor[:limit])
-	if cmp < 0 {
-		return nil, true
-	}
-	if cmp > 0 {
-		return nil, false
-	}
-	if len(prefix) < len(cursor) {
+	if bytes.HasPrefix(cursor, prefix) {
 		return cursor, false
+	}
+	if bytes.Compare(prefix, cursor) < 0 {
+		return nil, true
 	}
 	return nil, false
 }
