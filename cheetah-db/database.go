@@ -1871,7 +1871,18 @@ func (a *pairScanAccumulator) finalize(limit int) ([]PairScanResult, []byte) {
 }
 
 func (db *Database) parallelCollectPairEntries(tableID uint32, prefix []byte, workers int, acc *pairScanAccumulator) error {
-	tasks := make(chan pairScanTask, workers*4)
+	// Avoid deadlocks when a very dense table fans out more tasks than workers*buffer
+	// by sizing the queue to hold at least the maximum branch fan-out.
+	queueSize := workers * 4
+	if db.branchCodec.branchCount > queueSize {
+		queueSize = db.branchCodec.branchCount
+	}
+	// Add a little headroom so jumps/child tables can enqueue without blocking.
+	queueSize *= 2
+	if queueSize < 16 {
+		queueSize = 16
+	}
+	tasks := make(chan pairScanTask, queueSize)
 	var pending sync.WaitGroup
 	var workerWG sync.WaitGroup
 	var firstErr error
