@@ -2074,6 +2074,19 @@ func (db *Database) walkPairTable(
 	abort *atomic.Bool,
 ) error {
 	defer pending.Done()
+	enqueue := func(t pairScanTask) error {
+		if abort != nil && abort.Load() {
+			return nil
+		}
+		pending.Add(1)
+		select {
+		case tasks <- t:
+			return nil
+		default:
+			// Channel is saturated; process inline to avoid deadlock.
+			return db.walkPairTable(t, acc, pending, tasks, abort)
+		}
+	}
 	cursor := task.cursor
 	if len(cursor) > 0 && len(task.prefix) > 0 {
 		cmp := comparePrefixToCursor(task.prefix, cursor)
@@ -2162,8 +2175,9 @@ func (db *Database) walkPairTable(
 				}
 			}
 			if node.NextTableID != 0 {
-				pending.Add(1)
-				tasks <- pairScanTask{tableID: node.NextTableID, prefix: extended, cursor: jumpCursor}
+				if err := enqueue(pairScanTask{tableID: node.NextTableID, prefix: extended, cursor: jumpCursor}); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -2172,8 +2186,9 @@ func (db *Database) walkPairTable(
 			if childID == 0 {
 				continue
 			}
-			pending.Add(1)
-			tasks <- pairScanTask{tableID: childID, prefix: append([]byte{}, value...), cursor: childCursor}
+			if err := enqueue(pairScanTask{tableID: childID, prefix: append([]byte{}, value...), cursor: childCursor}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
