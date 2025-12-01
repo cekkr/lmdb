@@ -659,17 +659,27 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 		return PredictionEntry{}, errPredictionEntryNotFound
 	}
 	targetEncoded := base64.StdEncoding.EncodeToString(target)
-	for idx := range entry.Values {
-		expected := -1.0
-		if entry.Values[idx].Value == targetEncoded {
-			expected = 1.0
+	idx := -1
+	for i := range entry.Values {
+		if entry.Values[i].Value == targetEncoded {
+			idx = i
+			break
 		}
-		score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
-		err := expected - score
-		entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + lr*err)
-		entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
-		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
+	if idx == -1 {
+		entry.Values = append(entry.Values, PredictionValue{
+			Value:            targetEncoded,
+			BaseProbability:  0.05,
+			ContextWeights:   nil,
+			LastUpdatedEpoch: time.Now().Unix(),
+		})
+		idx = len(entry.Values) - 1
+	}
+	score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
+	err := 1.0 - score
+	entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + lr*err)
+	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
+	entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	entry.UpdatedAt = time.Now().UTC()
 	p.markDirtyLocked(entry.Key)
 	return *entry, nil

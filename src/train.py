@@ -786,7 +786,9 @@ def _train_prediction_tables(
         if not token_ids:
             continue
         limit = min(max_tokens, len(token_ids))
-        for token_id in token_ids[:limit]:
+        # De-duplicate within a single response to avoid over-weighting repeats of the same token.
+        unique_tokens = list(dict.fromkeys(token_ids[:limit]))
+        for token_id in unique_tokens:
             value_bytes = _encode_prediction_token(token_id)
             if token_id not in seeded_tokens:
                 if len(seeded_tokens) >= value_cap:
