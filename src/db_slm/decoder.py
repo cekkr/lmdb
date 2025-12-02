@@ -242,6 +242,9 @@ class Decoder:
             prob = max(0.0, float(entry.probability))
             distribution[token_id] = prob
             total += prob
+        # Avoid collapsing decoding when only a single prediction survives.
+        if len(distribution) < 2:
+            return None
         if total <= 0.0 or not distribution:
             return None
         for token_id in list(distribution.keys()):

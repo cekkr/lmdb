@@ -602,8 +602,14 @@ func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]fl
 	if !ok {
 		return nil, errPredictionEntryNotFound
 	}
+	if len(entry.Values) == 0 {
+		return nil, errPredictionEntryNotFound
+	}
 	results := make([]PredictionResult, 0, len(entry.Values))
 	windowMerge := p.merger.Merge(windows)
+	// Treat stored BaseProbability as a score/logit. Convert to a normalized distribution
+	// via softmax so one runaway entry cannot collapse all predictions.
+	scores := make([]float64, 0, len(entry.Values))
 	for _, value := range entry.Values {
 		decoded, err := base64.StdEncoding.DecodeString(value.Value)
 		if err != nil {
@@ -612,10 +618,29 @@ func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]fl
 		score := value.BaseProbability
 		score += applyContextWeights(ctx, value.ContextWeights)
 		score += mergeProbabilityWeight(windowMerge)
-		results = append(results, PredictionResult{
-			Value:       decoded,
-			Probability: clampProbability(score),
-		})
+		scores = append(scores, score)
+		results = append(results, PredictionResult{Value: decoded})
+	}
+	if len(results) == 0 {
+		return nil, errPredictionEntryNotFound
+	}
+	maxScore := scores[0]
+	for _, s := range scores[1:] {
+		if s > maxScore {
+			maxScore = s
+		}
+	}
+	var sumExp float64
+	for idx, s := range scores {
+		expVal := math.Exp(s - maxScore)
+		scores[idx] = expVal
+		sumExp += expVal
+	}
+	if sumExp <= 0 {
+		return nil, errPredictionEntryNotFound
+	}
+	for idx := range results {
+		results[idx].Probability = scores[idx] / sumExp
 	}
 	sortPredictionResults(results)
 	return results, nil
@@ -676,8 +701,9 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 		idx = len(entry.Values) - 1
 	}
 	score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
-	err := 1.0 - score
-	entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + lr*err)
+	pred := sigmoid(score)
+	err := 1.0 - pred
+	entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability + lr*err
 	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
 	entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	entry.UpdatedAt = time.Now().UTC()
@@ -703,9 +729,9 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 		bias := applyContextWeights(ctx, entry.Values[idx].ContextWeights) * strength
 		switch mode {
 		case "scale", "multiply":
-			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability * (1 + bias))
+			entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability * (1 + bias)
 		default:
-			entry.Values[idx].BaseProbability = clampProbability(entry.Values[idx].BaseProbability + bias)
+			entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability + bias
 		}
 		entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	}
@@ -767,6 +793,16 @@ func clampProbability(value float64) float64 {
 	default:
 		return value
 	}
+}
+
+func sigmoid(x float64) float64 {
+	// Stable sigmoid to avoid overflow for large magnitudes.
+	if x >= 0 {
+		z := math.Exp(-x)
+		return 1 / (1 + z)
+	}
+	z := math.Exp(x)
+	return z / (1 + z)
 }
 
 func encodeKey(key []byte) string {
