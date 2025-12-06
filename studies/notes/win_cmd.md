@@ -7,7 +7,7 @@ Complex training:
 python3.11 src/train.py datasets/GPTeacher.json --ngram-order 5 --json-chunk-size 50 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 20.0 --eval-interval 50000 --profile-ingest --decoder-presence-penalty 0.3 --decoder-frequency-penalty 0.1 --context-dimensions 8,12,16,22,32 --reset
 
 Linux Mint:
-python3.13 src/train.py datasets/GPTeacher.json --ngram-order 8 --json-chunk-size 500 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 10.0 --eval-interval 10000 --profile-ingest --decoder-presence-penalty 0.4 --decoder-frequency-penalty 0.2 --context-dimensions 16,20,24,38,46 --reset
+python3.13 src/train.py datasets/GPTeacher.json --ngram-order 8 --json-chunk-size 500 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 10.0 --eval-interval 10000 --profile-ingest --decoder-presence-penalty 0.4 --decoder-frequency-penalty 0.2 --context-dimensions 16,20,24,38,42,46 --reset
 
 Lighter training:
 python3.11 src/train.py datasets/GPTeacher.json --ngram-order 3 --json-chunk-size 100 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 20.0 --eval-interval 1000 --profile-ingest --decoder-presence-penalty 0.3 --decoder-frequency-penalty 0.1 --context-dimensions 12,16,22 --reset
