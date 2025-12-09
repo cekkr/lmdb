@@ -38,6 +38,9 @@ type Database struct {
 	mu               sync.Mutex
 	pairDir          string // Path alla cartella /pairs
 	nextPairIDPath   string // Path al file che memorizza il contatore
+	jumpDataPath     string
+	jumpIndexPath    string
+	jumpMu           sync.Mutex
 	resources        *ResourceMonitor
 	settings         DatabaseConfig
 	branchCodec      pairBranchCodec
@@ -367,6 +370,8 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		settings:       cfg,
 		branchCodec:    codec,
 		jumpDir:        jumpDir,
+		jumpDataPath:   filepath.Join(jumpDir, "jumps.bin"),
+		jumpIndexPath:  filepath.Join(jumpDir, "index.bin"),
 		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
 		forkScheduler:  newForkScheduler(path),
 		reduceJobs:     newReduceJobManager(),

@@ -245,6 +245,12 @@ automatically normalizes outputs.
   - `var/eval_logs/cheetah_db_benchmark_20251112-130623.log` — 24 workers / 30 s (~64 ops/s aggregate).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164324.log` — 32 workers / 45 s (90→56 ops/s before the graceful drain, 1002 inserts, errors=0).
   - `var/eval_logs/cheetah_db_benchmark_20251112-164803.log` — 24 workers / 30 s rerun (96→67 ops/s, pair scans present in every bucket).
+- Jump nodes now live in `pair_jumps/jumps.bin` with an `index.bin` offset table, eliminating the
+  millions-of-files inode blow-up. Legacy `.jump` files are still read and backfilled into the new
+  store, then unlinked. If you still see `no space left on device` for `pair_jumps/*.jump`, check
+  inode usage (`df -i` or `find cheetah_data/<db>/pair_jumps -maxdepth 1 -type f | wc -l`) and run
+  `RESET_DB <db>`/`PAIR_PURGE *` to clear old data or move the data dir to a filesystem with more
+  inodes. Using wider nodes (`pair_bytes=2`) can reduce jump creation on very large keys.
 - The pair-table cache now enforces a descriptor cap derived from `RLIMIT_NOFILE` (override via
   `CHEETAH_MAX_PAIR_TABLES`). Idle handles are closed and transparently re-opened when the trie node
   is touched again, so long-running ingests stop tripping `open ... next_id.dat: too many open files`
