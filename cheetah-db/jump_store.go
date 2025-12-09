@@ -113,10 +113,32 @@ func (db *Database) loadJumpFromIndexLocked(id uint32) (*JumpNode, error) {
 		return nil, err
 	}
 
-	offset := binary.BigEndian.Uint64(offsetBuf)
-	if offset == 0 {
-		return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+	offsetRaw := binary.BigEndian.Uint64(offsetBuf)
+	// Index stores offset+1 so zero stays reserved for "missing".
+	if offsetRaw == 0 {
+		// Backward compatibility: the very first jump written before offset+1 encoding
+		// used offset 0. Only attempt that slot when it exists and only for ID 1.
+		dataFile, err := os.Open(db.jumpDataPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+			}
+			return nil, err
+		}
+		defer dataFile.Close()
+		if id != 1 {
+			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+		}
+		info, err := dataFile.Stat()
+		if err != nil {
+			return nil, err
+		}
+		if info.Size() == 0 {
+			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+		}
+		return decodeJumpAt(dataFile, 0, id)
 	}
+	offset := int64(offsetRaw - 1)
 
 	dataFile, err := os.Open(db.jumpDataPath)
 	if err != nil {
@@ -127,50 +149,7 @@ func (db *Database) loadJumpFromIndexLocked(id uint32) (*JumpNode, error) {
 	}
 	defer dataFile.Close()
 
-	header := make([]byte, 4)
-	if _, err := dataFile.ReadAt(header, int64(offset)); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
-		}
-		return nil, err
-	}
-
-	length := binary.BigEndian.Uint32(header)
-	entrySize := int64(4) + int64(length) + 1 + 8 + 4
-	entry := make([]byte, entrySize)
-	if _, err := dataFile.ReadAt(entry, int64(offset)); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, fmt.Errorf("jump %d truncated", id)
-		}
-		return nil, err
-	}
-
-	length = binary.BigEndian.Uint32(entry[:4])
-	offsetInt := 4
-	if int(length) < 0 || offsetInt+int(length) > len(entry) {
-		return nil, fmt.Errorf("jump %d invalid length", id)
-	}
-	bytes := make([]byte, length)
-	copy(bytes, entry[offsetInt:offsetInt+int(length)])
-	offsetInt += int(length)
-	if offsetInt >= len(entry) {
-		return nil, fmt.Errorf("jump %d truncated", id)
-	}
-	flags := entry[offsetInt]
-	offsetInt++
-	if offsetInt+8+4 > len(entry) {
-		return nil, fmt.Errorf("jump %d truncated header", id)
-	}
-	terminalKey := binary.BigEndian.Uint64(entry[offsetInt : offsetInt+8])
-	offsetInt += 8
-	nextTableID := binary.BigEndian.Uint32(entry[offsetInt : offsetInt+4])
-	return &JumpNode{
-		ID:          id,
-		Bytes:       bytes,
-		HasTerminal: (flags & 0x01) != 0,
-		TerminalKey: terminalKey,
-		NextTableID: nextTableID,
-	}, nil
+	return decodeJumpAt(dataFile, offset, id)
 }
 
 func (db *Database) writeJump(node *JumpNode) error {
@@ -227,7 +206,8 @@ func (db *Database) writeJumpLocked(node *JumpNode) error {
 	defer indexFile.Close()
 
 	offsetBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(offsetBuf, uint64(dataOffset))
+	// Store offset+1 so zero stays reserved for "missing".
+	binary.BigEndian.PutUint64(offsetBuf, uint64(dataOffset)+1)
 	_, err = indexFile.WriteAt(offsetBuf, idToIndex(node.ID))
 	return err
 }
@@ -335,4 +315,51 @@ func idToIndex(id uint32) int64 {
 		return 0
 	}
 	return int64(id-1) * 8
+}
+
+func decodeJumpAt(reader io.ReaderAt, offset int64, id uint32) (*JumpNode, error) {
+	header := make([]byte, 4)
+	if _, err := reader.ReadAt(header, offset); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("jump %d missing: %w", id, errJumpNodeMissing)
+		}
+		return nil, err
+	}
+
+	length := binary.BigEndian.Uint32(header)
+	entrySize := int64(4) + int64(length) + 1 + 8 + 4
+	entry := make([]byte, entrySize)
+	if _, err := reader.ReadAt(entry, offset); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("jump %d truncated", id)
+		}
+		return nil, err
+	}
+
+	length = binary.BigEndian.Uint32(entry[:4])
+	offsetInt := 4
+	if int(length) < 0 || offsetInt+int(length) > len(entry) {
+		return nil, fmt.Errorf("jump %d invalid length", id)
+	}
+	bytes := make([]byte, length)
+	copy(bytes, entry[offsetInt:offsetInt+int(length)])
+	offsetInt += int(length)
+	if offsetInt >= len(entry) {
+		return nil, fmt.Errorf("jump %d truncated", id)
+	}
+	flags := entry[offsetInt]
+	offsetInt++
+	if offsetInt+8+4 > len(entry) {
+		return nil, fmt.Errorf("jump %d truncated header", id)
+	}
+	terminalKey := binary.BigEndian.Uint64(entry[offsetInt : offsetInt+8])
+	offsetInt += 8
+	nextTableID := binary.BigEndian.Uint32(entry[offsetInt : offsetInt+4])
+	return &JumpNode{
+		ID:          id,
+		Bytes:       bytes,
+		HasTerminal: (flags & 0x01) != 0,
+		TerminalKey: terminalKey,
+		NextTableID: nextTableID,
+	}, nil
 }
