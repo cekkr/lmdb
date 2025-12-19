@@ -112,7 +112,9 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   embeds the windows with `all-MiniLM-L6-v2`, and keeps running prototypes per dimension inside both
   SQLite metadata and the cheetah hot-path namespace. During inference the decoder reuses those
   prototypes to scale the per-dimension presence/frequency penalties via cosine similarity, so the
-  learned multi-scale contexts influence sampling without needing per-token embedding calls.
+  learned multi-scale contexts influence sampling without needing per-token embedding calls. The
+  same context matrices now append dimension-level summary/fusion vectors so cheetah prediction
+  tables see a hidden-layer style projection that differentiates short vs. long window signals.
 - Future idea: promote each dimension to a small codebook (k-means per window size) and expose a CLI
   inspector so we can audit the learned prototypes or pin certain domains (code, poetry, etc.)
   before wiring them into penalty scaling.

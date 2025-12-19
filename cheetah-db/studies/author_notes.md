@@ -28,6 +28,9 @@ automatically. Each chunk seeds unseen token IDs via `PREDICT_SET`, applies `PRE
 context matrix derived from the prompt/dependency summary, and the decoder blends those results back
 into inference via the new `--cheetah-token-*` knobs. Use `--disable-cheetah-token-train` when you
 need to skip the hot-path updates.
+Update: `ContextWindowEmbeddingManager.context_matrix_for_text()` now appends dimension-level
+summary/fusion vectors (a hidden-layer style projection) so prediction-table contexts differ from
+the initial raw-window baseline while still honoring the configured context dimensions.
 
 ### Where Cheetah's command tree/context are implemented:
 Cheetah context/prediction tables are exercised only for inspection right now. src/train.py (lines 567-614) implements _probe_context_predictions(), which builds MiniLM-derived context matrices via ContextWindowEmbeddingManager and calls hot_path.predict_query() for any --cheetah-context-probe inputs. These probes log existing prediction-table entries but don’t mutate them, so there is no real-time PREDICT_SET/PREDICT_TRAIN occurring during ingest.

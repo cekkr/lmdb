@@ -369,7 +369,7 @@ class ContextWindowEmbeddingManager:
         return weights
 
     def context_matrix_for_text(self, text: str) -> list[list[float]]:
-        """Return the raw context-window embedding vectors for a text snippet."""
+        """Return context-window vectors plus dimension-level hidden-layer projections."""
         if not self.enabled() or not text.strip():
             return []
         seed = self._seed_for_text(text)
@@ -383,15 +383,113 @@ class ContextWindowEmbeddingManager:
             return []
         vectors = self.embedder.embed([snippet.text for snippet in snippets])
         matrix: list[list[float]] = []
-        for vector in vectors:
-            if not vector:
-                continue
-            try:
-                row = [float(value) for value in vector]
-            except (TypeError, ValueError):
+        samples: list[tuple[ContextWindowSnippet, list[float]]] = []
+        for snippet, vector in zip(snippets, vectors):
+            row = self._normalize_embedding_vector(vector)
+            if not row:
                 continue
             matrix.append(row)
+            samples.append((snippet, row))
+        if not matrix:
+            return []
+        matrix.extend(self._derive_prediction_layers(samples))
         return matrix
+
+    @staticmethod
+    def _normalize_embedding_vector(vector: Sequence[float] | None) -> list[float]:
+        if not vector:
+            return []
+        try:
+            return [float(value) for value in vector]
+        except (TypeError, ValueError):
+            return []
+
+    def _derive_prediction_layers(
+        self,
+        samples: Sequence[tuple[ContextWindowSnippet, list[float]]],
+    ) -> list[list[float]]:
+        if not samples:
+            return []
+        grouped: dict[int, list[tuple[ContextWindowSnippet, list[float]]]] = {}
+        for snippet, vector in samples:
+            grouped.setdefault(snippet.dimension_index, []).append((snippet, vector))
+        derived: list[list[float]] = []
+        dimension_vectors: list[tuple[int, list[float]]] = []
+        for dim_index in range(len(self.dimensions)):
+            items = grouped.get(dim_index)
+            if not items:
+                continue
+            summary = self._summarize_dimension_vectors(dim_index, items)
+            if not summary:
+                continue
+            derived.append(summary)
+            dimension_vectors.append((dim_index, summary))
+        fused = self._fuse_dimension_vectors(dimension_vectors)
+        if fused:
+            derived.append(fused)
+        return derived
+
+    def _summarize_dimension_vectors(
+        self,
+        dim_index: int,
+        items: Sequence[tuple[ContextWindowSnippet, list[float]]],
+    ) -> list[float]:
+        if not items:
+            return []
+        proto = self._prototype_for(dim_index)
+        vectors = []
+        weights: list[float] = []
+        best_similarity: float | None = None
+        for snippet, vector in items:
+            vectors.append(vector)
+            weight = 1.0
+            if proto is not None and proto.vector:
+                similarity = self._cosine_similarity(proto.vector, vector)
+                if best_similarity is None or similarity > best_similarity:
+                    best_similarity = similarity
+                tag_weight = proto.tag_weight(self._tag_index_from_marker(snippet.tag_marker))
+                weight = max(0.2, (similarity + 1.0) / 2.0) * tag_weight
+            weights.append(weight)
+        max_len = max((len(vector) for vector in vectors), default=0)
+        if max_len <= 0:
+            return []
+        total = sum(weights)
+        if total <= 0:
+            weights = [1.0 for _ in vectors]
+            total = float(len(vectors))
+        averaged = [0.0] * max_len
+        for vector, weight in zip(vectors, weights):
+            for idx, value in enumerate(vector):
+                averaged[idx] += value * weight
+        averaged = [value / total for value in averaged]
+        if proto is not None and proto.vector and best_similarity is not None:
+            scale = self._weight_from_similarity(best_similarity, proto)
+            if scale != 1.0:
+                averaged = [value * scale for value in averaged]
+        return averaged
+
+    def _fuse_dimension_vectors(
+        self,
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+    ) -> list[float]:
+        if len(dimension_vectors) < 2:
+            return []
+        max_len = max((len(vector) for _, vector in dimension_vectors), default=0)
+        if max_len <= 0:
+            return []
+        fused = [0.0] * max_len
+        total = 0.0
+        for dim_index, vector in dimension_vectors:
+            span = 1.0
+            if 0 <= dim_index < len(self.dimensions):
+                span = float(self.dimensions[dim_index].span)
+            weight = 1.0 / math.sqrt(max(1.0, span))
+            total += weight
+            for idx, value in enumerate(vector):
+                fused[idx] += value * weight
+        if total <= 0:
+            return []
+        return [math.tanh(value / total) for value in fused]
 
     def flush(self) -> None:
         if not self._dirty:

@@ -392,10 +392,11 @@ previews the exact command (useful when orchestrating via
 The Python adapter now exposes cheetah's prediction-table commands, letting you exercise the context
 matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
 
-- `ContextWindowEmbeddingManager.context_matrix_for_text()` derives the same angular vectors used for
-  context-dimension penalties. `train.py` uses this helper whenever you pass one or more
-  `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted into a
-  context matrix via the active `--context-dimensions`, then piped through
+- `ContextWindowEmbeddingManager.context_matrix_for_text()` now emits the per-window vectors plus
+  dimension-level summary/fusion layers so prediction tables see a hidden-layer style context
+  matrix aligned with `--context-dimensions`. `train.py` uses this helper whenever you pass one or
+  more `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted
+  into a context matrix via the active `--context-dimensions`, then piped through
   `PREDICT_QUERY table=context_matrices key=meta:context_dimension_embeddings` by default.
 - Override `--cheetah-predict-table` or `--cheetah-predict-key` to target a different prediction
   shard, e.g. `--cheetah-predict-table ctx_predictions` for custom namespaces.

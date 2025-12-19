@@ -201,8 +201,9 @@ automatically normalizes outputs.
   the base64 payloads described above (`helpers.cheetah_cli.format_prediction_query()` renders the
   replies for logs/tests). The adapter automatically populates `ctx=`, `windows=`, and
   `key_windows=` arguments when Python passes raw float matrices.
-- `ContextWindowEmbeddingManager.context_matrix_for_text()` emits the same per-dimension vectors used
-  for repeat penalties, so CLI tools can build a prediction-ready matrix for arbitrary prose.
+- `ContextWindowEmbeddingManager.context_matrix_for_text()` emits the per-window vectors plus
+  dimension-level summary/fusion layers, so prediction queries see a hidden-layer style context
+  matrix aligned with the configured context dimensions.
 - `src/train.py` accepts `--cheetah-context-probe "<text>"` (repeatable) plus
   `--cheetah-predict-table`/`--cheetah-predict-key`. At startup the trainer builds a matrix from each
   snippet (respecting `--context-dimensions`) and issues `PREDICT_QUERY` against the selected table
