@@ -75,8 +75,10 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-dimensions",
         help=(
-            "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like '6,12,24' "
-            "used to group context penalties and MiniLM-based context-window embeddings. Use 'off' to disable."
+            "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like "
+            "'8,12,16,22,32' or '16,24,32,48,64' used to group context penalties and build MiniLM "
+            "context-window embeddings for the prediction context matrix. This is independent of "
+            "--cheetah-* probes/training. Use 'off' to disable."
         ),
     )
     parser.add_argument(
