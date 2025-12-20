@@ -160,6 +160,7 @@ class Tokenizer:
         lowercase_tokens: bool = True,
     ) -> None:
         self.vocab = vocab
+        self.lowercase_tokens = lowercase_tokens
         self._special_tokens: list[str] = []
         self._special_token_set: set[str] = set()
         self._special_backend_warned = False

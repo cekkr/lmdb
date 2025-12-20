@@ -130,18 +130,31 @@ class DBSLMEngine:
         """Allow callers to seed tokenizer/vocabulary with structured prompt tags."""
         if not tag_tokens:
             return
-        new_tokens: list[str] = []
+        register_tokens: list[str] = []
+        register_seen: set[str] = set()
+
+        def register(token: str) -> None:
+            normalized = (token or "").strip()
+            if not normalized or normalized in register_seen:
+                return
+            register_seen.add(normalized)
+            register_tokens.append(normalized)
+
         for token in tag_tokens:
             normalized = (token or "").strip()
-            if not normalized or normalized in self._prompt_tag_tokens:
+            if not normalized:
                 continue
-            self._prompt_tag_tokens.append(normalized)
-            new_tokens.append(normalized)
-        if not new_tokens and self._prompt_tag_tokens:
-            return
-        if new_tokens:
-            self.tokenizer.register_special_tokens(new_tokens)
-        self._prompt_tag_token_ids = {self.vocab.token_id(token) for token in self._prompt_tag_tokens}
+            if normalized not in self._prompt_tag_tokens:
+                self._prompt_tag_tokens.append(normalized)
+            register(normalized)
+            if self.tokenizer.lowercase_tokens:
+                register(normalized.lower())
+        if register_tokens:
+            self.tokenizer.register_special_tokens(register_tokens)
+        tokens_for_ban = set(self._prompt_tag_tokens)
+        if self.tokenizer.lowercase_tokens:
+            tokens_for_ban.update(token.lower() for token in self._prompt_tag_tokens)
+        self._prompt_tag_token_ids = {self.vocab.token_id(token) for token in tokens_for_ban}
         self._prompt_tag_aliases = self._derive_prompt_tag_aliases(self._prompt_tag_tokens)
         enumerator = self._build_prompt_tag_enumerator(self._prompt_tag_tokens)
         self._prompt_tag_enumerator = enumerator

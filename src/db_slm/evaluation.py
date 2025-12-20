@@ -472,8 +472,9 @@ def _detected_prompt_tag(text: str, prompt_tags: Sequence[str]) -> str | None:
     candidate = head.split(":", 1)[0].strip()
     if not candidate:
         return None
+    candidate_norm = candidate.lower()
     for tag in prompt_tags:
-        if candidate == tag:
+        if candidate == tag or candidate_norm == tag.lower():
             return tag
     return None
 

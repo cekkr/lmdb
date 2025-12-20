@@ -297,6 +297,8 @@ response label (default `|RESPONSE|:`). `run.py` exposes `--response-label` for 
 and uses the same helper. This is a high-priority invariant: without the sentinel the decoder will
 happily continue the `|USER|:` frame instead of predicting the reply, corrupting both training and
 evaluation logs.
+Prompt-tag bans and evaluation detection normalize case when `DBSLM_TOKENIZER_LOWERCASE=1`, so
+`|RESPONSE|:` or `|CONTEXT|:` markers stay blocked even if tokens are lowercased during decoding.
 
 When crafting new dataset configs place the canonical labels directly in the JSON. The updated
 `datasets/GPTeacher.config.json` file now maps `input` → `|USER|` and registers the `instruction`
