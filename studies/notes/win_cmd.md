@@ -7,7 +7,7 @@ Complex training:
 python3.11 src/train.py datasets/GPTeacher.json --ngram-order 5 --json-chunk-size 50 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 20.0 --eval-interval 50000 --profile-ingest --decoder-presence-penalty 0.3 --decoder-frequency-penalty 0.1 --context-dimensions 8,12,16,22,32 --reset
 
 Very complex:
-python3.13 src/train.py datasets/GPTeacher.json --ngram-order 8 --json-chunk-size 500 --eval-samples 3 --eval-variants 3 --chunk-eval-percent 10.0 --eval-interval 50000 --profile-ingest --decoder-presence-penalty 0.2 --decoder-frequency-penalty 0.05 --context-dimensions 12,16,24,32,48,64,96 --reset
+python3.13 src/train.py datasets/GPTeacher.json --ngram-order 8 --json-chunk-size 500 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 5.0 --eval-interval 50000 --profile-ingest --decoder-presence-penalty 0.2 --decoder-frequency-penalty 0.1 --context-dimensions 12,16,24,32,48,64,96 --reset
 
 Very complex mac:
 python3.14 src/train.py datasets/GPTeacher.json --ngram-order 6 --json-chunk-size 500 --eval-samples 3 --eval-variants 3 --chunk-eval-percent 10.0 --eval-interval 50000 --profile-ingest --decoder-presence-penalty 0.2 --decoder-frequency-penalty 0.05 --context-dimensions 12,16,24,32,48,64,96 --reset
