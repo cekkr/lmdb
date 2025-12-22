@@ -31,6 +31,12 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   Windows/LAN address when cheetah lives elsewhere (container, remote host, etc.). If the server
   advertises `0.0.0.0:4455`, keep the client pointed at a *real* address (127.0.0.1, LAN IP, etc.);
   connecting to `0.0.0.0` is invalid, so the adapter now rewrites that case to loopback.
+- Native Windows builds now compile cleanly. `gofmt`/`go test ./...` work with `GOOS=windows`, the
+  pair-table cache falls back to the default limit when `RLIMIT_NOFILE` is unavailable, and the
+  resource monitor degrades gracefully without `/proc` (CPU/system/IO stats show as unsupported; Go
+  runtime mem stats are still reported). Use `go run .` or `bash build.sh` from Git Bash/WSL to
+  produce `cheetah-server.exe`; set `CHEETAH_HEADLESS=1` if you want a background server without the
+  interactive CLI.
 - `cheetah-db` now keeps a bounded payload cache inside `database.go`, keyed by
   `<value_size, table_id, entry_id>` so hot `READ`/`PAIR_REDUCE` loops remain in RAM instead of
   pounding the same `values_<size>_<tableID>.table` sectors. It defaults to 16k entries (~64 MB) and

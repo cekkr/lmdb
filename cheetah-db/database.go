@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -149,17 +147,6 @@ func resolvePairTableLimit(configured int) int {
 		return candidate
 	}
 	return defaultPairTableLimit
-}
-
-func fileDescriptorSoftLimit() int {
-	var rl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		return 0
-	}
-	if rl.Cur <= 0 || rl.Cur > math.MaxInt32 {
-		return 0
-	}
-	return int(rl.Cur)
 }
 
 const (
