@@ -69,10 +69,10 @@ class EvaluationSampleResult:
     reference: str
     generated: str
     context_tokens: dict[str, str]
-    prompt_dependencies: DependencyLayer | None = None
-    response_dependencies: DependencyLayer | None = None
     metrics: dict[str, float | int | None]
     flagged: bool = False
+    prompt_dependencies: DependencyLayer | None = None
+    response_dependencies: DependencyLayer | None = None
     variant: int = 1
 
 
