@@ -234,9 +234,12 @@ SUCCESS,key=1_deleted
     `key_windows=` accepts a base64 array of `{ "key": "<hex>", "windows": [[...], ...] }` objects for
     per-prefix window overrides. Responses include the backend name (`cpu` or the simulated
     `webgpu-simulated` merger).
-  - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]` adjusts
-    stored weights via the forward/backward loop, and `PREDICT_CTX key=<prefix> ctx=<base64 json>
-    [mode=bias|scale] [strength=1] [table=name]` applies an immediate context bias without retraining.
+  - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]
+    [negatives=<hex,...>]` adjusts stored weights via the forward/backward loop (optionally
+    down-weighting bad predictions listed in `negatives=`). The table now persists normalized window
+    hints from every training/adversarial context and blends them into queries automatically when no
+    `windows=` payload is supplied. `PREDICT_CTX key=<prefix> ctx=<base64 json> [mode=bias|scale]
+    [strength=1] [table=name]` applies an immediate context bias without retraining.
   - `PREDICT_BACKEND [mode=cpu|gpu] [table=name]` toggles the probability merger per table, and
     `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
     current host.

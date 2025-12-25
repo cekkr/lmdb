@@ -476,6 +476,7 @@ class CheetahClient:
         context_matrix: Sequence[Sequence[float]] | None = None,
         learning_rate: float | None = None,
         table: str | None = None,
+        negatives: Sequence[bytes | str] | None = None,
     ) -> tuple[bool, str | None]:
         args = [f"key=x{key.hex()}", f"target=x{target.hex()}"]
         matrix_payload = self._encode_matrix_payload(context_matrix)
@@ -485,6 +486,14 @@ class CheetahClient:
             args.append(f"lr={learning_rate}")
         if table:
             args.append(f"table={table}")
+        if negatives:
+            formatted: list[str] = []
+            for value in negatives:
+                encoded_value = self._format_prediction_value(value)
+                if encoded_value:
+                    formatted.append(encoded_value)
+            if formatted:
+                args.append(f"negatives={','.join(formatted)}")
         response = self._command(f"PREDICT_TRAIN {' '.join(args)}")
         return (response is not None and response.startswith("SUCCESS")), response
 
@@ -1964,6 +1973,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         context_matrix: Sequence[Sequence[float]] | None,
         learning_rate: float = 0.01,
         table: str | None = None,
+        negatives: Sequence[bytes | str] | None = None,
     ) -> bool:
         if not self._enabled:
             return False
@@ -1976,6 +1986,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 context_matrix=context_matrix,
                 learning_rate=learning_rate,
                 table=table,
+                negatives=negatives,
             )
             if not success:
                 logger.warning(

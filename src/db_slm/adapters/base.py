@@ -125,6 +125,7 @@ class HotPathAdapter(Protocol):
         context_matrix: Sequence[Sequence[float]] | None,
         learning_rate: float = 0.01,
         table: str | None = None,
+        negatives: Sequence[bytes | str] | None = None,
     ) -> bool:
         """Adjust prediction weights using the provided context matrix (PREDICT_TRAIN)."""
 
@@ -241,6 +242,7 @@ class NullHotPathAdapter:
         context_matrix: Sequence[Sequence[float]] | None,
         learning_rate: float = 0.01,
         table: str | None = None,
+        negatives: Sequence[bytes | str] | None = None,
     ) -> bool:
         return False
 

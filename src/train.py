@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import random
@@ -30,6 +31,7 @@ from db_slm.evaluation import (
     EvalLogWriter,
     DependencyLayer,
     EvaluationRecord,
+    EvaluationSampleResult,
     QualityGate,
     ResponseEvaluator,
     VariantSeedPlanner,
@@ -315,6 +317,29 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="Blending weight applied to cheetah prediction outputs during decoding (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--disable-cheetah-adversarial-train",
+        action="store_true",
+        help="Skip adversarial prediction updates triggered by low-quality evaluation outputs (default: enabled).",
+    )
+    parser.add_argument(
+        "--cheetah-adversarial-threshold",
+        type=float,
+        default=0.45,
+        help="Quality-score floor that triggers adversarial prediction updates (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-adversarial-max-negatives",
+        type=int,
+        default=6,
+        help="Maximum negative tokens pushed per adversarial sample (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cheetah-adversarial-learning-rate",
+        type=float,
+        default=None,
+        help="Override learning rate for adversarial prediction updates (default: 60% of --cheetah-token-learning-rate).",
     )
     parser.add_argument(
         "--cheetah-eval-predict",
@@ -723,6 +748,9 @@ def _prediction_context_text(record: EvaluationRecord) -> str:
     prompt_summary = _prediction_dependency_summary(record.prompt_dependencies)
     if prompt_summary:
         segments.append(prompt_summary)
+    response_summary = _prediction_dependency_summary(getattr(record, "response_dependencies", None))
+    if response_summary:
+        segments.append(response_summary)
     return "\n".join(segment for segment in segments if segment).strip()
 
 
@@ -826,6 +854,196 @@ def _train_prediction_tables(
         )
     else:
         log(f"[train] cheetah prediction training: no eligible updates for table '{table}'.")
+
+
+def _safe_metric(metrics: dict[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _sample_to_record(sample: EvaluationSampleResult) -> EvaluationRecord:
+    return EvaluationRecord(
+        prompt=sample.prompt,
+        response=sample.reference,
+        context_tokens=sample.context_tokens,
+        prompt_dependencies=getattr(sample, "prompt_dependencies", None),
+        response_dependencies=getattr(sample, "response_dependencies", None),
+        response_label="|RESPONSE|",
+        prompt_tags=(),
+    )
+
+
+def _adversarial_context_text(sample: EvaluationSampleResult) -> str:
+    record = _sample_to_record(sample)
+    context_text = _prediction_context_text(record)
+    reference = (sample.reference or "").strip()
+    if len(reference) > 240:
+        reference = f"{reference[:237]}..."
+    parts = [context_text, reference]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _context_energy(matrix: Sequence[Sequence[float]] | None) -> float:
+    if not matrix:
+        return 0.0
+    energies: list[float] = []
+    for row in matrix:
+        if not row:
+            continue
+        total = sum(abs(component) for component in row)
+        energies.append(total / len(row))
+    return max(energies) if energies else 0.0
+
+
+class AdversarialTrainer:
+    """Runs adversarial prediction updates against cheetah when evaluation samples look weak."""
+
+    def __init__(self, engine: DBSLMEngine, args: argparse.Namespace) -> None:
+        self.engine = engine
+        self.enabled = not getattr(args, "disable_cheetah_adversarial_train", False)
+        self._predict_train = getattr(engine.hot_path, "predict_train", None)
+        self._predict_set = getattr(engine.hot_path, "predict_set", None)
+        self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+        self.table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
+        key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
+        self.key_bytes = key_label.encode("utf-8")
+        base_lr = float(getattr(args, "cheetah_token_learning_rate", 0.05) or 0.05)
+        override_lr = getattr(args, "cheetah_adversarial_learning_rate", None)
+        self.learning_rate = base_lr * 0.6 if override_lr is None or override_lr <= 0 else float(override_lr)
+        self.learning_rate = max(0.001, self.learning_rate)
+        self.quality_floor = float(getattr(args, "cheetah_adversarial_threshold", 0.45))
+        self.max_negatives = max(1, int(getattr(args, "cheetah_adversarial_max_negatives", 6)))
+        self.max_tokens = max(1, int(getattr(args, "cheetah_token_max_tokens", 24)))
+        self.value_cap = max(1, int(getattr(args, "cheetah_token_value_cap", 8192)))
+        self.seeded_tokens: set[int] = getattr(engine, "_prediction_seeded_tokens", set())
+        self._predictable = (
+            self.enabled
+            and not isinstance(engine.hot_path, NullHotPathAdapter)
+            and callable(self._predict_train)
+            and engine.context_windows.enabled()
+            and callable(self._matrix_builder)
+        )
+        if not self.enabled:
+            log("[adv] cheetah adversarial corrections disabled via flag.")
+            return
+        if not self._predictable:
+            log("[adv] cheetah adversarial corrections unavailable: hot-path adapter or context windows inactive.")
+            self.enabled = False
+            return
+        if not self.table or not self.key_bytes:
+            log("[adv] cheetah adversarial corrections skipped: missing token table/key configuration.")
+            self.enabled = False
+            return
+        log(
+            "[adv] Adversarial cheetah updates enabled "
+            f"(table={self.table}, key={key_label}, lr={self.learning_rate:.4f}, "
+            f"quality_floor={self.quality_floor:.2f}, max_negatives={self.max_negatives})."
+        )
+
+    def apply(self, samples: Sequence[EvaluationSampleResult], *, label: str) -> None:
+        if not self.enabled or not samples:
+            return
+        updates = 0
+        touched = 0
+        max_energy = 0.0
+        for sample in samples:
+            if not self._should_update(sample):
+                continue
+            context_text = _adversarial_context_text(sample)
+            if not context_text:
+                continue
+            matrix = self._matrix_builder(context_text) if callable(self._matrix_builder) else None
+            if not matrix:
+                continue
+            max_energy = max(max_energy, _context_energy(matrix))
+            positives = self._ensure_seeded(self._token_ids(sample.reference, self.max_tokens))
+            negatives = self._ensure_seeded(self._token_ids(sample.generated, self.max_negatives))
+            if not positives:
+                continue
+            touched += 1
+            negatives = [token_id for token_id in negatives if token_id not in positives]
+            encoded_negatives = [_encode_prediction_token(token_id) for token_id in negatives[: self.max_negatives]]
+            for token_id in positives:
+                success = self._predict_train(
+                    key=self.key_bytes,
+                    target=_encode_prediction_token(token_id),
+                    context_matrix=matrix,
+                    learning_rate=self.learning_rate,
+                    table=self.table,
+                    negatives=encoded_negatives,
+                )
+                if success:
+                    updates += 1
+        if updates:
+            setattr(self.engine, "_prediction_seeded_tokens", self.seeded_tokens)
+            log(
+                "[adv] {label}: applied {updates} adversarial update(s) across {touched} sample(s) "
+                "(lr={lr:.4f}, max_negatives={neg}, quality_floor={floor:.2f}, max_ctx_energy={energy:.3f}).".format(
+                    label=label,
+                    updates=updates,
+                    touched=touched,
+                    lr=self.learning_rate,
+                    neg=self.max_negatives,
+                    floor=self.quality_floor,
+                    energy=max_energy,
+                )
+            )
+
+    def _should_update(self, sample: EvaluationSampleResult) -> bool:
+        metrics = sample.metrics or {}
+        quality = _safe_metric(metrics, "quality_score")
+        semantic = _safe_metric(metrics, "semantic_similarity")
+        lexical = _safe_metric(metrics, "lexical")
+        if sample.flagged:
+            return True
+        if quality is not None and quality < self.quality_floor:
+            return True
+        if semantic is not None and semantic < 0.5 and (lexical is None or lexical < 0.5):
+            return True
+        return False
+
+    def _token_ids(self, text: str, limit: int) -> list[int]:
+        tokens = self.engine.tokenizer.encode(text or "", add_special_tokens=False)
+        if not tokens:
+            return []
+        unique: list[int] = []
+        seen: set[int] = set()
+        for token_id in tokens[:limit]:
+            if token_id in seen:
+                continue
+            unique.append(token_id)
+            seen.add(token_id)
+        return unique
+
+    def _ensure_seeded(self, token_ids: Sequence[int]) -> list[int]:
+        ensured: list[int] = []
+        for token_id in token_ids:
+            if token_id in self.seeded_tokens:
+                ensured.append(token_id)
+                continue
+            if len(self.seeded_tokens) >= self.value_cap:
+                continue
+            if callable(self._predict_set):
+                ok = self._predict_set(
+                    key=self.key_bytes,
+                    value=_encode_prediction_token(token_id),
+                    probability=0.05,
+                    table=self.table,
+                )
+                if not ok:
+                    continue
+            self.seeded_tokens.add(token_id)
+            ensured.append(token_id)
+        return ensured
+
+
+def _build_adversarial_trainer(engine: DBSLMEngine, args: argparse.Namespace) -> AdversarialTrainer | None:
+    trainer = AdversarialTrainer(engine, args)
+    if not trainer.enabled:
+        return None
+    return trainer
 
 
 def resolve_metrics_export_path(raw: str | None) -> Path | None:
@@ -1418,6 +1636,7 @@ class InferenceMonitor:
         seed_planner: VariantSeedPlanner | None = None,
         prediction_probe: ContextProbabilityProbe | None = None,
         prediction_source: str | None = None,
+        adversarial_trainer: "AdversarialTrainer | None" = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -1434,6 +1653,7 @@ class InferenceMonitor:
         self.seed_planner = seed_planner
         self.prediction_probe = prediction_probe
         self.prediction_source = (prediction_source or "").strip().lower() if prediction_probe else None
+        self.adversarial_trainer = adversarial_trainer
         log_verbose(
             3,
             "[eval:v3] Inference monitor configured "
@@ -1465,7 +1685,7 @@ class InferenceMonitor:
             f"(available={len(self.dataset)}).",
         )
         selections = random.sample(self.dataset, sample_size)
-        run_inference_records(
+        results = run_inference_records(
             self.engine,
             self.evaluator,
             selections,
@@ -1480,6 +1700,8 @@ class InferenceMonitor:
             prediction_probe=self.prediction_probe,
             prediction_source=self.prediction_source,
         )
+        if self.adversarial_trainer:
+            self.adversarial_trainer.apply(results, label=f"{threshold} token eval")
 
     def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
         if not new_records:
@@ -1679,6 +1901,7 @@ def main() -> None:
     _emit_cheetah_reports(engine, args)
     _probe_context_predictions(engine, args)
     eval_prediction_probe, eval_prediction_source = _build_eval_prediction_probe(engine, args)
+    adversarial_trainer = _build_adversarial_trainer(engine, args)
     if args.eval_variants is not None:
         if args.eval_variants < 1:
             parser.error("--eval-variants must be >= 1")
@@ -1766,6 +1989,7 @@ def main() -> None:
         seed_planner=seed_planner,
         prediction_probe=eval_prediction_probe,
         prediction_source=eval_prediction_source,
+        adversarial_trainer=adversarial_trainer,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -1789,6 +2013,7 @@ def main() -> None:
                 seed_planner=seed_planner,
                 prediction_probe=eval_prediction_probe,
                 prediction_source=eval_prediction_source,
+                adversarial_trainer=adversarial_trainer,
             )
             log(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
             log_verbose(
@@ -1812,6 +2037,7 @@ def main() -> None:
                 seed_planner=seed_planner,
                 prediction_probe=eval_prediction_probe,
                 prediction_source=eval_prediction_source,
+                adversarial_trainer=adversarial_trainer,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -1859,7 +2085,7 @@ def main() -> None:
                     f"[eval:v3] Running hold-out evaluation for {label} with "
                     f"{len(eval_batch)} record(s) (borrowed_from_pool={len(eval_batch) - len(chunk.eval_records)}).",
                 )
-                run_inference_records(
+                eval_results = run_inference_records(
                     engine,
                     evaluator,
                     eval_batch,
@@ -1874,6 +2100,8 @@ def main() -> None:
                     prediction_probe=eval_prediction_probe,
                     prediction_source=eval_prediction_source,
                 )
+                if adversarial_trainer:
+                    adversarial_trainer.apply(eval_results, label=f"{label} hold-out")
                 monitor.refresh_dataset(chunk.eval_records)
             if chunk.prediction_records:
                 _train_prediction_tables(engine, chunk.prediction_records, args)

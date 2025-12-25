@@ -29,6 +29,9 @@ const (
 	defaultPredictFlushMillis    = 75
 	minPredictFlushMillis        = 10
 	defaultPredictPurgeThreshold = 1e-4
+	maxWindowHintSize            = 32
+	windowHintBlendWeight        = 0.35
+	maxPredictionScoreMagnitude  = 24.0
 )
 
 // PredictionValue stores the base probability and context weights for a result.
@@ -605,8 +608,18 @@ func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]fl
 	if len(entry.Values) == 0 {
 		return nil, errPredictionEntryNotFound
 	}
+	effectiveWindows := windows
+	if len(entry.WindowHints) > 0 {
+		capacity := len(windows) + len(entry.WindowHints)
+		combined := make([][]float64, 0, capacity)
+		if len(windows) > 0 {
+			combined = append(combined, windows...)
+		}
+		combined = append(combined, entry.WindowHints...)
+		effectiveWindows = combined
+	}
 	results := make([]PredictionResult, 0, len(entry.Values))
-	windowMerge := p.merger.Merge(windows)
+	windowMerge := p.merger.Merge(effectiveWindows)
 	// Treat stored BaseProbability as a score/logit. Convert to a normalized distribution
 	// via softmax so one runaway entry cannot collapse all predictions.
 	scores := make([]float64, 0, len(entry.Values))
@@ -672,8 +685,91 @@ func mergeProbabilityWeight(merged []float64) float64 {
 	return sum / float64(len(merged))
 }
 
-// Train updates the weights by applying a very small gradient step.
-func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float64) (PredictionEntry, error) {
+func mergeWindowHints(existing [][]float64, ctx ContextMatrix) [][]float64 {
+	if len(ctx) == 0 {
+		return existing
+	}
+	target := existing
+	if target == nil {
+		target = make([][]float64, len(ctx))
+	}
+	if len(target) < len(ctx) {
+		target = append(target, make([][]float64, len(ctx)-len(target))...)
+	}
+	for idx, vector := range ctx {
+		hint := normalizeWindowHint(vector, maxWindowHintSize)
+		if len(hint) == 0 {
+			continue
+		}
+		if len(target[idx]) == 0 {
+			target[idx] = hint
+			continue
+		}
+		target[idx] = blendWindowHint(target[idx], hint, windowHintBlendWeight)
+	}
+	return target
+}
+
+func normalizeWindowHint(vector []float64, limit int) []float64 {
+	if len(vector) == 0 {
+		return nil
+	}
+	hint := vector
+	if limit > 0 && len(hint) > limit {
+		hint = hint[:limit]
+	}
+	normalized := append([]float64(nil), hint...)
+	var norm float64
+	for _, v := range normalized {
+		norm += v * v
+	}
+	if norm == 0 {
+		return normalized
+	}
+	scale := 1.0 / math.Sqrt(norm)
+	for i := range normalized {
+		normalized[i] *= scale
+	}
+	return normalized
+}
+
+func blendWindowHint(existing, incoming []float64, weight float64) []float64 {
+	if len(incoming) == 0 {
+		return existing
+	}
+	if len(existing) == 0 {
+		return append([]float64(nil), incoming...)
+	}
+	if weight <= 0 || weight >= 1 {
+		weight = windowHintBlendWeight
+	}
+	size := len(existing)
+	if len(incoming) > size {
+		size = len(incoming)
+	}
+	blended := make([]float64, size)
+	for i := 0; i < size; i++ {
+		base := 0.0
+		if i < len(existing) {
+			base = existing[i]
+		}
+		next := 0.0
+		if i < len(incoming) {
+			next = incoming[i]
+		}
+		blended[i] = (base * (1 - weight)) + (next * weight)
+	}
+	return blended
+}
+
+// Train updates the weights by applying a very small gradient step. Optional
+// negative targets receive an adversarial update to down-weight incorrect predictions.
+func (p *PredictionTable) Train(
+	key, target []byte,
+	ctx ContextMatrix,
+	lr float64,
+	negatives [][]byte,
+) (PredictionEntry, error) {
 	if lr <= 0 {
 		lr = 0.01
 	}
@@ -683,29 +779,33 @@ func (p *PredictionTable) Train(key, target []byte, ctx ContextMatrix, lr float6
 	if !ok {
 		return PredictionEntry{}, errPredictionEntryNotFound
 	}
-	targetEncoded := base64.StdEncoding.EncodeToString(target)
-	idx := -1
-	for i := range entry.Values {
-		if entry.Values[i].Value == targetEncoded {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 {
-		entry.Values = append(entry.Values, PredictionValue{
-			Value:            targetEncoded,
-			BaseProbability:  0.05,
-			ContextWeights:   nil,
-			LastUpdatedEpoch: time.Now().Unix(),
-		})
-		idx = len(entry.Values) - 1
+	entry.WindowHints = mergeWindowHints(entry.WindowHints, ctx)
+	targetEncoded := encodeKey(target)
+	idx := ensurePredictionValueIndex(entry, targetEncoded)
+	if idx < 0 {
+		return PredictionEntry{}, fmt.Errorf("invalid_prediction_target")
 	}
 	score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
 	pred := sigmoid(score)
 	err := 1.0 - pred
-	entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability + lr*err
+	entry.Values[idx].BaseProbability = clampScore(entry.Values[idx].BaseProbability + lr*err)
 	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
 	entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
+	adversarialValues := normalizeNegativeValues(negatives, targetEncoded)
+	if len(adversarialValues) > 0 {
+		for _, encodedValue := range adversarialValues {
+			negIdx := ensurePredictionValueIndex(entry, encodedValue)
+			if negIdx < 0 {
+				continue
+			}
+			negScore := entry.Values[negIdx].BaseProbability + applyContextWeights(ctx, entry.Values[negIdx].ContextWeights)
+			negPred := sigmoid(negScore)
+			delta := -negPred
+			entry.Values[negIdx].BaseProbability = clampScore(entry.Values[negIdx].BaseProbability + lr*delta)
+			entry.Values[negIdx].ContextWeights = adjustContextWeights(entry.Values[negIdx].ContextWeights, ctx, lr*delta)
+			entry.Values[negIdx].LastUpdatedEpoch = time.Now().Unix()
+		}
+	}
 	entry.UpdatedAt = time.Now().UTC()
 	p.markDirtyLocked(entry.Key)
 	return *entry, nil
@@ -767,6 +867,60 @@ func adjustContextWeights(weights []ContextWeight, ctx ContextMatrix, delta floa
 		weights[targetIdx].Bias += delta
 	}
 	return weights
+}
+
+func ensurePredictionValueIndex(entry *PredictionEntry, encodedValue string) int {
+	if encodedValue == "" {
+		return -1
+	}
+	for idx := range entry.Values {
+		if entry.Values[idx].Value == encodedValue {
+			return idx
+		}
+	}
+	entry.Values = append(entry.Values, PredictionValue{
+		Value:            encodedValue,
+		BaseProbability:  0.05,
+		ContextWeights:   nil,
+		LastUpdatedEpoch: time.Now().Unix(),
+	})
+	return len(entry.Values) - 1
+}
+
+func normalizeNegativeValues(values [][]byte, skipEncoded string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	results := make([]string, 0, len(values))
+	for _, raw := range values {
+		if len(raw) == 0 {
+			continue
+		}
+		encoded := encodeKey(raw)
+		if encoded == "" || encoded == skipEncoded {
+			continue
+		}
+		if _, exists := seen[encoded]; exists {
+			continue
+		}
+		seen[encoded] = struct{}{}
+		results = append(results, encoded)
+	}
+	return results
+}
+
+func clampScore(value float64) float64 {
+	switch {
+	case math.IsNaN(value):
+		return 0
+	case value > maxPredictionScoreMagnitude:
+		return maxPredictionScoreMagnitude
+	case value < -maxPredictionScoreMagnitude:
+		return -maxPredictionScoreMagnitude
+	default:
+		return value
+	}
 }
 
 func sortPredictionResults(results []PredictionResult) {

@@ -410,6 +410,12 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
   `--cheetah-token-table`, `--cheetah-token-key`, `--cheetah-token-max-tokens`,
   `--cheetah-token-learning-rate`, and `--cheetah-token-value-cap`, or opt out entirely with
   `--disable-cheetah-token-train`.
+- Evaluation failures now trigger adversarial cheetah updates by default. When a probe is flagged or
+  its `quality_score` drops below `--cheetah-adversarial-threshold`, the trainer derives a context
+  matrix from the prompt/metadata, reinforces the reference tokens, and down-weights the generated
+  tokens in one `PREDICT_TRAIN` call (`negatives=`). Control the cadence with
+  `--disable-cheetah-adversarial-train`, `--cheetah-adversarial-max-negatives`, and
+  `--cheetah-adversarial-learning-rate` (defaults to 60% of the main cheetah-token rate).
 - Decoding blends those predictions back into sampling. `train.py` probes and `run.py` both honor
   `--cheetah-token-table` / `--cheetah-token-key` and mix the cheetah probabilities using
   `--cheetah-token-weight` (defaults to `0.25`). This keeps next-token hints synchronized between

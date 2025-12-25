@@ -2859,17 +2859,26 @@ func (db *Database) handlePredictTrain(args string) (string, error) {
 	if err != nil {
 		return fmt.Sprintf("ERROR,invalid_ctx:%v", err), nil
 	}
+	negatives, err := parseKeyList(params["negatives"])
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_negatives:%v", err), nil
+	}
 	learningRate := 0.01
 	if rawLR := params["lr"]; rawLR != "" {
 		if parsed, parseErr := strconv.ParseFloat(rawLR, 64); parseErr == nil {
 			learningRate = parsed
 		}
 	}
-	entry, err := table.Train(keyBytes, targetBytes, ctx, learningRate)
+	entry, err := table.Train(keyBytes, targetBytes, ctx, learningRate, negatives)
 	if err != nil {
 		return err.Error(), nil
 	}
-	return fmt.Sprintf("SUCCESS,table=%s,prediction_values=%d,lr=%.4f", tableName, len(entry.Values), learningRate), nil
+	return fmt.Sprintf(
+		"SUCCESS,table=%s,prediction_values=%d,lr=%.4f",
+		tableName,
+		len(entry.Values),
+		learningRate,
+	), nil
 }
 
 func (db *Database) handlePredictBackend(args string) string {

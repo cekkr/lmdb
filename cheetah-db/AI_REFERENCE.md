@@ -151,6 +151,11 @@ matrix.
   context vector of arbitrary length. Missing entries default to zero so sparse contexts are cheap.
 - Training/ingest MUST prune edges whose normalized probability stays below the configured
   `discard_below` threshold to avoid gigabytes of low-value weights during early learning.
+- `PREDICT_TRAIN` accepts an optional `negatives=` arg (comma-separated `x...` payloads) so callers
+  can down-weight bad predictions in the same step they reinforce the target. The server now
+  captures normalized window hints from every training/adversarial context and blends them into
+  `PREDICT_QUERY` when no windows are provided (or alongside caller-supplied windows) to surface
+  hidden context correlations automatically.
 
 ### Context matrix weighting
 

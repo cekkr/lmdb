@@ -188,6 +188,17 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   samples (topped up from the rolling pool when needed). `SentenceQualityScorer` now scales
   `quality_score` down whenever `token_group_share` exceeds 0.30 so repetition spikes show up in the
   aggregate means.
+- Adversarial prediction fixes now ride alongside evaluation. When a probe is flagged or its
+  `quality_score` dips below `--cheetah-adversarial-threshold`, the trainer derives a context matrix
+  from the prompt + metadata, reinforces the reference tokens, and down-weights the generated tokens
+  with a single `PREDICT_TRAIN` call that carries `negatives=`. Tune via
+  `--disable-cheetah-adversarial-train`, `--cheetah-adversarial-max-negatives`, and
+  `--cheetah-adversarial-learning-rate` (defaults to 60% of the main cheetah-token rate) so bad
+  generations immediately correct the prediction table instead of waiting for a full retrain.
+- Prediction tables now persist normalized window hints from every training/adversarial context. The
+  Go reducers blend those stored hints with any caller-supplied windows (or fall back to the hints
+  when none are provided), exposing hidden correlations in context matrices without extra CLI
+  arguments.
 - Latest smoke-train matrix (2025-11-10, python3.11) now runs
   `baseline_profiled` (400-row ingest, profiling enabled) followed by
   `penalty_sweep_holdout` (240-row ingest with chunk hold-outs + penalty overrides) via

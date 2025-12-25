@@ -69,6 +69,8 @@ class EvaluationSampleResult:
     reference: str
     generated: str
     context_tokens: dict[str, str]
+    prompt_dependencies: DependencyLayer | None = None
+    response_dependencies: DependencyLayer | None = None
     metrics: dict[str, float | int | None]
     flagged: bool = False
     variant: int = 1
@@ -1001,6 +1003,8 @@ def run_inference_records(
                 reference=record.response,
                 generated=generated,
                 context_tokens=dict(record.context_tokens),
+                prompt_dependencies=getattr(record, "prompt_dependencies", None),
+                response_dependencies=getattr(record, "response_dependencies", None),
                 metrics=metrics,
                 flagged=flagged,
                 variant=variant,
