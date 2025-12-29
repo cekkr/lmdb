@@ -65,11 +65,13 @@ class DBSLMEngine:
         prediction_table: str | None = None,
         prediction_key: str | None = None,
         prediction_weight: float = 0.0,
+        token_merge_max_tokens: int | None = None,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
         self.hot_path = build_cheetah_adapter(self.settings)
         self.context_dimensions = self._init_context_dimensions(context_dimensions)
+        merge_max = self._init_token_merging(token_merge_max_tokens, ngram_order)
         self.vocab = Vocabulary(self.db)
         self.tokenizer = Tokenizer(
             self.vocab,
@@ -77,6 +79,8 @@ class DBSLMEngine:
             tokenizer_path=self.settings.tokenizer_json_path,
             lowercase_tokens=self.settings.tokenizer_lowercase,
         )
+        self.tokenizer.configure_merging(merge_max)
+        self.token_merge_max_tokens = merge_max
         self.quantizer = LogProbQuantizer(self.db)
         self.store = NGramStore(
             self.db,
@@ -239,6 +243,39 @@ class DBSLMEngine:
         if writer:
             writer("context_dimensions", payload)
         return resolved
+
+    def _init_token_merging(
+        self,
+        requested_max: int | None,
+        ngram_order: int,
+    ) -> int:
+        reader = getattr(self.hot_path, "read_metadata", None)
+
+        def _coerce(value, fallback: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return fallback
+
+        stored_max: int | None = None
+        if reader:
+            stored_max_raw = reader("token_merge_max_tokens")
+            if stored_max_raw is not None:
+                stored_max = _coerce(stored_max_raw, 0)
+        if stored_max is None:
+            stored_max = _coerce(self.db.get_metadata("token_merge_max_tokens"), 0)
+
+        resolved_max = _coerce(requested_max, stored_max or 0)
+        if resolved_max < 0:
+            resolved_max = 0
+        if ngram_order < 5:
+            resolved_max = 0
+
+        self.db.set_metadata("token_merge_max_tokens", str(resolved_max))
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if writer:
+            writer("token_merge_max_tokens", str(resolved_max))
+        return resolved_max
 
     # ------------------------------------------------------------------ #
     # Training utilities

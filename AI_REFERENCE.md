@@ -89,6 +89,11 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   for tags like `|USER|:` / `|INSTRUCTION|:` and lets each corpus opt-in to canonical context headers
   by setting `canonical_tag`; datasets that skip the field no longer receive automatic `|CTX|:`
   prefixes.
+- Training runs with `--ngram-order` >= 5 now merge repeated token runs into composite tokens by default
+  (`--merge-max-tokens 5`). Spans below the average frequency of all candidate spans are discarded
+  automatically so incongruent merges do not pollute the vocabulary. The merge config is persisted in
+  metadata (SQLite + cheetah) so inference reuses the same rules; set `--merge-max-tokens 0` to
+  disable.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input

@@ -172,6 +172,7 @@ python src/train.py datasets/emotion_data.json \
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
+  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive. Set `--merge-max-tokens 0` to disable.
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
 - **File reading helpers**

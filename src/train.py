@@ -75,6 +75,15 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="N-gram order to enforce while training (default: %(default)s).",
     )
     parser.add_argument(
+        "--merge-max-tokens",
+        type=int,
+        default=5,
+        help=(
+            "Maximum number of consecutive tokens to merge into a composite token when --ngram-order >= 5. "
+            "Set to 0 to disable (default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
         "--context-dimensions",
         help=(
             "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like "
@@ -1821,6 +1830,8 @@ def main() -> None:
         value = getattr(args, field_name, None)
         if value is not None and value < 0:
             parser.error(f"{cli_name} must be >= 0 (got {value})")
+    if args.merge_max_tokens is not None and args.merge_max_tokens < 0:
+        parser.error("--merge-max-tokens must be >= 0")
 
     if not args.inputs and not args.stdin:
         parser.error("Provide at least one input path or enable --stdin")
@@ -1849,6 +1860,16 @@ def main() -> None:
         formatted = "\n".join(f"- {message}" for message in requirement_errors)
         parser.error(f"Missing training requirements:\n{formatted}")
 
+    merge_max_tokens = max(0, int(args.merge_max_tokens or 0))
+    if args.ngram_order < 5:
+        merge_max_tokens = 0
+    log_verbose(
+        3,
+        "[train:v3] Token merge configuration: "
+        f"max_tokens={merge_max_tokens}, dynamic_threshold=avg-count, "
+        f"ngram_order={args.ngram_order}.",
+    )
+
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
     if args.reset:
         reset_cheetah_store(settings)
@@ -1876,6 +1897,7 @@ def main() -> None:
         prediction_table=args.cheetah_token_table,
         prediction_key=args.cheetah_token_key,
         prediction_weight=args.cheetah_token_weight,
+        token_merge_max_tokens=merge_max_tokens,
     )
     cheetah_primary = settings.backend == "cheetah-db" and not settings.cheetah_mirror
     if cheetah_primary and isinstance(engine.hot_path, NullHotPathAdapter):
@@ -1891,6 +1913,11 @@ def main() -> None:
         log(f"[train] Hot-path adapter active -> {describe_adapter()}")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
+    if getattr(engine, "token_merge_max_tokens", 0) > 1:
+        log(
+            "[train] Token merging enabled "
+            f"(max_span={engine.token_merge_max_tokens}, threshold=ceil(avg span frequency))."
+        )
     context_window_label = engine.context_windows.describe()
     if context_window_label:
         log(f"[train] Context window embeddings: {context_window_label}")

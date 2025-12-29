@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,9 @@ except ImportError:  # pragma: no cover - optional dependency
     HFTokenizer = None
 
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+MERGE_TOKEN_PREFIX = "<MERGE:"
+MERGE_TOKEN_SUFFIX = ">"
+MERGE_CANDIDATE_LIMIT = 128
 
 
 class _TokenizerBackend:
@@ -164,7 +168,14 @@ class Tokenizer:
         self._special_tokens: list[str] = []
         self._special_token_set: set[str] = set()
         self._special_backend_warned = False
+        self._merge_max_tokens = 0
+        self._merge_candidate_limit = MERGE_CANDIDATE_LIMIT
         self._backend = self._init_backend(backend, tokenizer_path, lowercase_tokens)
+
+    def configure_merging(self, max_tokens: int | None) -> None:
+        """Configure token-merge behaviour (disabled when max_tokens <= 1)."""
+        resolved_max = max(0, int(max_tokens or 0))
+        self._merge_max_tokens = resolved_max
 
     def _init_backend(
         self,
@@ -213,7 +224,87 @@ class Tokenizer:
         tokens = self._backend.tokenize(text)
         if add_special_tokens:
             tokens = ["<BOS>", *tokens, "<EOS>"]
+        tokens = self._apply_merges(tokens)
         return [self.vocab.token_id(token) for token in tokens]
+
+    def _merge_boundaries(self) -> set[str]:
+        boundaries = {"<BOS>", "<EOS>", "<PAD>", "|END|"}
+        boundaries.update(self._special_token_set)
+        return boundaries
+
+    def _select_merge_candidates(self, tokens: Sequence[str], max_len: int) -> set[tuple[str, ...]]:
+        if max_len <= 1:
+            return set()
+        counts: Dict[tuple[str, ...], int] = defaultdict(int)
+        boundaries = self._merge_boundaries()
+        total = len(tokens)
+        for start in range(total):
+            if tokens[start] in boundaries:
+                continue
+            for span in range(2, max_len + 1):
+                end = start + span
+                if end > total:
+                    break
+                window = tokens[start:end]
+                if any(token in boundaries for token in window):
+                    continue
+                counts[tuple(window)] += 1
+        if not counts:
+            return set()
+        avg = sum(counts.values()) / float(len(counts))
+        threshold = max(2, int(math.ceil(avg)))
+        candidates = [(run, count) for run, count in counts.items() if count >= threshold]
+        if not candidates:
+            return set()
+        candidates.sort(
+            key=lambda rc: (rc[1] * len(rc[0]), rc[1], len(rc[0])),
+            reverse=True,
+        )
+        limit = self._merge_candidate_limit
+        chosen = candidates if not limit or limit <= 0 else candidates[:limit]
+        return {run for run, _count in chosen}
+
+    def _merged_token_text(self, run: Sequence[str]) -> str:
+        payload = json.dumps(list(run), ensure_ascii=True)
+        return f"{MERGE_TOKEN_PREFIX}{payload}{MERGE_TOKEN_SUFFIX}"
+
+    def _apply_merges(self, tokens: Sequence[str]) -> List[str]:
+        max_len = self._merge_max_tokens
+        if max_len <= 1:
+            return list(tokens)
+        candidates = self._select_merge_candidates(tokens, max_len)
+        if not candidates:
+            return list(tokens)
+        boundaries = self._merge_boundaries()
+        longest = max(len(run) for run in candidates)
+        merged: list[str] = []
+        idx = 0
+        total = len(tokens)
+        while idx < total:
+            token = tokens[idx]
+            if token in boundaries:
+                merged.append(token)
+                idx += 1
+                continue
+            chosen: tuple[str, ...] | None = None
+            upper = min(longest, max_len)
+            for span in range(upper, 1, -1):
+                end = idx + span
+                if end > total:
+                    continue
+                window = tuple(tokens[idx:end])
+                if any(part in boundaries for part in window):
+                    continue
+                if window in candidates:
+                    chosen = window
+                    break
+            if chosen:
+                merged.append(self._merged_token_text(chosen))
+                idx += len(chosen)
+            else:
+                merged.append(token)
+                idx += 1
+        return merged
 
     def decode(self, token_ids: Iterable[int]) -> str:
         pieces: List[str] = []
@@ -235,6 +326,9 @@ class Tokenizer:
 
     @staticmethod
     def _normalize_generated_token(token: str) -> str | None:
+        merged = Tokenizer._decode_merged_token(token)
+        if merged is not None:
+            token = merged
         adjusted = token.replace("Ċ", "\n")
         adjusted = adjusted.replace("▁", "").replace("Ġ", "")
         adjusted = adjusted.strip(" \t\r")
@@ -255,6 +349,19 @@ class Tokenizer:
         if raw_token and raw_token[0].isalnum():
             return True
         return normalized[0].isalnum()
+
+    @staticmethod
+    def _decode_merged_token(token: str) -> str | None:
+        if not (token.startswith(MERGE_TOKEN_PREFIX) and token.endswith(MERGE_TOKEN_SUFFIX)):
+            return None
+        payload = token[len(MERGE_TOKEN_PREFIX) : -len(MERGE_TOKEN_SUFFIX)]
+        try:
+            parts = json.loads(payload)
+        except Exception:
+            return None
+        if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
+            return None
+        return " ".join(parts)
 
     def tokens_to_text(self, token_ids: Iterable[int]) -> List[str]:
         return [self.vocab.token_text(token_id) for token_id in token_ids]
