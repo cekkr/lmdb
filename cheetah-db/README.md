@@ -90,6 +90,8 @@ Environment variables:
 - `CHEETAH_PAYLOAD_CACHE_ENTRIES` / `_MB` / `_BYTES` — cache tuning knobs.
 - `CHEETAH_LOG_LEVEL` — set to `3`/`debug` for level 3 traces (command ingress, reducer/trie steps).
 
+- `CHEETAH_PREDICT_DEEPEN` - set to `0` to disable context-matrix deepening in prediction tables.
+
 Prefer declarative settings? Copy `config.example.ini` to `config.ini` (or point
 `CHEETAH_CONFIG_PATH` at a custom file) and edit:
 

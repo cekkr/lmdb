@@ -9,6 +9,7 @@
 - `scripts/smoke_train.py`'s telemetry thread now auto-runs `scripts/drain_queue.py` when queue depth exceeds `--queue-drain-threshold` and appends a â€œQueue Drain (auto smoke harness)â€ entry (with metrics) to `studies/BENCHMARKS.md`.
 
 - `src/train.py` now prints the cheetah hot-path endpoint plus the final Top-K hit ratio, and evaluation uses `helpers/char_tree_similarity.py` to surface `char_repeat_*` metrics, feed them into quality gating, and re-run repeats with stronger penalties.
+- cheetah prediction tables now deepen context matrices with derived mean/variance/contrast/interaction layers (toggle via `CHEETAH_PREDICT_DEEPEN`) so prediction weights can react to richer context signals.
 
 ## Active tasks
 - Cheetah-only smoke ingest follow-up:
@@ -16,5 +17,6 @@
   - `Disabling cheetah hot-path adapter: pair_reduce counts failed` kept the decoder on SQLite. Python now tolerates ~30 seconds of reducer inactivity before giving up on the cheetah socket, so `PAIR_REDUCE counts` should stay alive once the Go server finishes streaming a page. Next step: rerun the same smoke ingest with the tmux-backed cheetah server, tail both `var/cheetah_smoke_train_*.log` and `var/cheetah-server-linux.log` every 30 seconds, then capture decoder latency / Top-K stats in `cheetah-db/README.md` + `studies/BENCHMARKS.md`.
 - Investigate the cheetah smoke helper hang: `scripts/start_cheetah_smoke_session.sh` + `scripts/run_cheetah_smoke.sh` still wedge on `datasets/emotion_data.json#chunk1` (originally in `var/eval_logs/cheetah_smoke_train_20251112-190626.log`, now reproducible in `var/cheetah_smoke_train_20251112-205914.log` where the eval loop burns retries indefinitely). Capture stack traces and cheetah telemetry the moment it wedges so we can remove the repetitive â€œZooming inâ€¦â€ scaffolds and finally unlock reliable latency/top-K recordings.
 
+- Validate the new deepened prediction layers against GPTeacher eval probes and log whether punctuation repetition drops; adjust `CHEETAH_PREDICT_DEEPEN` or `--cheetah-token-weight` based on the quality metrics.
 ## Remember
 - The development works also on Cheetah: don't fallback on sqlite if it doesn't works, but fix the issue.

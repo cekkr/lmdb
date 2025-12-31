@@ -599,6 +599,7 @@ func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float
 }
 
 func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]float64) ([]PredictionResult, error) {
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	entry, ok := p.entries[encodeKey(key)]
@@ -629,7 +630,7 @@ func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]fl
 			continue
 		}
 		score := value.BaseProbability
-		score += applyContextWeights(ctx, value.ContextWeights)
+		score += applyContextWeights(deepCtx, value.ContextWeights)
 		score += mergeProbabilityWeight(windowMerge)
 		scores = append(scores, score)
 		results = append(results, PredictionResult{Value: decoded})
@@ -672,6 +673,262 @@ func applyContextWeights(ctx ContextMatrix, weights []ContextWeight) float64 {
 		delta += weight.Bias
 	}
 	return delta
+}
+
+func deepenContextMatrix(ctx ContextMatrix) ContextMatrix {
+	if !predictDeepenEnabled() || len(ctx) == 0 {
+		return ctx
+	}
+	rows := make(ContextMatrix, 0, len(ctx))
+	for _, row := range ctx {
+		if len(row) == 0 {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) < 2 {
+		return ctx
+	}
+	maxLen := contextMatrixMaxLen(rows)
+	if maxLen == 0 {
+		return ctx
+	}
+	meanAll := vectorMean(rows, maxLen)
+	varianceAll := vectorVariance(rows, meanAll, maxLen)
+	rmsAll := vectorRMS(rows, maxLen)
+	topMean, bottomMean := vectorMeanExtremes(rows, maxLen, 3)
+	contrast := vectorTanh(vectorSub(topMean, bottomMean))
+	interaction := vectorTanh(vectorMul(meanAll, contrast))
+	depthBlend := vectorTanh(vectorAdd(vectorAdd(meanAll, varianceAll), interaction))
+
+	expanded := make(ContextMatrix, 0, len(ctx)+6)
+	expanded = append(expanded, ctx...)
+	expanded = appendDerivedLayer(expanded, meanAll)
+	expanded = appendDerivedLayer(expanded, varianceAll)
+	expanded = appendDerivedLayer(expanded, rmsAll)
+	expanded = appendDerivedLayer(expanded, contrast)
+	expanded = appendDerivedLayer(expanded, interaction)
+	expanded = appendDerivedLayer(expanded, depthBlend)
+	return expanded
+}
+
+func predictDeepenEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("CHEETAH_PREDICT_DEEPEN"))
+	if raw == "" {
+		return true
+	}
+	switch strings.ToLower(raw) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func appendDerivedLayer(ctx ContextMatrix, layer []float64) ContextMatrix {
+	if len(layer) == 0 {
+		return ctx
+	}
+	return append(ctx, layer)
+}
+
+func contextMatrixMaxLen(ctx ContextMatrix) int {
+	maxLen := 0
+	for _, row := range ctx {
+		if len(row) > maxLen {
+			maxLen = len(row)
+		}
+	}
+	return maxLen
+}
+
+func vectorMean(rows ContextMatrix, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	mean := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			mean[idx] += value
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return mean
+	}
+	for idx := range mean {
+		mean[idx] /= denom
+	}
+	return mean
+}
+
+func vectorVariance(rows ContextMatrix, mean []float64, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	variance := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			diff := value
+			if idx < len(mean) {
+				diff -= mean[idx]
+			}
+			variance[idx] += diff * diff
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return variance
+	}
+	for idx := range variance {
+		variance[idx] /= denom
+	}
+	return variance
+}
+
+func vectorRMS(rows ContextMatrix, maxLen int) []float64 {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil
+	}
+	energy := make([]float64, maxLen)
+	for _, row := range rows {
+		for idx, value := range row {
+			energy[idx] += value * value
+		}
+	}
+	denom := float64(len(rows))
+	if denom <= 0 {
+		return energy
+	}
+	for idx := range energy {
+		energy[idx] = math.Sqrt(energy[idx] / denom)
+	}
+	return energy
+}
+
+func vectorMeanExtremes(rows ContextMatrix, maxLen int, k int) ([]float64, []float64) {
+	if len(rows) == 0 || maxLen <= 0 {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 1
+	}
+	maxK := len(rows) / 2
+	if maxK < 1 {
+		maxK = 1
+	}
+	if k > maxK {
+		k = maxK
+	}
+	type rowEnergy struct {
+		index  int
+		energy float64
+	}
+	energies := make([]rowEnergy, 0, len(rows))
+	for idx, row := range rows {
+		energies = append(energies, rowEnergy{
+			index:  idx,
+			energy: vectorEnergy(row),
+		})
+	}
+	sort.Slice(energies, func(i, j int) bool {
+		return energies[i].energy > energies[j].energy
+	})
+	topRows := make(ContextMatrix, 0, k)
+	bottomRows := make(ContextMatrix, 0, k)
+	for i := 0; i < k && i < len(energies); i++ {
+		topRows = append(topRows, rows[energies[i].index])
+		bottomIdx := len(energies) - 1 - i
+		if bottomIdx >= 0 && bottomIdx < len(energies) {
+			bottomRows = append(bottomRows, rows[energies[bottomIdx].index])
+		}
+	}
+	return vectorMean(topRows, maxLen), vectorMean(bottomRows, maxLen)
+}
+
+func vectorEnergy(row []float64) float64 {
+	if len(row) == 0 {
+		return 0
+	}
+	total := 0.0
+	for _, value := range row {
+		total += math.Abs(value)
+	}
+	return total / float64(len(row))
+}
+
+func vectorAdd(a, b []float64) []float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		if idx < len(a) {
+			result[idx] += a[idx]
+		}
+		if idx < len(b) {
+			result[idx] += b[idx]
+		}
+	}
+	return result
+}
+
+func vectorSub(a, b []float64) []float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		if idx < len(a) {
+			result[idx] += a[idx]
+		}
+		if idx < len(b) {
+			result[idx] -= b[idx]
+		}
+	}
+	return result
+}
+
+func vectorMul(a, b []float64) []float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	size := len(a)
+	if len(b) > size {
+		size = len(b)
+	}
+	result := make([]float64, size)
+	for idx := 0; idx < size; idx++ {
+		aVal := 0.0
+		bVal := 0.0
+		if idx < len(a) {
+			aVal = a[idx]
+		}
+		if idx < len(b) {
+			bVal = b[idx]
+		}
+		result[idx] = aVal * bVal
+	}
+	return result
+}
+
+func vectorTanh(values []float64) []float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]float64, len(values))
+	for idx, value := range values {
+		result[idx] = math.Tanh(value)
+	}
+	return result
 }
 
 func mergeProbabilityWeight(merged []float64) float64 {
@@ -773,6 +1030,7 @@ func (p *PredictionTable) Train(
 	if lr <= 0 {
 		lr = 0.01
 	}
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	entry, ok := p.entries[encodeKey(key)]
@@ -785,11 +1043,11 @@ func (p *PredictionTable) Train(
 	if idx < 0 {
 		return PredictionEntry{}, fmt.Errorf("invalid_prediction_target")
 	}
-	score := entry.Values[idx].BaseProbability + applyContextWeights(ctx, entry.Values[idx].ContextWeights)
+	score := entry.Values[idx].BaseProbability + applyContextWeights(deepCtx, entry.Values[idx].ContextWeights)
 	pred := sigmoid(score)
 	err := 1.0 - pred
 	entry.Values[idx].BaseProbability = clampScore(entry.Values[idx].BaseProbability + lr*err)
-	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, ctx, lr*err)
+	entry.Values[idx].ContextWeights = adjustContextWeights(entry.Values[idx].ContextWeights, deepCtx, lr*err)
 	entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
 	adversarialValues := normalizeNegativeValues(negatives, targetEncoded)
 	if len(adversarialValues) > 0 {
@@ -798,11 +1056,11 @@ func (p *PredictionTable) Train(
 			if negIdx < 0 {
 				continue
 			}
-			negScore := entry.Values[negIdx].BaseProbability + applyContextWeights(ctx, entry.Values[negIdx].ContextWeights)
+			negScore := entry.Values[negIdx].BaseProbability + applyContextWeights(deepCtx, entry.Values[negIdx].ContextWeights)
 			negPred := sigmoid(negScore)
 			delta := -negPred
 			entry.Values[negIdx].BaseProbability = clampScore(entry.Values[negIdx].BaseProbability + lr*delta)
-			entry.Values[negIdx].ContextWeights = adjustContextWeights(entry.Values[negIdx].ContextWeights, ctx, lr*delta)
+			entry.Values[negIdx].ContextWeights = adjustContextWeights(entry.Values[negIdx].ContextWeights, deepCtx, lr*delta)
 			entry.Values[negIdx].LastUpdatedEpoch = time.Now().Unix()
 		}
 	}
@@ -819,6 +1077,7 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 	if mode == "" {
 		mode = "bias"
 	}
+	deepCtx := deepenContextMatrix(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	entry, ok := p.entries[encodeKey(key)]
@@ -826,7 +1085,7 @@ func (p *PredictionTable) ApplyContextAdjustment(key []byte, ctx ContextMatrix, 
 		return PredictionEntry{}, errPredictionEntryNotFound
 	}
 	for idx := range entry.Values {
-		bias := applyContextWeights(ctx, entry.Values[idx].ContextWeights) * strength
+		bias := applyContextWeights(deepCtx, entry.Values[idx].ContextWeights) * strength
 		switch mode {
 		case "scale", "multiply":
 			entry.Values[idx].BaseProbability = entry.Values[idx].BaseProbability * (1 + bias)

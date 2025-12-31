@@ -121,6 +121,8 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   learned multi-scale contexts influence sampling without needing per-token embedding calls. The
   same context matrices now append dimension-level summary/fusion vectors so cheetah prediction
   tables see a hidden-layer style projection that differentiates short vs. long window signals.
+  cheetah-db now deepens every context matrix with derived mean/variance/contrast/interaction layers
+  before prediction training/querying; toggle via `CHEETAH_PREDICT_DEEPEN=0` if needed.
 - Future idea: promote each dimension to a small codebook (k-means per window size) and expose a CLI
   inspector so we can audit the learned prototypes or pin certain domains (code, poetry, etc.)
   before wiring them into penalty scaling.
