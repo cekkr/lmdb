@@ -174,6 +174,9 @@ python src/train.py datasets/emotion_data.json \
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
   - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive. Set `--merge-max-tokens 0` to disable.
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
+  - `--context-window-train-windows <n>`: Override how many windows per dimension are sampled during training for context embeddings (0 = default).
+  - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).
+  - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = default).
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
 - **File reading helpers**
   - `--recursive`: When scanning folders, include subdirectories (default is to read only the top level).

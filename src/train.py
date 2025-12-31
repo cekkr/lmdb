@@ -93,6 +93,32 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--context-window-train-windows",
+        type=int,
+        default=0,
+        help=(
+            "Max windows per dimension sampled during training for context embeddings "
+            "(default: engine preset)."
+        ),
+    )
+    parser.add_argument(
+        "--context-window-infer-windows",
+        type=int,
+        default=0,
+        help=(
+            "Max windows per dimension sampled during inference/evaluation for context embeddings "
+            "(default: engine preset)."
+        ),
+    )
+    parser.add_argument(
+        "--context-window-stride-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Stride ratio for context window sampling (0.1-1.0, default: engine preset)."
+        ),
+    )
+    parser.add_argument(
         "--encoding",
         default="utf-8",
         help="File encoding used while reading corpora (default: %(default)s).",
@@ -408,6 +434,35 @@ def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
     if reset:
         _wipe_sqlite_artifacts(path)
     return str(path), path
+
+
+def _configure_context_windows(
+    engine: DBSLMEngine,
+    args: argparse.Namespace,
+) -> dict[str, float | int] | None:
+    manager = getattr(engine, "context_windows", None)
+    if not manager or not manager.enabled():
+        return None
+    changed = False
+    train_windows = int(getattr(args, "context_window_train_windows", 0) or 0)
+    if train_windows > 0:
+        manager.max_train_windows = max(1, train_windows)
+        changed = True
+    infer_windows = int(getattr(args, "context_window_infer_windows", 0) or 0)
+    if infer_windows > 0:
+        manager.max_infer_windows = max(1, infer_windows)
+        changed = True
+    stride_ratio = float(getattr(args, "context_window_stride_ratio", 0.0) or 0.0)
+    if stride_ratio > 0:
+        manager.extractor.stride_ratio = max(0.1, min(stride_ratio, 1.0))
+        changed = True
+    if not changed:
+        return None
+    return {
+        "stride_ratio": manager.extractor.stride_ratio,
+        "max_train_windows": manager.max_train_windows,
+        "max_infer_windows": manager.max_infer_windows,
+    }
 
 
 _CHEETAH_PURGE_PREFIXES: tuple[bytes, ...] = (
@@ -1913,6 +1968,16 @@ def main() -> None:
         log(f"[train] Hot-path adapter active -> {describe_adapter()}")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
+    context_window_config = _configure_context_windows(engine, args)
+    if context_window_config:
+        log(
+            "[train] Context window config: "
+            "stride={stride:.2f}, train_windows={train}, infer_windows={infer}.".format(
+                stride=context_window_config["stride_ratio"],
+                train=context_window_config["max_train_windows"],
+                infer=context_window_config["max_infer_windows"],
+            )
+        )
     if getattr(engine, "token_merge_max_tokens", 0) > 1:
         log(
             "[train] Token merging enabled "
@@ -1923,6 +1988,8 @@ def main() -> None:
         log(f"[train] Context window embeddings: {context_window_label}")
     if run_metadata is not None:
         run_metadata["context_dimensions"] = dims_label
+        if context_window_config:
+            run_metadata["context_window_config"] = context_window_config
         if context_window_label:
             run_metadata["context_window_embeddings"] = context_window_label
     _emit_cheetah_reports(engine, args)
