@@ -97,7 +97,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Max windows per dimension sampled during training for context embeddings "
+            "Cap on adaptive windows per dimension sampled during training for context embeddings "
             "(default: engine preset)."
         ),
     )

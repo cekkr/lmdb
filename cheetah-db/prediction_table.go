@@ -700,15 +700,19 @@ func deepenContextMatrix(ctx ContextMatrix) ContextMatrix {
 	contrast := vectorTanh(vectorSub(topMean, bottomMean))
 	interaction := vectorTanh(vectorMul(meanAll, contrast))
 	depthBlend := vectorTanh(vectorAdd(vectorAdd(meanAll, varianceAll), interaction))
+	depthScale := contextMatrixDepthScale(rows, varianceAll)
+	if depthScale <= 0 {
+		return ctx
+	}
 
 	expanded := make(ContextMatrix, 0, len(ctx)+6)
 	expanded = append(expanded, ctx...)
-	expanded = appendDerivedLayer(expanded, meanAll)
-	expanded = appendDerivedLayer(expanded, varianceAll)
-	expanded = appendDerivedLayer(expanded, rmsAll)
-	expanded = appendDerivedLayer(expanded, contrast)
-	expanded = appendDerivedLayer(expanded, interaction)
-	expanded = appendDerivedLayer(expanded, depthBlend)
+	expanded = appendDerivedLayer(expanded, vectorScale(meanAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(varianceAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(rmsAll, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(contrast, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(interaction, depthScale))
+	expanded = appendDerivedLayer(expanded, vectorScale(depthBlend, depthScale))
 	return expanded
 }
 
@@ -929,6 +933,50 @@ func vectorTanh(values []float64) []float64 {
 		result[idx] = math.Tanh(value)
 	}
 	return result
+}
+
+func vectorScale(values []float64, scale float64) []float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	scaled := make([]float64, len(values))
+	for idx, value := range values {
+		scaled[idx] = value * scale
+	}
+	return scaled
+}
+
+func vectorMeanAbs(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var total float64
+	for _, value := range values {
+		if value < 0 {
+			total -= value
+		} else {
+			total += value
+		}
+	}
+	return total / float64(len(values))
+}
+
+func contextMatrixDepthScale(rows ContextMatrix, variance []float64) float64 {
+	if len(rows) == 0 || len(variance) == 0 {
+		return 0
+	}
+	magnitude := vectorMeanAbs(variance)
+	if magnitude <= 0 {
+		return 0
+	}
+	scale := math.Tanh(magnitude * math.Log1p(float64(len(rows))))
+	if scale <= 0 {
+		return 0
+	}
+	if scale >= 1 {
+		return 1
+	}
+	return scale
 }
 
 func mergeProbabilityWeight(merged []float64) float64 {

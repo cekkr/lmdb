@@ -164,8 +164,10 @@ matrix.
   arrays, but deeper arrays can fine-tune an already-biased probability when higher precision is
   needed.
 - cheetah-db deepens every context matrix with derived mean/variance/contrast/interaction layers
-  before training or querying prediction tables. Disable this expansion by setting
-  `CHEETAH_PREDICT_DEEPEN=0` when comparing against legacy behaviour.
+  before training or querying prediction tables. The derived layers now scale automatically with
+  context diversity (variance + row count) so shallow/generic matrices stay light while richer
+  windows get more depth. Disable this expansion by setting `CHEETAH_PREDICT_DEEPEN=0` when comparing
+  against legacy behaviour.
 - The training loop runs forward/backward passes. Forward: collect per-window probabilities, fold in
   active context vectors, truncate to the requested byte span, then merge. Backward: adjust the
   stored weights so correlated byte sequences + contexts keep consistent probabilities, attaching

@@ -174,7 +174,7 @@ python src/train.py datasets/emotion_data.json \
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
   - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
-  - `--context-window-train-windows <n>`: Override how many windows per dimension are sampled during training for context embeddings (0 = default).
+  - `--context-window-train-windows <n>`: Override the cap for adaptive windows-per-dimension sampling during training for context embeddings (0 = default).
   - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).
   - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = default).
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
@@ -402,7 +402,8 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
   dimension-level summary/fusion layers so prediction tables see a hidden-layer style context
   matrix aligned with `--context-dimensions`. The Python side now auto-adds extra fused tiers when
   dimension summaries diverge, deepening the matrix without fixed depth knobs. cheetah-db further
-  deepens these matrices with derived mean/variance/contrast/interaction layers during
+  deepens these matrices with derived mean/variance/contrast/interaction layers that scale with
+  context diversity during
   training/querying (disable with `CHEETAH_PREDICT_DEEPEN=0`). `train.py` uses this helper whenever
   you pass one or more
   `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted into

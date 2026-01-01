@@ -107,6 +107,7 @@ class ContextWindowExtractor:
         *,
         windows_per_dimension: int,
         rng: random.Random,
+        adaptive_windows: bool = False,
     ) -> list[ContextWindowSnippet]:
         if not text.strip():
             return []
@@ -117,19 +118,28 @@ class ContextWindowExtractor:
         for index, dim in enumerate(self.dimensions):
             window = max(2, dim.span)
             stride = max(1, int(round(window * self.stride_ratio)))
+            window_budget = self._window_budget(
+                len(tokens),
+                stride,
+                windows_per_dimension,
+                adaptive_windows,
+            )
+            if window_budget <= 0:
+                continue
+            candidate_cap = window_budget * 3
             candidates: list[list[TaggedToken]] = []
             for start in range(0, len(tokens), stride):
                 chunk = tokens[start : start + window]
                 if len(chunk) < 2:
-                    continue
+                    break
                 candidates.append(chunk)
-                if len(candidates) >= windows_per_dimension * 3:
+                if len(candidates) >= candidate_cap:
                     break
             if not candidates:
                 continue
-            if len(candidates) > windows_per_dimension:
+            if len(candidates) > window_budget:
                 rng.shuffle(candidates)
-                selected = candidates[:windows_per_dimension]
+                selected = candidates[:window_budget]
             else:
                 selected = candidates
             for chunk in selected:
@@ -151,6 +161,29 @@ class ContextWindowExtractor:
             parts.append(" ".join(words))
         snippet_text = " ".join(part for part in parts if part).strip()
         return snippet_text or " ".join(words), tag_marker
+
+    @staticmethod
+    def _window_budget(
+        token_count: int,
+        stride: int,
+        max_windows: int,
+        adaptive_windows: bool,
+    ) -> int:
+        if token_count < 2:
+            return 0
+        if not adaptive_windows:
+            return max(1, max_windows)
+        candidate_total = ((token_count - 2) // max(1, stride)) + 1
+        if candidate_total <= 0:
+            return 0
+        adaptive = int(round(math.log1p(candidate_total) ** 2))
+        if adaptive < 1:
+            adaptive = 1
+        if adaptive > candidate_total:
+            adaptive = candidate_total
+        if max_windows > 0:
+            adaptive = min(adaptive, max_windows)
+        return adaptive
 
     def _dimension_tag_marker(
         self,
@@ -315,6 +348,7 @@ class ContextWindowEmbeddingManager:
             text,
             windows_per_dimension=self.max_train_windows,
             rng=self._rng,
+            adaptive_windows=True,
         )
         if not snippets:
             return
@@ -463,7 +497,8 @@ class ContextWindowEmbeddingManager:
         normalized = max(0.0, min(1.0, (mean_similarity + 1.0) / 2.0))
         diversity = 1.0 - normalized
         raw_depth = math.log2(len(dimension_vectors) + 1.0)
-        depth = int(round(diversity * raw_depth))
+        depth_scale = self._prototype_depth_scale()
+        depth = int(round(diversity * raw_depth * depth_scale))
         return max(0, min(depth, int(raw_depth)))
 
     def _mean_similarity_to_fused(
@@ -481,6 +516,17 @@ class ContextWindowEmbeddingManager:
         if not sims:
             return 0.0
         return sum(sims) / float(len(sims))
+
+    def _prototype_depth_scale(self) -> float:
+        if not self._prototypes:
+            return 0.0
+        counts = [proto.count for proto in self._prototypes if proto.count > 0]
+        if not counts:
+            return 0.0
+        avg_count = sum(counts) / float(len(counts))
+        if self.max_train_windows <= 0:
+            return 1.0
+        return max(0.0, min(1.0, avg_count / float(self.max_train_windows)))
 
     def _sorted_dimension_vectors(
         self,
