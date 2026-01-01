@@ -424,10 +424,91 @@ class ContextWindowEmbeddingManager:
                 continue
             derived.append(summary)
             dimension_vectors.append((dim_index, summary))
-        fused = self._fuse_dimension_vectors(dimension_vectors)
-        if fused:
-            derived.append(fused)
+        derived.extend(self._adaptive_prediction_layers(dimension_vectors))
         return derived
+
+    def _adaptive_prediction_layers(
+        self,
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+    ) -> list[list[float]]:
+        if len(dimension_vectors) < 2:
+            fused = self._fuse_dimension_vectors(dimension_vectors)
+            return [fused] if fused else []
+        fused = self._fuse_dimension_vectors(dimension_vectors)
+        depth_budget = self._adaptive_depth_budget(dimension_vectors, fused)
+        if depth_budget <= 0:
+            return [fused] if fused else []
+        ordered = self._sorted_dimension_vectors(dimension_vectors)
+        layers: list[list[float]] = []
+        for depth in range(1, depth_budget + 1):
+            group_count = 2**depth
+            for group in self._split_dimension_vectors(ordered, group_count):
+                if len(group) < 2:
+                    continue
+                fused_group = self._fuse_dimension_vectors(group)
+                if fused_group:
+                    layers.append(fused_group)
+        if fused:
+            layers.append(fused)
+        return layers
+
+    def _adaptive_depth_budget(
+        self,
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+        fused: list[float] | None,
+    ) -> int:
+        if len(dimension_vectors) < 2 or not fused:
+            return 0
+        mean_similarity = self._mean_similarity_to_fused(dimension_vectors, fused)
+        normalized = max(0.0, min(1.0, (mean_similarity + 1.0) / 2.0))
+        diversity = 1.0 - normalized
+        raw_depth = math.log2(len(dimension_vectors) + 1.0)
+        depth = int(round(diversity * raw_depth))
+        return max(0, min(depth, int(raw_depth)))
+
+    def _mean_similarity_to_fused(
+        self,
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+        fused: Sequence[float],
+    ) -> float:
+        if not dimension_vectors:
+            return 0.0
+        sims: list[float] = []
+        for _dim_index, vector in dimension_vectors:
+            if not vector:
+                continue
+            sims.append(self._cosine_similarity(fused, vector))
+        if not sims:
+            return 0.0
+        return sum(sims) / float(len(sims))
+
+    def _sorted_dimension_vectors(
+        self,
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+    ) -> list[tuple[int, list[float]]]:
+        def _span_for(index: int) -> float:
+            if 0 <= index < len(self.dimensions):
+                return float(self.dimensions[index].span)
+            return float(index)
+
+        return sorted(dimension_vectors, key=lambda item: _span_for(item[0]))
+
+    @staticmethod
+    def _split_dimension_vectors(
+        dimension_vectors: Sequence[tuple[int, list[float]]],
+        group_count: int,
+    ) -> list[list[tuple[int, list[float]]]]:
+        if not dimension_vectors:
+            return []
+        if group_count <= 1:
+            return [list(dimension_vectors)]
+        group_size = int(math.ceil(len(dimension_vectors) / float(group_count)))
+        groups: list[list[tuple[int, list[float]]]] = []
+        for start in range(0, len(dimension_vectors), group_size):
+            group = list(dimension_vectors[start : start + group_size])
+            if group:
+                groups.append(group)
+        return groups
 
     def _summarize_dimension_vectors(
         self,

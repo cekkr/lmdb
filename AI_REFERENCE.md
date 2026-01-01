@@ -90,10 +90,10 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   by setting `canonical_tag`; datasets that skip the field no longer receive automatic `|CTX|:`
   prefixes.
 - Training runs with `--ngram-order` >= 5 now merge repeated token runs into composite tokens by default
-  (`--merge-max-tokens 5`). Spans below the average frequency of all candidate spans are discarded
-  automatically so incongruent merges do not pollute the vocabulary. The merge config is persisted in
-  metadata (SQLite + cheetah) so inference reuses the same rules; set `--merge-max-tokens 0` to
-  disable.
+  (`--merge-max-tokens 5`). Spans below the average frequency of all candidate spans are discarded,
+  and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely
+  to merge. The merge config is persisted in metadata (SQLite + cheetah) so inference reuses the
+  same rules; set `--merge-max-tokens 0` to disable.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input
@@ -120,9 +120,11 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   prototypes to scale the per-dimension presence/frequency penalties via cosine similarity, so the
   learned multi-scale contexts influence sampling without needing per-token embedding calls. The
   same context matrices now append dimension-level summary/fusion vectors so cheetah prediction
-  tables see a hidden-layer style projection that differentiates short vs. long window signals.
-  cheetah-db now deepens every context matrix with derived mean/variance/contrast/interaction layers
-  before prediction training/querying; toggle via `CHEETAH_PREDICT_DEEPEN=0` if needed.
+  tables see a hidden-layer style projection that differentiates short vs. long window signals, and
+  extra fused tiers are added automatically when dimension summaries diverge so the matrix can
+  deepen without fixed depth knobs. cheetah-db now deepens every context matrix with derived
+  mean/variance/contrast/interaction layers before prediction training/querying; toggle via
+  `CHEETAH_PREDICT_DEEPEN=0` if needed.
   `train.py` also exposes `--context-window-train-windows`, `--context-window-infer-windows`, and
   `--context-window-stride-ratio` to control how densely those windows are sampled.
 - Future idea: promote each dimension to a small codebook (k-means per window size) and expose a CLI

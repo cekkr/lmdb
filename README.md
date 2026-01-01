@@ -172,7 +172,7 @@ python src/train.py datasets/emotion_data.json \
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
-  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive. Set `--merge-max-tokens 0` to disable.
+  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
   - `--context-window-train-windows <n>`: Override how many windows per dimension are sampled during training for context embeddings (0 = default).
   - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).
@@ -400,9 +400,11 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
 
 - `ContextWindowEmbeddingManager.context_matrix_for_text()` now emits the per-window vectors plus
   dimension-level summary/fusion layers so prediction tables see a hidden-layer style context
-  matrix aligned with `--context-dimensions`. cheetah-db further deepens these matrices with
-  derived mean/variance/contrast/interaction layers during training/querying (disable with
-  `CHEETAH_PREDICT_DEEPEN=0`). `train.py` uses this helper whenever you pass one or more
+  matrix aligned with `--context-dimensions`. The Python side now auto-adds extra fused tiers when
+  dimension summaries diverge, deepening the matrix without fixed depth knobs. cheetah-db further
+  deepens these matrices with derived mean/variance/contrast/interaction layers during
+  training/querying (disable with `CHEETAH_PREDICT_DEEPEN=0`). `train.py` uses this helper whenever
+  you pass one or more
   `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted into
   a context matrix via the active `--context-dimensions`, then piped through
   `PREDICT_QUERY table=context_matrices key=meta:context_dimension_embeddings` by default.

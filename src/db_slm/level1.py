@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 import re
 import json
 from collections import defaultdict
@@ -232,11 +233,12 @@ class Tokenizer:
         boundaries.update(self._special_token_set)
         return boundaries
 
-    def _select_merge_candidates(self, tokens: Sequence[str], max_len: int) -> set[tuple[str, ...]]:
+    def _select_merge_candidates(self, tokens: Sequence[str], max_len: int) -> Dict[tuple[str, ...], float]:
         if max_len <= 1:
-            return set()
+            return {}
         counts: Dict[tuple[str, ...], int] = defaultdict(int)
         boundaries = self._merge_boundaries()
+        token_probs, median_prob = self._token_probabilities(tokens, boundaries)
         total = len(tokens)
         for start in range(total):
             if tokens[start] in boundaries:
@@ -250,19 +252,55 @@ class Tokenizer:
                     continue
                 counts[tuple(window)] += 1
         if not counts:
-            return set()
-        avg = sum(counts.values()) / float(len(counts))
+            return {}
+        weighted_counts: Dict[tuple[str, ...], float] = {}
+        for run, count in counts.items():
+            max_prob = max(token_probs.get(token, 0.0) for token in run)
+            weight = self._merge_run_weight(max_prob, median_prob)
+            weighted_counts[run] = count * weight
+        avg = sum(weighted_counts.values()) / float(len(weighted_counts))
         threshold = max(2, int(math.ceil(avg)))
-        candidates = [(run, count) for run, count in counts.items() if count >= threshold]
+        candidates = []
+        for run, count in counts.items():
+            weighted_count = weighted_counts.get(run, 0.0)
+            if weighted_count >= threshold:
+                score = weighted_count * len(run)
+                candidates.append((run, score, count))
         if not candidates:
-            return set()
+            return {}
         candidates.sort(
-            key=lambda rc: (rc[1] * len(rc[0]), rc[1], len(rc[0])),
+            key=lambda rc: (rc[1], rc[2], len(rc[0])),
             reverse=True,
         )
         limit = self._merge_candidate_limit
         chosen = candidates if not limit or limit <= 0 else candidates[:limit]
-        return {run for run, _count in chosen}
+        return {run: score for run, score, _count in chosen}
+
+    def _token_probabilities(
+        self,
+        tokens: Sequence[str],
+        boundaries: set[str],
+    ) -> tuple[Dict[str, float], float]:
+        counts: Dict[str, int] = defaultdict(int)
+        total = 0
+        for token in tokens:
+            if token in boundaries:
+                continue
+            counts[token] += 1
+            total += 1
+        if total <= 0 or not counts:
+            return {}, 0.0
+        probs = {token: count / float(total) for token, count in counts.items()}
+        median_prob = float(statistics.median(probs.values())) if probs else 0.0
+        return probs, median_prob
+
+    @staticmethod
+    def _merge_run_weight(max_prob: float, median_prob: float) -> float:
+        if median_prob <= 0.0 or max_prob <= median_prob:
+            return 1.0
+        relative = max_prob / median_prob
+        # Down-weight runs dominated by globally common tokens.
+        return 1.0 / (1.0 + math.log1p(relative - 1.0))
 
     def _merged_token_text(self, run: Sequence[str]) -> str:
         payload = json.dumps(list(run), ensure_ascii=True)
@@ -287,6 +325,8 @@ class Tokenizer:
                 idx += 1
                 continue
             chosen: tuple[str, ...] | None = None
+            chosen_score = -1.0
+            chosen_len = 0
             upper = min(longest, max_len)
             for span in range(upper, 1, -1):
                 end = idx + span
@@ -295,9 +335,13 @@ class Tokenizer:
                 window = tuple(tokens[idx:end])
                 if any(part in boundaries for part in window):
                     continue
-                if window in candidates:
+                score = candidates.get(window)
+                if score is None:
+                    continue
+                if score > chosen_score or (score == chosen_score and span > chosen_len):
                     chosen = window
-                    break
+                    chosen_score = score
+                    chosen_len = span
             if chosen:
                 merged.append(self._merged_token_text(chosen))
                 idx += len(chosen)
