@@ -10,7 +10,7 @@ Very complex:
 python3.13 src/train.py datasets/GPTeacher.json --ngram-order 6 --json-chunk-size 1000 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 5.0 --eval-interval 100000 --decoder-presence-penalty 0.3 --decoder-frequency-penalty 0.15 --context-dimensions 16,24,32,48,64  --cheetah-eval-predict --reset --profile-ingest --cheetah-context-probe "Summaries about remote work" --cheetah-context-probe "Reflect on the previous lesson"
 
 Very complex -1:
-python3.13 src/train.py datasets/GPTeacher.json --ngram-order 4 --merge-max-tokens 3 --json-chunk-size 1000 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 5.0 --eval-interval 50000 --decoder-presence-penalty 0.3 --decoder-frequency-penalty 0.15 --context-dimensions 16,24,32,64 --reset --profile-ingest
+python3.13 src/train.py datasets/GPTeacher.json --ngram-order 5 --merge-max-tokens 3 --json-chunk-size 1000 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 5.0 --eval-interval 50000 --decoder-presence-penalty 0.4 --decoder-frequency-penalty 0.15 --context-dimensions 16,24,32,64 --reset --profile-ingest
 
 Very complex but not too much:
 python3.13 src/train.py datasets/GPTeacher.json --ngram-order 5 --json-chunk-size 100 --eval-samples 2 --eval-variants 2 --chunk-eval-percent 20.0 --eval-interval 1000 --profile-ingest --decoder-presence-penalty 0.4 --decoder-frequency-penalty 0.15 --context-dimensions 12,16,24,32,48 --cheetah-context-probe "Summaries about remote work" --cheetah-context-probe "Reflect on the previous lesson" --cheetah-system-stats --cheetah-token-weight 0.5 --cheetah-token-learning-rate 0.01 --reset
