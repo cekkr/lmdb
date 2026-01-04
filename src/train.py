@@ -89,7 +89,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
             "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like "
             "'8,12,16,22,32' or '16,24,32,48,64' used to group context penalties and build MiniLM "
             "context-window embeddings for the prediction context matrix. This is independent of "
-            "--cheetah-* probes/training. Use 'off' to disable."
+            "--cheetah-* probes/training. Use presets 'default', 'deep', or 'shallow', or set "
+            "'off' to disable."
         ),
     )
     parser.add_argument(
@@ -116,6 +117,15 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "Stride ratio for context window sampling (0.1-1.0, default: engine preset)."
+        ),
+    )
+    parser.add_argument(
+        "--context-window-depth",
+        type=int,
+        default=None,
+        help=(
+            "Extra hidden-layer depth tiers to apply when building context matrices "
+            "(default: engine preset). Use 0 for legacy depth; negative values reduce depth."
         ),
     )
     parser.add_argument(
@@ -456,12 +466,17 @@ def _configure_context_windows(
     if stride_ratio > 0:
         manager.extractor.stride_ratio = max(0.1, min(stride_ratio, 1.0))
         changed = True
+    depth_bonus = getattr(args, "context_window_depth", None)
+    if depth_bonus is not None:
+        manager.depth_bonus = int(depth_bonus)
+        changed = True
     if not changed:
         return None
     return {
         "stride_ratio": manager.extractor.stride_ratio,
         "max_train_windows": manager.max_train_windows,
         "max_infer_windows": manager.max_infer_windows,
+        "depth_bonus": manager.depth_bonus,
     }
 
 
@@ -1122,6 +1137,113 @@ def resolve_metrics_export_path(raw: str | None) -> Path | None:
     path = Path(cleaned).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+_RESUME_STATE_PATH = Path("var/train_resume.json")
+_RESUME_STATE_VERSION = 1
+
+
+def _utc_timestamp() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _load_resume_state(path: Path = _RESUME_STATE_PATH) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log(f"[resume] Warning: unable to read {path}: {exc}")
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log(f"[resume] Warning: invalid resume state {path}: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        log(f"[resume] Warning: malformed resume state {path}")
+        return None
+    return payload
+
+
+def _write_resume_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    tmp_path.replace(path)
+
+
+def _persist_resume_state(state: dict[str, Any]) -> None:
+    state["updated_at"] = _utc_timestamp()
+    _write_resume_state(_RESUME_STATE_PATH, state)
+
+
+def _fingerprint_input(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": int(stat.st_size), "mtime": int(stat.st_mtime)}
+
+
+def _collect_input_fingerprints(paths: Sequence[Path]) -> dict[str, dict[str, int]]:
+    return {str(path): _fingerprint_input(path) for path in paths}
+
+
+def _validate_resume_inputs(
+    paths: Sequence[Path],
+    fingerprints: dict[str, dict[str, int]] | None,
+) -> list[str]:
+    if not fingerprints:
+        return []
+    errors: list[str] = []
+    for path in paths:
+        key = str(path)
+        if not path.exists():
+            errors.append(f"missing: {path}")
+            continue
+        expected = fingerprints.get(key)
+        if not expected:
+            errors.append(f"untracked: {path}")
+            continue
+        actual = _fingerprint_input(path)
+        if actual["size"] != expected.get("size") or actual["mtime"] != expected.get("mtime"):
+            errors.append(f"changed: {path}")
+    return errors
+
+
+def _merge_resume_args(
+    parser: argparse.ArgumentParser, saved_args: dict[str, Any] | None
+) -> argparse.Namespace:
+    defaults = parser.parse_args([])
+    merged = vars(defaults)
+    if saved_args:
+        merged.update(saved_args)
+    return argparse.Namespace(**merged)
+
+
+def _build_resume_state(
+    args: argparse.Namespace,
+    file_inputs: Sequence[Path],
+    metrics_path: Path | None,
+    *,
+    prior_state: dict[str, Any] | None = None,
+    resumed: bool = False,
+) -> dict[str, Any]:
+    now = _utc_timestamp()
+    state = dict(prior_state) if prior_state else {}
+    state["version"] = _RESUME_STATE_VERSION
+    state["status"] = "running"
+    state["started_at"] = state.get("started_at") or now
+    if resumed:
+        state["resumed_at"] = now
+        state["resume_count"] = int(state.get("resume_count", 0)) + 1
+    state["args"] = vars(args)
+    state["expanded_inputs"] = [str(path) for path in file_inputs]
+    state["input_fingerprints"] = _collect_input_fingerprints(file_inputs)
+    state["metrics_file"] = str(metrics_path) if metrics_path else None
+    state["db_path"] = args.db
+    state.setdefault("completed_chunks", [])
+    state.setdefault("current_chunk", None)
+    return state
 
 
 def collect_files(entries: Sequence[str], recursive: bool) -> List[Path]:
@@ -1876,6 +1998,47 @@ def main() -> None:
     settings = load_settings()
     parser = build_parser(settings.sqlite_dsn())
     args = parser.parse_args()
+    resume_state: dict[str, Any] | None = None
+    resume_completed: set[str] = set()
+    resume_completed_list: list[str] = []
+    resume_origin_metrics: str | None = None
+    resume_mode = False
+
+    if not args.inputs and not args.stdin:
+        if len(sys.argv) <= 1:
+            resume_state = _load_resume_state()
+            if not resume_state:
+                parser.error("Provide at least one input path or enable --stdin (no resume state found).")
+            if resume_state.get("status") == "success":
+                parser.error("No interrupted run to resume; the last run completed successfully.")
+            resume_origin_metrics = resume_state.get("metrics_file")
+            saved_args = resume_state.get("args")
+            if not isinstance(saved_args, dict):
+                parser.error("Resume state is missing saved CLI arguments.")
+            args = _merge_resume_args(parser, saved_args)
+            if getattr(args, "stdin", False):
+                parser.error("Cannot resume --stdin runs without explicit inputs.")
+            expanded_inputs = resume_state.get("expanded_inputs")
+            if not expanded_inputs:
+                parser.error("Resume state is missing the expanded input list.")
+            args.inputs = list(expanded_inputs)
+            resume_completed_list = list(resume_state.get("completed_chunks") or [])
+            resume_completed = set(resume_completed_list)
+            current_chunk = resume_state.get("current_chunk")
+            if current_chunk:
+                resume_completed.discard(current_chunk)
+                if current_chunk in resume_completed_list:
+                    resume_completed_list.remove(current_chunk)
+                resume_state["current_chunk"] = None
+            resume_state["completed_chunks"] = resume_completed_list
+            resume_mode = True
+        else:
+            parser.error("Provide at least one input path or enable --stdin")
+
+    if resume_mode and getattr(args, "reset", False):
+        log("[resume] Ignoring --reset from the interrupted run to preserve progress.")
+        args.reset = False
+
     log_verbose(3, f"[train:v3] Parsed CLI arguments: {vars(args)}")
 
     for field_name, cli_name in (
@@ -1887,9 +2050,6 @@ def main() -> None:
             parser.error(f"{cli_name} must be >= 0 (got {value})")
     if args.merge_max_tokens is not None and args.merge_max_tokens < 0:
         parser.error("--merge-max-tokens must be >= 0")
-
-    if not args.inputs and not args.stdin:
-        parser.error("Provide at least one input path or enable --stdin")
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -1972,10 +2132,11 @@ def main() -> None:
     if context_window_config:
         log(
             "[train] Context window config: "
-            "stride={stride:.2f}, train_windows={train}, infer_windows={infer}.".format(
+            "stride={stride:.2f}, train_windows={train}, infer_windows={infer}, depth_bonus={depth}.".format(
                 stride=context_window_config["stride_ratio"],
                 train=context_window_config["max_train_windows"],
                 infer=context_window_config["max_infer_windows"],
+                depth=context_window_config["depth_bonus"],
             )
         )
     if getattr(engine, "token_merge_max_tokens", 0) > 1:
@@ -2014,8 +2175,35 @@ def main() -> None:
         decoder_cfg_override = DecoderConfig(**decoder_overrides)
 
     file_inputs = collect_files(args.inputs, args.recursive)
+    file_inputs = [path.resolve() for path in file_inputs]
+    if resume_mode and resume_state:
+        resume_errors = _validate_resume_inputs(
+            file_inputs,
+            resume_state.get("input_fingerprints"),
+        )
+        if resume_errors:
+            formatted = "\n".join(f"- {message}" for message in resume_errors)
+            parser.error(f"Resume inputs have changed:\n{formatted}")
     log_verbose(3, f"[train:v3] Prepared {len(file_inputs)} file input(s) for ingestion.")
     prompt_tag_tokens = collect_prompt_tag_tokens(file_inputs, args.dataset_config)
+    resume_state = _build_resume_state(
+        args,
+        file_inputs,
+        metrics_path,
+        prior_state=resume_state,
+        resumed=resume_mode,
+    )
+    resume_completed_list = list(resume_state.get("completed_chunks") or [])
+    resume_completed = set(resume_completed_list)
+    _persist_resume_state(resume_state)
+    if resume_mode:
+        log(f"[resume] Resuming training with {len(resume_completed)} completed chunk(s) skipped.")
+        if run_metadata is not None:
+            run_metadata["resume_from"] = {
+                "started_at": resume_state.get("started_at"),
+                "metrics_file": resume_origin_metrics,
+                "completed_chunks": len(resume_completed),
+            }
     prep_workers = _resolve_worker_count(args.prep_workers)
     prep_prefetch = max(1, args.prep_prefetch)
     if prep_workers > 1:
@@ -2138,12 +2326,19 @@ def main() -> None:
     total_tokens = 0
     total_windows = 0
     processed_corpora = 0
+    skipped_corpora = 0
     success = False
     try:
         log(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
         for chunk in corpora_iter:
             label = chunk.label
             corpus = chunk.train_text
+            if resume_completed and label in resume_completed:
+                skipped_corpora += 1
+                continue
+            if resume_state:
+                resume_state["current_chunk"] = label
+                _persist_resume_state(resume_state)
             processed_corpora += 1
             log(
                 f"[train] Processing {label} ({len(corpus)} bytes, "
@@ -2156,6 +2351,13 @@ def main() -> None:
             )
             if token_count == 0:
                 log(f"[train] Skipping {label} (corpus too small for order={engine.store.order})")
+                if resume_state:
+                    if label not in resume_completed:
+                        resume_completed.add(label)
+                        resume_completed_list.append(label)
+                        resume_state["completed_chunks"] = resume_completed_list
+                    resume_state["current_chunk"] = None
+                    _persist_resume_state(resume_state)
                 continue
             window = max(0, token_count - engine.store.order + 1)
             total_tokens += token_count
@@ -2199,7 +2401,18 @@ def main() -> None:
                 monitor.refresh_dataset(chunk.eval_records)
             if chunk.prediction_records:
                 _train_prediction_tables(engine, chunk.prediction_records, args)
+            if resume_state:
+                if label not in resume_completed:
+                    resume_completed.add(label)
+                    resume_completed_list.append(label)
+                    resume_state["completed_chunks"] = resume_completed_list
+                resume_state["current_chunk"] = None
+                _persist_resume_state(resume_state)
         if processed_corpora == 0:
+            if skipped_corpora > 0:
+                log("[resume] No remaining corpora to ingest; training already up to date.")
+                success = True
+                return
             parser.error("No readable corpora found in the provided inputs")
 
         if total_windows == 0:
@@ -2227,6 +2440,16 @@ def main() -> None:
                 },
                 status="success" if success else "aborted",
             )
+        if resume_state:
+            resume_state["status"] = "success" if success else "aborted"
+            resume_state["current_chunk"] = None
+            resume_state["totals"] = {
+                "tokens": total_tokens,
+                "windows": total_windows,
+                "processed_corpora": processed_corpora,
+                "skipped_corpora": skipped_corpora,
+            }
+            _persist_resume_state(resume_state)
 
 
 if __name__ == "__main__":

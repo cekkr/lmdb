@@ -173,10 +173,11 @@ python src/train.py datasets/emotion_data.json \
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
   - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
-  - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
+  - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use presets `default`/`deep`/`shallow`, or `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
   - `--context-window-train-windows <n>`: Override the cap for adaptive windows-per-dimension sampling during training for context embeddings (0 = default).
   - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).
   - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = default).
+  - `--context-window-depth <n>`: Bias extra context-matrix fusion depth tiers (default engine preset). Use `0` to match legacy depth, negative values reduce depth.
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
 - **File reading helpers**
   - `--recursive`: When scanning folders, include subdirectories (default is to read only the top level).
@@ -203,6 +204,7 @@ python src/train.py datasets/emotion_data.json \
   - `--decoder-frequency-penalty <float>`: Scales penalties by how often the token/span repeats. Values between `0.0` and `0.2` usually smooth repetition without collapsing the sampler.
 
 Every run reports per-file token counts, derived n-gram windows, and the evaluation log path. Inputs shorter than the configured order are skipped automatically and clearly labeled in the logs.
+Running `python src/train.py` with no arguments resumes the last interrupted training run using `var/train_resume.json`, skipping any completed chunks. Pass explicit inputs to start a fresh ingest.
 
 #### Dependency parsing layer & strong token groups
 
@@ -400,10 +402,10 @@ matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
 
 - `ContextWindowEmbeddingManager.context_matrix_for_text()` now emits the per-window vectors plus
   dimension-level summary/fusion layers so prediction tables see a hidden-layer style context
-  matrix aligned with `--context-dimensions`. The Python side now auto-adds extra fused tiers when
-  dimension summaries diverge, deepening the matrix without fixed depth knobs. cheetah-db further
-  deepens these matrices with derived mean/variance/contrast/interaction layers that scale with
-  context diversity during
+  matrix aligned with `--context-dimensions`. The Python side auto-adds extra fused tiers when
+  dimension summaries diverge; `--context-window-depth` biases how deep those hidden layers run.
+  cheetah-db further deepens these matrices with derived mean/variance/contrast/interaction layers
+  that scale with context diversity during
   training/querying (disable with `CHEETAH_PREDICT_DEEPEN=0`). `train.py` uses this helper whenever
   you pass one or more
   `--cheetah-context-probe "text snippet"` arguments (repeatable). Each snippet is converted into

@@ -41,7 +41,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help=(
             "Override the stored context-dimension penalties with ranges like '6,12,24' or "
             "length specs such as '4,8,4'. These drive both penalty spans and context-window embeddings. "
-            "Use 'off' to disable; omit to reuse metadata from the database."
+            "Use presets 'default', 'deep', or 'shallow', set 'off' to disable, or omit to reuse metadata."
         ),
     )
     parser.add_argument(

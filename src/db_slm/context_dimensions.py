@@ -29,10 +29,33 @@ class ContextDimension:
         return 1.0 / span if span > 0 else 1.0
 
 
-DEFAULT_CONTEXT_DIMENSIONS: tuple[ContextDimension, ...] = (
+LEGACY_CONTEXT_DIMENSIONS: tuple[ContextDimension, ...] = (
     ContextDimension(1, 2),
     ContextDimension(3, 5),
 )
+
+DEFAULT_CONTEXT_DIMENSIONS: tuple[ContextDimension, ...] = (
+    ContextDimension(1, 2),
+    ContextDimension(3, 5),
+    ContextDimension(6, 10),
+    ContextDimension(11, 18),
+)
+
+DEEP_CONTEXT_DIMENSIONS: tuple[ContextDimension, ...] = (
+    ContextDimension(1, 2),
+    ContextDimension(3, 5),
+    ContextDimension(6, 10),
+    ContextDimension(11, 18),
+    ContextDimension(19, 31),
+)
+
+_CONTEXT_DIMENSION_PRESETS: dict[str, tuple[ContextDimension, ...]] = {
+    "default": DEFAULT_CONTEXT_DIMENSIONS,
+    "deep": DEEP_CONTEXT_DIMENSIONS,
+    "deeper": DEEP_CONTEXT_DIMENSIONS,
+    "legacy": LEGACY_CONTEXT_DIMENSIONS,
+    "shallow": LEGACY_CONTEXT_DIMENSIONS,
+}
 
 
 class ContextDimensionTracker:
@@ -106,7 +129,7 @@ def parse_context_dimensions_arg(
     *,
     default: Sequence[ContextDimension] | None = DEFAULT_CONTEXT_DIMENSIONS,
 ) -> list[ContextDimension] | None:
-    """Parse CLI-style dimension strings like '1-2,3-5' or length specs like '4,8,4'."""
+    """Parse CLI-style dimension strings like '1-2,3-5' or presets like 'deep'."""
     if raw_value is None:
         return list(default) if default is not None else None
     text = raw_value.strip()
@@ -115,6 +138,8 @@ def parse_context_dimensions_arg(
     lowered = text.lower()
     if lowered in {"off", "none", "disable"}:
         return []
+    if lowered in _CONTEXT_DIMENSION_PRESETS:
+        return list(_CONTEXT_DIMENSION_PRESETS[lowered])
     parts = [part.strip() for part in text.split(",") if part.strip()]
     if not parts:
         return []

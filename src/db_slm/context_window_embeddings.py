@@ -324,6 +324,7 @@ class ContextWindowEmbeddingManager:
         stride_ratio: float = 0.5,
         max_train_windows: int = 24,
         max_infer_windows: int = 6,
+        depth_bonus: int = 1,
     ) -> None:
         self.dimensions = list(dimensions)
         self.embedder = embedder or ExternalEmbedder("all-MiniLM-L6-v2")
@@ -332,6 +333,7 @@ class ContextWindowEmbeddingManager:
         self.extractor = ContextWindowExtractor(self.dimensions, stride_ratio=stride_ratio)
         self.max_train_windows = max(1, max_train_windows)
         self.max_infer_windows = max(1, max_infer_windows)
+        self.depth_bonus = int(depth_bonus)
         self._prototypes: list[ContextDimensionPrototype] = []
         self._rng = random.Random(0xCEEDA7)
         self._tag_enumerator: dict[str, int] = {}
@@ -499,6 +501,7 @@ class ContextWindowEmbeddingManager:
         raw_depth = math.log2(len(dimension_vectors) + 1.0)
         depth_scale = self._prototype_depth_scale()
         depth = int(round(diversity * raw_depth * depth_scale))
+        depth += self.depth_bonus
         return max(0, min(depth, int(raw_depth)))
 
     def _mean_similarity_to_fused(
@@ -625,6 +628,7 @@ class ContextWindowEmbeddingManager:
             "model": self.embedder.model_name,
             "stride_ratio": self.extractor.stride_ratio,
             "max_train_windows": self.max_train_windows,
+            "depth_bonus": self.depth_bonus,
             "dimensions": [proto.as_dict() for proto in self._prototypes if proto.count > 0],
         }
         serialized = json.dumps(payload, separators=(",", ":"))
@@ -732,6 +736,11 @@ class ContextWindowEmbeddingManager:
         except json.JSONDecodeError:
             log("[context-dim] Warning: invalid context embedding metadata; ignoring.")
             return
+        if "depth_bonus" in payload:
+            try:
+                self.depth_bonus = int(payload["depth_bonus"])
+            except (TypeError, ValueError):
+                pass
         raw_dimensions = payload.get("dimensions") or []
         if not isinstance(raw_dimensions, list):
             return
