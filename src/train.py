@@ -773,7 +773,9 @@ def _probe_context_predictions(engine: DBSLMEngine, args: argparse.Namespace) ->
     if not engine.context_windows.enabled():
         log("[train] cheetah context probes skipped: context windows disabled.")
         return
-    matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+    matrix_builder = getattr(engine.context_windows, "context_matrix_payload_for_text", None)
+    if not callable(matrix_builder):
+        matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
     if not callable(matrix_builder):
         log("[train] cheetah context probes unavailable: context window manager missing context_matrix_for_text().")
         return
@@ -884,6 +886,13 @@ def _prediction_context_text(record: EvaluationRecord) -> str:
     return "\n".join(segment for segment in segments if segment).strip()
 
 
+def _context_matrix_payload(engine: DBSLMEngine, text: str) -> Sequence[Sequence[float]] | dict[str, object] | None:
+    builder = getattr(engine.context_windows, "context_matrix_payload_for_text", None)
+    if callable(builder):
+        return builder(text)
+    return engine.context_windows.context_matrix_for_text(text)
+
+
 def _encode_prediction_token(token_id: int) -> bytes:
     return token_id.to_bytes(4, "big", signed=False)
 
@@ -939,7 +948,7 @@ def _train_prediction_tables(
         context_text = _prediction_context_text(record)
         if not context_text:
             continue
-        matrix = engine.context_windows.context_matrix_for_text(context_text)
+        matrix = _context_matrix_payload(engine, context_text)
         if not matrix:
             continue
         token_ids = engine.tokenizer.encode(record.response or "", add_special_tokens=False)
@@ -1015,9 +1024,11 @@ def _adversarial_context_text(sample: EvaluationSampleResult) -> str:
     return "\n".join(part for part in parts if part).strip()
 
 
-def _context_energy(matrix: Sequence[Sequence[float]] | None) -> float:
+def _context_energy(matrix: Sequence[Sequence[float]] | dict[str, object] | None) -> float:
     if not matrix:
         return 0.0
+    if isinstance(matrix, dict):
+        matrix = matrix.get("rows") or matrix.get("matrix") or []
     energies: list[float] = []
     for row in matrix:
         if not row:
@@ -1035,7 +1046,9 @@ class AdversarialTrainer:
         self.enabled = not getattr(args, "disable_cheetah_adversarial_train", False)
         self._predict_train = getattr(engine.hot_path, "predict_train", None)
         self._predict_set = getattr(engine.hot_path, "predict_set", None)
-        self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+        self._matrix_builder = getattr(engine.context_windows, "context_matrix_payload_for_text", None)
+        if not callable(self._matrix_builder):
+            self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
         self.table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
         key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
         self.key_bytes = key_label.encode("utf-8")

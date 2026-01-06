@@ -601,7 +601,11 @@ class DBSLMEngine:
         if self.context_windows.enabled():
             window_reference = bias_context or history_text
             window_weights = self.context_windows.weights_for_text(window_reference)
-            prediction_matrix = self.context_windows.context_matrix_for_text(window_reference)
+            payload_builder = getattr(self.context_windows, "context_matrix_payload_for_text", None)
+            if callable(payload_builder):
+                prediction_matrix = payload_builder(window_reference)
+            else:
+                prediction_matrix = self.context_windows.context_matrix_for_text(window_reference)
 
         attempt_count = max(1, self._prompt_tag_retry_attempts)
         final_ids: List[int] = []

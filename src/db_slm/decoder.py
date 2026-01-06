@@ -60,7 +60,7 @@ class Decoder:
         dimension_weights: Sequence[float] | None = None,
         banned_token_ids: Sequence[int] | None = None,
         commit_cache: bool = True,
-        prediction_matrix: Sequence[Sequence[float]] | None = None,
+        prediction_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
@@ -215,7 +215,7 @@ class Decoder:
 
     def _prediction_distribution(
         self,
-        prediction_matrix: Sequence[Sequence[float]] | None,
+        prediction_matrix: Sequence[Sequence[float]] | dict[str, object] | None,
     ) -> Optional[Dict[int, float]]:
         if (
             prediction_matrix is None

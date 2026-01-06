@@ -1493,6 +1493,41 @@ func (p *PredictionTable) Benchmark(samples, vectorLen int) map[string]time.Dura
 	return BenchmarkMerger(samples, vectorLen)
 }
 
+type contextMatrixPayload struct {
+	Rows    ContextMatrix `json:"rows"`
+	Matrix  ContextMatrix `json:"matrix"`
+	Weights []float64     `json:"weights"`
+}
+
+func applyContextMatrixWeights(rows ContextMatrix, weights []float64) ContextMatrix {
+	if len(rows) == 0 || len(weights) == 0 {
+		return rows
+	}
+	limit := len(rows)
+	if len(weights) < limit {
+		limit = len(weights)
+	}
+	for idx := 0; idx < limit; idx++ {
+		weight := weights[idx]
+		if math.IsNaN(weight) || math.IsInf(weight, 0) {
+			continue
+		}
+		if weight < 0 {
+			weight = 0
+		} else if weight > 2 {
+			weight = 2
+		}
+		if weight == 1 {
+			continue
+		}
+		row := rows[idx]
+		for i := range row {
+			row[i] *= weight
+		}
+	}
+	return rows
+}
+
 func parseContextMatrixArg(raw string) (ContextMatrix, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -1501,11 +1536,37 @@ func parseContextMatrixArg(raw string) (ContextMatrix, error) {
 	if err != nil {
 		return nil, err
 	}
-	var matrix ContextMatrix
-	if err := json.Unmarshal(data, &matrix); err != nil {
-		return nil, err
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, nil
 	}
-	return matrix, nil
+	switch trimmed[0] {
+	case '[':
+		var matrix ContextMatrix
+		if err := json.Unmarshal(trimmed, &matrix); err != nil {
+			return nil, err
+		}
+		return matrix, nil
+	case '{':
+		var payload contextMatrixPayload
+		if err := json.Unmarshal(trimmed, &payload); err != nil {
+			return nil, err
+		}
+		rows := payload.Rows
+		if len(rows) == 0 {
+			rows = payload.Matrix
+		}
+		if len(rows) == 0 {
+			return nil, nil
+		}
+		return applyContextMatrixWeights(rows, payload.Weights), nil
+	default:
+		var matrix ContextMatrix
+		if err := json.Unmarshal(trimmed, &matrix); err != nil {
+			return nil, err
+		}
+		return matrix, nil
+	}
 }
 
 func parseWindowMatrixArg(raw string) ([][]float64, error) {

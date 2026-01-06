@@ -473,7 +473,7 @@ class CheetahClient:
         key: bytes,
         target: bytes,
         *,
-        context_matrix: Sequence[Sequence[float]] | None = None,
+        context_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
         learning_rate: float | None = None,
         table: str | None = None,
         negatives: Sequence[bytes | str] | None = None,
@@ -502,7 +502,7 @@ class CheetahClient:
         *,
         key: bytes | str | None = None,
         keys: Sequence[bytes | str] | None = None,
-        context_matrix: Sequence[Sequence[float]] | None = None,
+        context_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
         windows: Sequence[Sequence[float]] | None = None,
         key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
         merge_mode: str | None = None,
@@ -1012,9 +1012,33 @@ class CheetahClient:
         return f"x{normalized.hex()}"
 
     @staticmethod
-    def _encode_matrix_payload(matrix: Sequence[Sequence[float]] | None) -> str | None:
+    def _encode_matrix_payload(matrix: Sequence[Sequence[float]] | dict[str, object] | None) -> str | None:
         if not matrix:
             return None
+        if isinstance(matrix, dict):
+            rows = matrix.get("rows") or matrix.get("matrix") or []
+            weights = matrix.get("weights") or []
+            serializable_rows: list[list[float]] = []
+            for row in rows:
+                if not row:
+                    continue
+                try:
+                    serializable_rows.append([float(component) for component in row])
+                except (TypeError, ValueError):
+                    continue
+            if not serializable_rows:
+                return None
+            payload: dict[str, object] = {"rows": serializable_rows}
+            serializable_weights: list[float] = []
+            for weight in weights:
+                try:
+                    serializable_weights.append(float(weight))
+                except (TypeError, ValueError):
+                    continue
+            if serializable_weights:
+                payload["weights"] = serializable_weights
+            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            return base64.b64encode(encoded).decode("ascii")
         serializable: list[list[float]] = []
         for row in matrix:
             if not row:
@@ -1910,7 +1934,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         *,
         key: bytes | str | None = None,
         keys: Sequence[bytes | str] | None = None,
-        context_matrix: Sequence[Sequence[float]] | None = None,
+        context_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
         windows: Sequence[Sequence[float]] | None = None,
         key_windows: Sequence[tuple[bytes | str, Sequence[Sequence[float]]]] | None = None,
         merge_mode: str | None = None,
@@ -1970,7 +1994,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         *,
         key: bytes | str,
         target: bytes | str,
-        context_matrix: Sequence[Sequence[float]] | None,
+        context_matrix: Sequence[Sequence[float]] | dict[str, object] | None,
         learning_rate: float = 0.01,
         table: str | None = None,
         negatives: Sequence[bytes | str] | None = None,

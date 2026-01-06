@@ -129,7 +129,9 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   extra fused tiers are added automatically when dimension summaries diverge; `--context-window-depth`
   biases how deep those tiers run (default now deeper). Training window sampling now adapts to token
   volume (with `--context-window-train-windows` acting as the cap), and prototype counts gate how deep
-  those extra tiers run so early training stays shallow while richer corpora unlock more depth.
+  those extra tiers run so early training stays shallow while richer corpora unlock more depth. Token
+  prediction calls can now send weighted context matrices (`{"rows":[...],"weights":[...]}`) so cheetah
+  scales each row before applying prediction-table updates or queries.
   Presets `default`, `deep`, and `shallow` are now accepted for `--context-dimensions` (default spans
   1-2,3-5,6-10,11-18; deep adds 19-31). cheetah-db now deepens every context matrix with derived
   mean/variance/contrast/interaction layers that scale with context diversity before prediction

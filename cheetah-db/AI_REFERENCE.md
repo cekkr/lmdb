@@ -208,8 +208,9 @@ matrix.
   enabling online bias corrections during ingest/serving.
 
 Context matrices + window specs are passed as base64-encoded JSON arrays so CLI whitespace stays
-stable. The probability merger truncates vectors to the shared byte-span before aggregating and
-automatically normalizes outputs.
+stable. You can also send a JSON object payload (`{"rows":[...],"weights":[...]}`) to scale each row
+before the prediction table applies context weights. The probability merger truncates vectors to the
+shared byte-span before aggregating and automatically normalizes outputs.
 
 #### Python integration
 

@@ -232,10 +232,11 @@ SUCCESS,key=1_deleted
     `AI_REFERENCE.md` (encode the JSON blob, then pass it as base64).
   - `PREDICT_QUERY key=<prefix> [keys=a,b,c] [ctx=<base64 json>] [windows=<base64 json>]
     [key_windows=<base64 json>] [merge=avg|sum|max] [table=name]` evaluates one or many prefixes and
-    merges their probability windows. `keys=` lets you query several prefixes at once, while
-    `key_windows=` accepts a base64 array of `{ "key": "<hex>", "windows": [[...], ...] }` objects for
-    per-prefix window overrides. Responses include the backend name (`cpu` or the simulated
-    `webgpu-simulated` merger).
+    merges their probability windows. `ctx` may be a base64-encoded JSON array (`[[...], ...]`) or an
+    object like `{"rows":[[...]],"weights":[...]}` where weights scale each row. `keys=` lets you
+    query several prefixes at once, while `key_windows=` accepts a base64 array of
+    `{ "key": "<hex>", "windows": [[...], ...] }` objects for per-prefix window overrides. Responses
+    include the backend name (`cpu` or the simulated `webgpu-simulated` merger).
   - `PREDICT_TRAIN key=<prefix> target=<bytes> [ctx=<base64 json>] [lr=0.01] [table=name]
     [negatives=<hex,...>]` adjusts stored weights via the forward/backward loop (optionally
     down-weighting bad predictions listed in `negatives=`). The table now persists normalized window

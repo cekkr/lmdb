@@ -379,8 +379,42 @@ class ContextWindowEmbeddingManager:
         if not snippets:
             return [1.0 for _ in self.dimensions]
         vectors = self.embedder.embed([snippet.text for snippet in snippets])
-        similarity_by_dim: dict[int, list[tuple[float, float]]] = {}
+        samples = []
         for snippet, vector in zip(snippets, vectors):
+            samples.append((snippet, self._normalize_embedding_vector(vector)))
+        return self._weights_for_samples(samples)
+
+    def context_matrix_payload_for_text(self, text: str) -> dict[str, object] | None:
+        matrix, weights = self._context_matrix_with_weights(text, include_weights=True)
+        if not matrix:
+            return None
+        payload: dict[str, object] = {"rows": matrix}
+        if weights:
+            payload["weights"] = weights
+        return payload
+
+    def context_matrix_for_text(self, text: str) -> list[list[float]]:
+        """Return context-window vectors plus dimension-level hidden-layer projections."""
+        matrix, _weights = self._context_matrix_with_weights(text, include_weights=False)
+        return matrix
+
+    @staticmethod
+    def _normalize_embedding_vector(vector: Sequence[float] | None) -> list[float]:
+        if not vector:
+            return []
+        try:
+            return [float(value) for value in vector]
+        except (TypeError, ValueError):
+            return []
+
+    def _weights_for_samples(
+        self,
+        samples: Sequence[tuple[ContextWindowSnippet, list[float]]],
+    ) -> list[float]:
+        if not samples:
+            return [1.0 for _ in self.dimensions]
+        similarity_by_dim: dict[int, list[tuple[float, float]]] = {}
+        for snippet, vector in samples:
             proto = self._prototype_for(snippet.dimension_index)
             if proto is None or not proto.vector or not vector:
                 continue
@@ -404,10 +438,14 @@ class ContextWindowEmbeddingManager:
             weights.append(max(0.25, min(2.0, combined)))
         return weights
 
-    def context_matrix_for_text(self, text: str) -> list[list[float]]:
-        """Return context-window vectors plus dimension-level hidden-layer projections."""
+    def _context_matrix_with_weights(
+        self,
+        text: str,
+        *,
+        include_weights: bool,
+    ) -> tuple[list[list[float]], list[float] | None]:
         if not self.enabled() or not text.strip():
-            return []
+            return [], None
         seed = self._seed_for_text(text)
         infer_rng = random.Random(seed)
         snippets = self.extractor.sample(
@@ -416,7 +454,7 @@ class ContextWindowEmbeddingManager:
             rng=infer_rng,
         )
         if not snippets:
-            return []
+            return [], None
         vectors = self.embedder.embed([snippet.text for snippet in snippets])
         matrix: list[list[float]] = []
         samples: list[tuple[ContextWindowSnippet, list[float]]] = []
@@ -427,18 +465,22 @@ class ContextWindowEmbeddingManager:
             matrix.append(row)
             samples.append((snippet, row))
         if not matrix:
-            return []
-        matrix.extend(self._derive_prediction_layers(samples))
-        return matrix
-
-    @staticmethod
-    def _normalize_embedding_vector(vector: Sequence[float] | None) -> list[float]:
-        if not vector:
-            return []
-        try:
-            return [float(value) for value in vector]
-        except (TypeError, ValueError):
-            return []
+            return [], None
+        weights: list[float] | None = None
+        if include_weights:
+            dimension_weights = self._weights_for_samples(samples)
+            weights = []
+            for snippet, _row in samples:
+                if 0 <= snippet.dimension_index < len(dimension_weights):
+                    weights.append(float(dimension_weights[snippet.dimension_index]))
+                else:
+                    weights.append(1.0)
+        derived = self._derive_prediction_layers(samples)
+        if derived:
+            matrix.extend(derived)
+            if weights is not None:
+                weights.extend([1.0] * len(derived))
+        return matrix, weights
 
     def _derive_prediction_layers(
         self,

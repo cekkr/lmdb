@@ -103,7 +103,9 @@ class ContextProbabilityProbe:
         self._key = (key or "").strip() or None
         self._max_entries = max(1, int(max_entries))
         self._log_prefix = log_prefix.strip() or "[prediction]"
-        self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
+        self._matrix_builder = getattr(engine.context_windows, "context_matrix_payload_for_text", None)
+        if not callable(self._matrix_builder):
+            self._matrix_builder = getattr(engine.context_windows, "context_matrix_for_text", None)
         self._predict_query = getattr(engine.hot_path, "predict_query", None)
         self._enabled = (
             engine.context_windows.enabled()
