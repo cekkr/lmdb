@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import random
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
@@ -22,6 +24,7 @@ from .level1 import (
     MKNSmoother,
     NGramStore,
     TokenCandidate,
+    MergeStats,
     Tokenizer,
     Vocabulary,
 )
@@ -40,6 +43,111 @@ class ContextRelativismResult:
     probability: float
     ranked: Tuple[TokenCandidate, ...]
 
+
+@dataclass
+class TokenMergeReport:
+    merged_tokens: int
+    baseline_tokens: int
+    applied_total: int
+    candidate_total: int
+    unique_applied: int
+    unique_candidates: int
+    passes: int
+    retired_added: int
+    retired_total: int
+    top_applied: Tuple[Tuple[str, int, float], ...] = tuple()
+
+
+class TokenMergeTracker:
+    def __init__(
+        self,
+        *,
+        retire_threshold: float,
+        retire_min_count: int,
+        retire_cap: int,
+        retired_tokens: Sequence[str] | None = None,
+    ) -> None:
+        self.retire_threshold = max(0.0, float(retire_threshold))
+        self.retire_min_count = max(1, int(retire_min_count))
+        self.retire_cap = max(1, int(retire_cap))
+        self.retired_tokens = set(retired_tokens or [])
+        self.applied_counts: dict[str, int] = defaultdict(int)
+        self.candidate_counts: dict[str, int] = defaultdict(int)
+        self.base_lengths: dict[str, int] = {}
+
+    def update(
+        self,
+        stats: MergeStats,
+        *,
+        merged_tokens: int,
+        baseline_tokens: int,
+        top_limit: int = 5,
+    ) -> TokenMergeReport:
+        applied_total = sum(stats.applied_counts.values())
+        candidate_total = sum(stats.candidate_counts.values())
+        for token, count in stats.applied_counts.items():
+            self.applied_counts[token] += count
+        for token, count in stats.candidate_counts.items():
+            self.candidate_counts[token] += count
+        for token, length in stats.base_lengths.items():
+            if token not in self.base_lengths:
+                self.base_lengths[token] = length
+        retired_added = self._retire_low_significance()
+        top_applied = self._top_applied(stats, limit=top_limit)
+        return TokenMergeReport(
+            merged_tokens=merged_tokens,
+            baseline_tokens=baseline_tokens,
+            applied_total=applied_total,
+            candidate_total=candidate_total,
+            unique_applied=len(stats.applied_counts),
+            unique_candidates=len(stats.candidate_counts),
+            passes=stats.passes,
+            retired_added=retired_added,
+            retired_total=len(self.retired_tokens),
+            top_applied=top_applied,
+        )
+
+    def _retire_low_significance(self) -> int:
+        if self.retire_threshold <= 0.0:
+            return 0
+        remaining = self.retire_cap - len(self.retired_tokens)
+        if remaining <= 0:
+            return 0
+        candidates: list[tuple[float, int, str]] = []
+        for token, candidate_count in self.candidate_counts.items():
+            if token in self.retired_tokens:
+                continue
+            if candidate_count < self.retire_min_count:
+                continue
+            applied = self.applied_counts.get(token, 0)
+            ratio = applied / float(candidate_count) if candidate_count else 0.0
+            if ratio < self.retire_threshold:
+                candidates.append((ratio, candidate_count, token))
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda item: (item[0], -item[1]))
+        added = 0
+        for ratio, _count, token in candidates:
+            if added >= remaining:
+                break
+            self.retired_tokens.add(token)
+            added += 1
+        return added
+
+    @staticmethod
+    def _top_applied(stats: MergeStats, *, limit: int) -> Tuple[Tuple[str, int, float], ...]:
+        if limit <= 0 or not stats.applied_counts:
+            return tuple()
+        entries: list[tuple[int, float, str]] = []
+        for token, count in stats.applied_counts.items():
+            candidate = stats.candidate_counts.get(token, 0)
+            ratio = count / float(candidate) if candidate else 0.0
+            entries.append((count, ratio, token))
+        entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        top = []
+        for count, ratio, token in entries[:limit]:
+            top.append((token, count, round(ratio, 4)))
+        return tuple(top)
 
 _DEFAULT_PROMPT_TAG_TOKENS: Tuple[str, ...] = (
     "|INSTRUCTION|:",
@@ -66,12 +174,22 @@ class DBSLMEngine:
         prediction_key: str | None = None,
         prediction_weight: float = 0.0,
         token_merge_max_tokens: int | None = None,
+        token_merge_recursion_depth: int | None = None,
+        token_merge_baseline_train: bool | None = None,
+        token_merge_baseline_eval: bool | None = None,
+        token_merge_significance_threshold: float | None = None,
+        token_merge_significance_min_count: int = 2,
+        token_merge_significance_cap: int = 128,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
         self.hot_path = build_cheetah_adapter(self.settings)
         self.context_dimensions = self._init_context_dimensions(context_dimensions)
-        merge_max = self._init_token_merging(token_merge_max_tokens, ngram_order)
+        merge_max, merge_depth, retired_tokens = self._init_token_merging(
+            token_merge_max_tokens,
+            ngram_order,
+            recursion_depth=token_merge_recursion_depth,
+        )
         self.vocab = Vocabulary(self.db)
         self.tokenizer = Tokenizer(
             self.vocab,
@@ -79,8 +197,39 @@ class DBSLMEngine:
             tokenizer_path=self.settings.tokenizer_json_path,
             lowercase_tokens=self.settings.tokenizer_lowercase,
         )
-        self.tokenizer.configure_merging(merge_max)
+        self.tokenizer.configure_merging(
+            merge_max,
+            recursion_depth=merge_depth,
+            retired_tokens=retired_tokens,
+        )
         self.token_merge_max_tokens = merge_max
+        self.token_merge_recursion_depth = merge_depth
+        merge_enabled = merge_max > 1
+        baseline_train = (
+            token_merge_baseline_train if token_merge_baseline_train is not None else merge_enabled
+        )
+        baseline_eval = (
+            token_merge_baseline_eval if token_merge_baseline_eval is not None else merge_enabled
+        )
+        if not merge_enabled:
+            baseline_train = False
+            baseline_eval = False
+        self.token_merge_baseline_train = bool(baseline_train)
+        self.token_merge_baseline_eval = bool(baseline_eval)
+        self.token_merge_significance_threshold = max(
+            0.0, float(token_merge_significance_threshold or 0.0)
+        )
+        self.token_merge_significance_min_count = max(1, int(token_merge_significance_min_count))
+        self.token_merge_significance_cap = max(1, int(token_merge_significance_cap))
+        self._merge_tracker: TokenMergeTracker | None = None
+        if merge_enabled:
+            self._merge_tracker = TokenMergeTracker(
+                retire_threshold=self.token_merge_significance_threshold,
+                retire_min_count=self.token_merge_significance_min_count,
+                retire_cap=self.token_merge_significance_cap,
+                retired_tokens=retired_tokens,
+            )
+        self._last_merge_report: TokenMergeReport | None = None
         self.quantizer = LogProbQuantizer(self.db)
         self.store = NGramStore(
             self.db,
@@ -248,7 +397,9 @@ class DBSLMEngine:
         self,
         requested_max: int | None,
         ngram_order: int,
-    ) -> int:
+        *,
+        recursion_depth: int | None = None,
+    ) -> tuple[int, int, set[str]]:
         reader = getattr(self.hot_path, "read_metadata", None)
 
         def _coerce(value, fallback: int) -> int:
@@ -257,25 +408,91 @@ class DBSLMEngine:
             except Exception:
                 return fallback
 
+        def _read_metadata(key: str) -> str | None:
+            if reader:
+                stored = reader(key)
+                if stored is not None:
+                    return stored
+            return self.db.get_metadata(key)
+
         stored_max: int | None = None
-        if reader:
-            stored_max_raw = reader("token_merge_max_tokens")
-            if stored_max_raw is not None:
-                stored_max = _coerce(stored_max_raw, 0)
+        stored_max_raw = _read_metadata("token_merge_max_tokens")
+        if stored_max_raw is not None:
+            stored_max = _coerce(stored_max_raw, 0)
         if stored_max is None:
-            stored_max = _coerce(self.db.get_metadata("token_merge_max_tokens"), 0)
+            stored_max = 0
+
+        stored_depth_raw = _read_metadata("token_merge_recursion_depth")
+        stored_depth = _coerce(stored_depth_raw, 1)
+
+        stored_retired_raw = _read_metadata("token_merge_retired_tokens")
+        retired_tokens: set[str] = set()
+        if stored_retired_raw:
+            try:
+                parsed = json.loads(stored_retired_raw)
+                if isinstance(parsed, list):
+                    retired_tokens = {str(token) for token in parsed if str(token).strip()}
+            except Exception:
+                retired_tokens = set()
 
         resolved_max = _coerce(requested_max, stored_max or 0)
         if resolved_max < 0:
             resolved_max = 0
+        resolved_depth = _coerce(recursion_depth, stored_depth or 1)
+        if resolved_depth < 1:
+            resolved_depth = 1
         if ngram_order < 5:
             resolved_max = 0
+            resolved_depth = 1
 
         self.db.set_metadata("token_merge_max_tokens", str(resolved_max))
+        self.db.set_metadata("token_merge_recursion_depth", str(resolved_depth))
         writer = getattr(self.hot_path, "write_metadata", None)
         if writer:
             writer("token_merge_max_tokens", str(resolved_max))
-        return resolved_max
+            writer("token_merge_recursion_depth", str(resolved_depth))
+        if retired_tokens:
+            payload = json.dumps(sorted(retired_tokens), ensure_ascii=True)
+            self.db.set_metadata("token_merge_retired_tokens", payload)
+            if writer:
+                writer("token_merge_retired_tokens", payload)
+        return resolved_max, resolved_depth, retired_tokens
+
+    def _persist_merge_retired_tokens(self) -> None:
+        tracker = self._merge_tracker
+        if tracker is None or not tracker.retired_tokens:
+            return
+        payload = json.dumps(sorted(tracker.retired_tokens), ensure_ascii=True)
+        self.db.set_metadata("token_merge_retired_tokens", payload)
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if writer:
+            writer("token_merge_retired_tokens", payload)
+
+    def _update_merge_tracker(
+        self,
+        stats: MergeStats | None,
+        *,
+        merged_tokens: int,
+        baseline_tokens: int,
+    ) -> None:
+        tracker = self._merge_tracker
+        if tracker is None or stats is None:
+            self._last_merge_report = None
+            return
+        report = tracker.update(
+            stats,
+            merged_tokens=merged_tokens,
+            baseline_tokens=baseline_tokens,
+        )
+        self._last_merge_report = report
+        if report.retired_added:
+            self.tokenizer.set_merge_retired_tokens(tracker.retired_tokens)
+            self._persist_merge_retired_tokens()
+
+    def consume_merge_report(self) -> TokenMergeReport | None:
+        report = self._last_merge_report
+        self._last_merge_report = None
+        return report
 
     # ------------------------------------------------------------------ #
     # Training utilities
@@ -293,16 +510,45 @@ class DBSLMEngine:
         prepared = self.segment_embedder.prepare_for_training(corpus)
         if progress_callback:
             progress_callback("prepare", 1, 1)
-        token_ids = self.tokenizer.encode(prepared or corpus)
+        collect_stats = self._merge_tracker is not None and self.token_merge_max_tokens > 1
+        if collect_stats:
+            token_ids, merge_stats = self.tokenizer.encode_with_stats(
+                prepared or corpus,
+                add_special_tokens=True,
+                merge_mode="auto",
+            )
+        else:
+            token_ids = self.tokenizer.encode(
+                prepared or corpus,
+                add_special_tokens=True,
+                merge_mode="auto",
+            )
+            merge_stats = None
         total_tokens = len(token_ids)
         if total_tokens < 2:
             return 0
+        baseline_tokens = 0
+        if self.token_merge_baseline_train and self.token_merge_max_tokens > 1:
+            baseline_ids = self.tokenizer.encode(
+                prepared or corpus,
+                add_special_tokens=True,
+                merge_mode="off",
+            )
+            baseline_tokens = len(baseline_ids)
+            if baseline_tokens >= 2:
+                self.store.ingest(baseline_ids, progress_callback=None)
         if progress_callback:
             progress_callback("tokenize", total_tokens, total_tokens)
         self.store.ingest(token_ids, progress_callback=progress_callback)
         self.smoother.rebuild_all(progress_callback=progress_callback)
         if self.context_windows.enabled():
             self.context_windows.flush()
+        if collect_stats:
+            self._update_merge_tracker(
+                merge_stats,
+                merged_tokens=total_tokens,
+                baseline_tokens=baseline_tokens,
+            )
         return total_tokens
 
     # ------------------------------------------------------------------ #

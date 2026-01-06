@@ -172,7 +172,13 @@ python src/train.py datasets/emotion_data.json \
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
   - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
-  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
+  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries, then optionally recurse across the merged stream. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
+  - `--merge-recursion-depth`: Recursive merge passes to attempt per tokenization step (defaults to 2 when merging is enabled).
+  - `--merge-train-baseline` / `--no-merge-train-baseline`: Train the unmerged token sequence alongside merged tokens (defaults to enabled when merging is active).
+  - `--merge-eval-baseline` / `--no-merge-eval-baseline`: Log perplexity metrics with merging disabled for comparison (defaults to enabled when merging is active).
+  - `--merge-significance-threshold`: Retire merge tokens whose applied/candidate ratio falls below the threshold (0 disables).
+  - `--merge-significance-min-count`: Minimum candidate count before evaluating merge significance (default 2).
+  - `--merge-significance-cap`: Cap how many retired merge tokens are persisted in metadata (default 128).
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use presets `default`/`deep`/`shallow`, or `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
   - `--context-window-train-windows <n>`: Override the cap for adaptive windows-per-dimension sampling during training for context embeddings (0 = default).
   - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).

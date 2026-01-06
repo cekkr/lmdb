@@ -84,6 +84,57 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--merge-recursion-depth",
+        type=int,
+        default=None,
+        help=(
+            "Number of recursive merge passes to attempt per tokenization step. "
+            "Defaults to 2 when merging is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--merge-train-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Train the unmerged token sequence alongside merged tokens. "
+            "Defaults to enabled when merging is active."
+        ),
+    )
+    parser.add_argument(
+        "--merge-eval-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Compute evaluation perplexity with merging disabled for comparison. "
+            "Defaults to enabled when merging is active."
+        ),
+    )
+    parser.add_argument(
+        "--merge-significance-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Mark merge tokens as retired when applied/candidate ratio falls below this threshold "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--merge-significance-min-count",
+        type=int,
+        default=2,
+        help=(
+            "Minimum candidate occurrences before evaluating merge significance "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--merge-significance-cap",
+        type=int,
+        default=128,
+        help="Maximum retired merge tokens stored in metadata (default: %(default)s).",
+    )
+    parser.add_argument(
         "--context-dimensions",
         help=(
             "Comma-separated token span ranges (e.g. '1-2,3-5') or progressive lengths like "
@@ -2050,6 +2101,14 @@ def main() -> None:
             parser.error(f"{cli_name} must be >= 0 (got {value})")
     if args.merge_max_tokens is not None and args.merge_max_tokens < 0:
         parser.error("--merge-max-tokens must be >= 0")
+    if args.merge_recursion_depth is not None and args.merge_recursion_depth < 1:
+        parser.error("--merge-recursion-depth must be >= 1")
+    if args.merge_significance_threshold is not None and args.merge_significance_threshold < 0:
+        parser.error("--merge-significance-threshold must be >= 0")
+    if args.merge_significance_min_count is not None and args.merge_significance_min_count < 1:
+        parser.error("--merge-significance-min-count must be >= 1")
+    if args.merge_significance_cap is not None and args.merge_significance_cap < 1:
+        parser.error("--merge-significance-cap must be >= 1")
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -2078,12 +2137,47 @@ def main() -> None:
     merge_max_tokens = max(0, int(args.merge_max_tokens or 0))
     if args.ngram_order < 5:
         merge_max_tokens = 0
+    if args.merge_recursion_depth is not None:
+        merge_recursion_depth = int(args.merge_recursion_depth)
+    else:
+        merge_recursion_depth = 2 if merge_max_tokens > 1 else 1
+    if merge_max_tokens <= 1:
+        merge_recursion_depth = 1
+    if args.merge_train_baseline is None:
+        merge_train_baseline = merge_max_tokens > 1
+    else:
+        merge_train_baseline = bool(args.merge_train_baseline)
+    if args.merge_eval_baseline is None:
+        merge_eval_baseline = merge_max_tokens > 1
+    else:
+        merge_eval_baseline = bool(args.merge_eval_baseline)
+    if merge_max_tokens <= 1:
+        merge_train_baseline = False
+        merge_eval_baseline = False
+    merge_significance_threshold = max(0.0, float(args.merge_significance_threshold or 0.0))
+    merge_significance_min_count = max(1, int(args.merge_significance_min_count or 1))
+    merge_significance_cap = max(1, int(args.merge_significance_cap or 1))
+    args.merge_recursion_depth = merge_recursion_depth
+    args.merge_train_baseline = merge_train_baseline
+    args.merge_eval_baseline = merge_eval_baseline
+    args.merge_significance_threshold = merge_significance_threshold
+    args.merge_significance_min_count = merge_significance_min_count
+    args.merge_significance_cap = merge_significance_cap
     log_verbose(
         3,
         "[train:v3] Token merge configuration: "
-        f"max_tokens={merge_max_tokens}, dynamic_threshold=avg-count, "
-        f"ngram_order={args.ngram_order}.",
+        f"max_tokens={merge_max_tokens}, recursion={merge_recursion_depth}, "
+        f"baseline_train={merge_train_baseline}, baseline_eval={merge_eval_baseline}, "
+        f"dynamic_threshold=avg-count, ngram_order={args.ngram_order}.",
     )
+    if merge_significance_threshold > 0:
+        log_verbose(
+            3,
+            "[train:v3] Token merge significance: "
+            f"threshold={merge_significance_threshold}, "
+            f"min_count={merge_significance_min_count}, "
+            f"cap={merge_significance_cap}.",
+        )
 
     db_path_str, db_path = resolve_db_path(args.db, args.reset)
     if args.reset:
@@ -2113,6 +2207,12 @@ def main() -> None:
         prediction_key=args.cheetah_token_key,
         prediction_weight=args.cheetah_token_weight,
         token_merge_max_tokens=merge_max_tokens,
+        token_merge_recursion_depth=merge_recursion_depth,
+        token_merge_baseline_train=merge_train_baseline,
+        token_merge_baseline_eval=merge_eval_baseline,
+        token_merge_significance_threshold=merge_significance_threshold,
+        token_merge_significance_min_count=merge_significance_min_count,
+        token_merge_significance_cap=merge_significance_cap,
     )
     cheetah_primary = settings.backend == "cheetah-db" and not settings.cheetah_mirror
     if cheetah_primary and isinstance(engine.hot_path, NullHotPathAdapter):
@@ -2142,8 +2242,19 @@ def main() -> None:
     if getattr(engine, "token_merge_max_tokens", 0) > 1:
         log(
             "[train] Token merging enabled "
-            f"(max_span={engine.token_merge_max_tokens}, threshold=ceil(avg span frequency))."
+            f"(max_span={engine.token_merge_max_tokens}, "
+            f"recursion={engine.token_merge_recursion_depth}, "
+            f"baseline_train={engine.token_merge_baseline_train}, "
+            f"baseline_eval={engine.token_merge_baseline_eval}, "
+            "threshold=ceil(avg span frequency))."
         )
+        if engine.token_merge_significance_threshold > 0:
+            log(
+                "[train] Token merge significance threshold "
+                f"{engine.token_merge_significance_threshold:.3f} "
+                f"(min_count={engine.token_merge_significance_min_count}, "
+                f"cap={engine.token_merge_significance_cap})."
+            )
     context_window_label = engine.context_windows.describe()
     if context_window_label:
         log(f"[train] Context window embeddings: {context_window_label}")
@@ -2363,6 +2474,30 @@ def main() -> None:
             total_tokens += token_count
             total_windows += window
             log(f"[train] Ingested {label}: {token_count} tokens -> {window} n-grams")
+            merge_reporter = getattr(engine, "consume_merge_report", None)
+            if callable(merge_reporter):
+                report = merge_reporter()
+                if report:
+                    baseline_note = ""
+                    if report.baseline_tokens:
+                        baseline_note = f", baseline_tokens={report.baseline_tokens}"
+                    log(
+                        f"[merge] {label}: merged_tokens={report.merged_tokens}{baseline_note}, "
+                        f"applied={report.applied_total}, candidates={report.candidate_total}, "
+                        f"passes={report.passes}, retired+{report.retired_added} "
+                        f"(total={report.retired_total})."
+                    )
+                    if report.top_applied:
+                        previews = []
+                        for token_text, count, ratio in report.top_applied:
+                            preview = token_text
+                            if len(preview) > 60:
+                                preview = preview[:57] + "..."
+                            previews.append(f"{preview}*{count}@{ratio:.2f}")
+                        log_verbose(
+                            3,
+                            f"[merge] {label}: top merges -> {', '.join(previews)}",
+                        )
             monitor.maybe_run(total_tokens)
             if chunk.eval_records:
                 eval_batch = list(chunk.eval_records)

@@ -5,7 +5,7 @@ import statistics
 import re
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
@@ -87,6 +87,30 @@ class TokenCandidate:
     token_text: str
     probability: float
     q_logprob: int
+
+
+@dataclass(frozen=True)
+class MergeCandidates:
+    scores: Dict[tuple[str, ...], float]
+    counts: Dict[tuple[str, ...], int]
+
+
+@dataclass
+class MergeStats:
+    applied_counts: Dict[str, int] = field(default_factory=dict)
+    candidate_counts: Dict[str, int] = field(default_factory=dict)
+    base_lengths: Dict[str, int] = field(default_factory=dict)
+    passes: int = 0
+
+    def record_candidate(self, token_text: str, count: int, base_length: int) -> None:
+        self.candidate_counts[token_text] = self.candidate_counts.get(token_text, 0) + count
+        if token_text not in self.base_lengths:
+            self.base_lengths[token_text] = base_length
+
+    def record_applied(self, token_text: str, count: int, base_length: int) -> None:
+        self.applied_counts[token_text] = self.applied_counts.get(token_text, 0) + count
+        if token_text not in self.base_lengths:
+            self.base_lengths[token_text] = base_length
 
 
 class Vocabulary:
@@ -171,12 +195,32 @@ class Tokenizer:
         self._special_backend_warned = False
         self._merge_max_tokens = 0
         self._merge_candidate_limit = MERGE_CANDIDATE_LIMIT
+        self._merge_recursion_depth = 1
+        self._merge_retired_tokens: set[str] = set()
+        self._merge_span_cache: dict[str, int] = {}
         self._backend = self._init_backend(backend, tokenizer_path, lowercase_tokens)
 
-    def configure_merging(self, max_tokens: int | None) -> None:
+    def configure_merging(
+        self,
+        max_tokens: int | None,
+        *,
+        recursion_depth: int | None = None,
+        candidate_limit: int | None = None,
+        retired_tokens: Sequence[str] | None = None,
+    ) -> None:
         """Configure token-merge behaviour (disabled when max_tokens <= 1)."""
         resolved_max = max(0, int(max_tokens or 0))
         self._merge_max_tokens = resolved_max
+        if recursion_depth is not None:
+            self._merge_recursion_depth = max(1, int(recursion_depth))
+        if candidate_limit is not None:
+            self._merge_candidate_limit = max(0, int(candidate_limit))
+        if retired_tokens is not None:
+            self._merge_retired_tokens = {token for token in retired_tokens if token}
+        if resolved_max <= 1:
+            self._merge_recursion_depth = 1
+            self._merge_retired_tokens = set()
+            self._merge_span_cache = {}
 
     def _init_backend(
         self,
@@ -221,21 +265,64 @@ class Tokenizer:
             )
             self._special_backend_warned = True
 
-    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
+    def set_merge_retired_tokens(self, tokens: Sequence[str] | None) -> None:
+        self._merge_retired_tokens = {token for token in (tokens or []) if token}
+        self._merge_span_cache = {}
+
+    def tokenize(
+        self,
+        text: str,
+        add_special_tokens: bool = True,
+        *,
+        merge_mode: str = "auto",
+        collect_stats: bool = False,
+    ) -> tuple[List[str], MergeStats | None]:
         tokens = self._backend.tokenize(text)
         if add_special_tokens:
             tokens = ["<BOS>", *tokens, "<EOS>"]
-        tokens = self._apply_merges(tokens)
+        if merge_mode.strip().lower() in {"off", "none", "disabled"}:
+            return list(tokens), None
+        merged, stats = self._apply_merges(tokens, collect_stats=collect_stats)
+        return merged, stats
+
+    def encode(
+        self,
+        text: str,
+        add_special_tokens: bool = True,
+        *,
+        merge_mode: str = "auto",
+    ) -> List[int]:
+        tokens, _stats = self.tokenize(
+            text,
+            add_special_tokens=add_special_tokens,
+            merge_mode=merge_mode,
+            collect_stats=False,
+        )
         return [self.vocab.token_id(token) for token in tokens]
+
+    def encode_with_stats(
+        self,
+        text: str,
+        add_special_tokens: bool = True,
+        *,
+        merge_mode: str = "auto",
+    ) -> tuple[List[int], MergeStats | None]:
+        tokens, stats = self.tokenize(
+            text,
+            add_special_tokens=add_special_tokens,
+            merge_mode=merge_mode,
+            collect_stats=True,
+        )
+        return [self.vocab.token_id(token) for token in tokens], stats
 
     def _merge_boundaries(self) -> set[str]:
         boundaries = {"<BOS>", "<EOS>", "<PAD>", "|END|"}
         boundaries.update(self._special_token_set)
         return boundaries
 
-    def _select_merge_candidates(self, tokens: Sequence[str], max_len: int) -> Dict[tuple[str, ...], float]:
+    def _select_merge_candidates(self, tokens: Sequence[str], max_len: int) -> MergeCandidates:
         if max_len <= 1:
-            return {}
+            return MergeCandidates({}, {})
         counts: Dict[tuple[str, ...], int] = defaultdict(int)
         boundaries = self._merge_boundaries()
         token_probs, median_prob = self._token_probabilities(tokens, boundaries)
@@ -252,7 +339,7 @@ class Tokenizer:
                     continue
                 counts[tuple(window)] += 1
         if not counts:
-            return {}
+            return MergeCandidates({}, {})
         weighted_counts: Dict[tuple[str, ...], float] = {}
         for run, count in counts.items():
             max_prob = max(token_probs.get(token, 0.0) for token in run)
@@ -261,20 +348,28 @@ class Tokenizer:
         avg = sum(weighted_counts.values()) / float(len(weighted_counts))
         threshold = max(2, int(math.ceil(avg)))
         candidates = []
+        retired_tokens = self._merge_retired_tokens
         for run, count in counts.items():
             weighted_count = weighted_counts.get(run, 0.0)
             if weighted_count >= threshold:
+                if retired_tokens:
+                    merged_token = self._merged_token_text(run)
+                    if merged_token in retired_tokens:
+                        continue
                 score = weighted_count * len(run)
                 candidates.append((run, score, count))
         if not candidates:
-            return {}
+            return MergeCandidates({}, {})
         candidates.sort(
             key=lambda rc: (rc[1], rc[2], len(rc[0])),
             reverse=True,
         )
         limit = self._merge_candidate_limit
         chosen = candidates if not limit or limit <= 0 else candidates[:limit]
-        return {run: score for run, score, _count in chosen}
+        return MergeCandidates(
+            scores={run: score for run, score, _count in chosen},
+            counts={run: count for run, _score, count in chosen},
+        )
 
     def _token_probabilities(
         self,
@@ -306,13 +401,29 @@ class Tokenizer:
         payload = json.dumps(list(run), ensure_ascii=True)
         return f"{MERGE_TOKEN_PREFIX}{payload}{MERGE_TOKEN_SUFFIX}"
 
-    def _apply_merges(self, tokens: Sequence[str]) -> List[str]:
-        max_len = self._merge_max_tokens
-        if max_len <= 1:
-            return list(tokens)
-        candidates = self._select_merge_candidates(tokens, max_len)
-        if not candidates:
-            return list(tokens)
+    def _merge_token_span_length(self, token: str) -> int:
+        cached = self._merge_span_cache.get(token)
+        if cached is not None:
+            return cached
+        parts = self._parse_merged_token_parts(token)
+        if not parts:
+            self._merge_span_cache[token] = 1
+            return 1
+        length = sum(self._merge_token_span_length(part) for part in parts)
+        length = max(1, length)
+        self._merge_span_cache[token] = length
+        return length
+
+    def _merge_run_length(self, run: Sequence[str]) -> int:
+        return sum(self._merge_token_span_length(token) for token in run)
+
+    def _apply_merge_pass(
+        self,
+        tokens: Sequence[str],
+        candidates: Dict[tuple[str, ...], float],
+        max_len: int,
+        stats: MergeStats | None,
+    ) -> List[str]:
         boundaries = self._merge_boundaries()
         longest = max(len(run) for run in candidates)
         merged: list[str] = []
@@ -343,12 +454,45 @@ class Tokenizer:
                     chosen_score = score
                     chosen_len = span
             if chosen:
-                merged.append(self._merged_token_text(chosen))
+                merged_token = self._merged_token_text(chosen)
+                merged.append(merged_token)
+                if stats is not None:
+                    stats.record_applied(merged_token, 1, self._merge_run_length(chosen))
                 idx += len(chosen)
             else:
                 merged.append(token)
                 idx += 1
         return merged
+
+    def _apply_merges(
+        self,
+        tokens: Sequence[str],
+        *,
+        collect_stats: bool = False,
+    ) -> tuple[List[str], MergeStats | None]:
+        max_len = self._merge_max_tokens
+        if max_len <= 1:
+            return list(tokens), None
+        stats = MergeStats() if collect_stats else None
+        current = list(tokens)
+        passes = 0
+        depth = max(1, int(self._merge_recursion_depth))
+        while passes < depth:
+            candidates = self._select_merge_candidates(current, max_len)
+            if not candidates.scores:
+                break
+            if stats is not None:
+                for run, count in candidates.counts.items():
+                    token_text = self._merged_token_text(run)
+                    stats.record_candidate(token_text, count, self._merge_run_length(run))
+            merged = self._apply_merge_pass(current, candidates.scores, max_len, stats)
+            passes += 1
+            if merged == current:
+                break
+            current = merged
+        if stats is not None:
+            stats.passes = passes
+        return current, stats
 
     def decode(self, token_ids: Iterable[int]) -> str:
         pieces: List[str] = []
@@ -395,7 +539,7 @@ class Tokenizer:
         return normalized[0].isalnum()
 
     @staticmethod
-    def _decode_merged_token(token: str) -> str | None:
+    def _parse_merged_token_parts(token: str) -> list[str] | None:
         if not (token.startswith(MERGE_TOKEN_PREFIX) and token.endswith(MERGE_TOKEN_SUFFIX)):
             return None
         payload = token[len(MERGE_TOKEN_PREFIX) : -len(MERGE_TOKEN_SUFFIX)]
@@ -405,7 +549,28 @@ class Tokenizer:
             return None
         if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
             return None
-        return " ".join(parts)
+        return parts
+
+    @classmethod
+    def _flatten_merged_parts(cls, parts: Sequence[str]) -> List[str]:
+        flattened: List[str] = []
+        for part in parts:
+            nested = cls._parse_merged_token_parts(part)
+            if nested:
+                flattened.extend(cls._flatten_merged_parts(nested))
+            else:
+                flattened.append(part)
+        return flattened
+
+    @classmethod
+    def _decode_merged_token(cls, token: str) -> str | None:
+        parts = cls._parse_merged_token_parts(token)
+        if not parts:
+            return None
+        flattened = cls._flatten_merged_parts(parts)
+        if not flattened:
+            return None
+        return " ".join(flattened)
 
     def tokens_to_text(self, token_ids: Iterable[int]) -> List[str]:
         return [self.vocab.token_text(token_id) for token_id in token_ids]

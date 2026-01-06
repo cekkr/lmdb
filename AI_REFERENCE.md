@@ -90,10 +90,15 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
   by setting `canonical_tag`; datasets that skip the field no longer receive automatic `|CTX|:`
   prefixes.
 - Training runs with `--ngram-order` >= 5 now merge repeated token runs into composite tokens by default
-  (`--merge-max-tokens 5`). Spans below the average frequency of all candidate spans are discarded,
-  and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely
-  to merge. The merge config is persisted in metadata (SQLite + cheetah) so inference reuses the
-  same rules; set `--merge-max-tokens 0` to disable.
+  (`--merge-max-tokens 5`) and can recurse merges via `--merge-recursion-depth`. Spans below the
+  average frequency of all candidate spans are discarded, and runs dominated by high-frequency
+  tokens are down-weighted so generic phrases are less likely to merge. When merging is active the
+  trainer can also ingest baseline (unmerged) tokens (`--merge-train-baseline`) and evaluation logs
+  baseline perplexity (`--merge-eval-baseline`). Merge significance tracking records
+  applied/candidate ratios and can retire low-significance merged tokens via
+  `--merge-significance-threshold`; the retired list persists in metadata (SQLite + cheetah) so
+  future tokenization skips those merges (IDs remain in vocab for now). Set `--merge-max-tokens 0`
+  to disable.
 - `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
   ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
   cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input

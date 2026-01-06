@@ -703,6 +703,19 @@ class ResponseEvaluator:
             "ppl_generated": ppl_generated,
             "ppl_reference": ppl_reference,
         }
+        merge_enabled = getattr(self.engine, "token_merge_max_tokens", 0) > 1
+        merge_baseline = getattr(self.engine, "token_merge_baseline_eval", False)
+        if merge_enabled and merge_baseline:
+            metrics["ppl_generated_base"] = self._perplexity(
+                prompt,
+                candidate,
+                merge_mode="off",
+            )
+            metrics["ppl_reference_base"] = self._perplexity(
+                prompt,
+                reference,
+                merge_mode="off",
+            )
         metrics["lexical_novelty"] = max(0.0, 1.0 - lexical)
         structure_metrics = _structure_metrics(reference, candidate)
         metrics.update(structure_metrics)
@@ -745,11 +758,11 @@ class ResponseEvaluator:
             return
         self._recent_generations.append(normalized)
 
-    def _perplexity(self, prompt: str, target: str) -> float:
-        tokens = self.engine.tokenizer.encode(target, add_special_tokens=False)
+    def _perplexity(self, prompt: str, target: str, *, merge_mode: str = "auto") -> float:
+        tokens = self.engine.tokenizer.encode(target, add_special_tokens=False, merge_mode=merge_mode)
         if not tokens:
             return float("inf")
-        history = self.engine.tokenizer.encode(prompt, add_special_tokens=False)
+        history = self.engine.tokenizer.encode(prompt, add_special_tokens=False, merge_mode=merge_mode)
         if not history:
             history = [self.engine.vocab.token_id("<BOS>")]
         log_sum = 0.0
@@ -789,6 +802,8 @@ def summarize_samples(samples: Sequence[EvaluationSampleResult]) -> dict[str, fl
         "rougeL_mean": "rougeL",
         "ppl_generated_mean": "ppl_generated",
         "ppl_reference_mean": "ppl_reference",
+        "ppl_generated_base_mean": "ppl_generated_base",
+        "ppl_reference_base_mean": "ppl_reference_base",
         "grammar_errors_mean": "grammar_errors",
         "grammar_score_mean": "grammar_score",
         "cola_acceptability_mean": "cola_acceptability",
