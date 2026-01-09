@@ -129,6 +129,17 @@ class HotPathAdapter(Protocol):
     ) -> bool:
         """Adjust prediction weights using the provided context matrix (PREDICT_TRAIN)."""
 
+    def predict_inherit(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        sources: Sequence[bytes | str],
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> bool:
+        """Inherit prediction weights from existing values (PREDICT_INHERIT)."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -243,6 +254,17 @@ class NullHotPathAdapter:
         learning_rate: float = 0.01,
         table: str | None = None,
         negatives: Sequence[bytes | str] | None = None,
+    ) -> bool:
+        return False
+
+    def predict_inherit(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        sources: Sequence[bytes | str],
+        table: str | None = None,
+        merge_mode: str | None = None,
     ) -> bool:
         return False
 

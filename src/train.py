@@ -8,10 +8,11 @@ import math
 import multiprocessing
 import os
 import random
+import re
 import shutil
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,7 @@ from db_slm.evaluation import (
     build_dependency_layer,
     run_inference_records,
     ContextProbabilityProbe,
+    summarize_samples,
 )
 from db_slm.settings import DBSLMSettings, load_settings
 from db_slm.text_markers import append_end_marker
@@ -71,8 +73,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--ngram-order",
         type=int,
-        default=3,
-        help="N-gram order to enforce while training (default: %(default)s).",
+        default=0,
+        help="N-gram order to enforce while training (0 = auto, default: %(default)s).",
     )
     parser.add_argument(
         "--merge-max-tokens",
@@ -150,7 +152,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=0,
         help=(
             "Cap on adaptive windows per dimension sampled during training for context embeddings "
-            "(default: engine preset)."
+            "(0 = auto)."
         ),
     )
     parser.add_argument(
@@ -159,7 +161,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=0,
         help=(
             "Max windows per dimension sampled during inference/evaluation for context embeddings "
-            "(default: engine preset)."
+            "(0 = auto)."
         ),
     )
     parser.add_argument(
@@ -167,7 +169,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Stride ratio for context window sampling (0.1-1.0, default: engine preset)."
+            "Stride ratio for context window sampling (0.1-1.0, 0 = auto)."
         ),
     )
     parser.add_argument(
@@ -497,6 +499,99 @@ def resolve_db_path(raw: str, reset: bool) -> Tuple[str, Path | None]:
     return str(path), path
 
 
+_SAMPLE_TOKEN_RE = re.compile(r"\S+")
+_NGRAM_AUTO_MIN_TOKENS = 200
+_NGRAM_AUTO_MAX_ORDER = 6
+_NGRAM_AUTO_MAX_TOKENS = 6000
+_NGRAM_AUTO_MAX_ROWS = 50
+_NGRAM_AUTO_MIN_RATIO = 0.02
+
+
+def _tokenize_sample(text: str) -> list[str]:
+    return _SAMPLE_TOKEN_RE.findall(text or "")
+
+
+def _collect_ngram_sample_tokens(
+    paths: Sequence[Path],
+    *,
+    encoding: str,
+    dataset_config_override: str | None,
+    max_rows: int = _NGRAM_AUTO_MAX_ROWS,
+    max_tokens: int = _NGRAM_AUTO_MAX_TOKENS,
+) -> list[str]:
+    tokens: list[str] = []
+    if not paths:
+        return tokens
+    for path in paths:
+        if len(tokens) >= max_tokens:
+            break
+        suffix = path.suffix.lower()
+        if suffix in {".json", ".ndjson"}:
+            dataset_cfg = load_dataset_config(path, override=dataset_config_override)
+            row_count = 0
+            for _line_no, json_text in _iter_json_records(path):
+                if row_count >= max_rows or len(tokens) >= max_tokens:
+                    break
+                try:
+                    payload = json.loads(json_text)
+                except json.JSONDecodeError:
+                    continue
+                prompt_value = dataset_cfg.extract_prompt(payload)
+                response_value = dataset_cfg.extract_response(payload)
+                if prompt_value:
+                    tokens.extend(_tokenize_sample(prompt_value))
+                if response_value:
+                    tokens.extend(_tokenize_sample(response_value))
+                row_count += 1
+            continue
+        try:
+            with open(path, "r", encoding=encoding, errors="ignore") as handle:
+                for line in handle:
+                    tokens.extend(_tokenize_sample(line))
+                    if len(tokens) >= max_tokens:
+                        break
+        except OSError:
+            continue
+    return tokens[:max_tokens]
+
+
+def _auto_ngram_order(
+    tokens: Sequence[str],
+    *,
+    merge_max_tokens: int,
+    max_order: int = _NGRAM_AUTO_MAX_ORDER,
+) -> tuple[int, dict[int, float]]:
+    token_count = len(tokens)
+    if token_count < _NGRAM_AUTO_MIN_TOKENS:
+        return 3, {}
+    ratios: dict[int, float] = {}
+    max_order = max(3, max_order)
+    for n in range(3, max_order + 1):
+        total = token_count - n + 1
+        if total < 50:
+            continue
+        counts = Counter(tuple(tokens[i : i + n]) for i in range(total))
+        if not counts:
+            continue
+        repeated = sum(1 for count in counts.values() if count > 1)
+        ratio = repeated / float(len(counts))
+        ratios[n] = ratio
+    if not ratios:
+        return 3, ratios
+    def _score(order: int, ratio: float) -> float:
+        length_weight = 1.0 + 0.12 * (order - 3)
+        return ratio * length_weight
+    best_order = max(ratios.items(), key=lambda item: _score(item[0], item[1]))[0]
+    if ratios.get(best_order, 0.0) < _NGRAM_AUTO_MIN_RATIO:
+        best_order = 3
+    if merge_max_tokens > 1 and best_order < 5:
+        candidate_ratio = ratios.get(5, 0.0)
+        best_ratio = ratios.get(best_order, 0.0)
+        if candidate_ratio and candidate_ratio >= best_ratio * 0.7:
+            best_order = 5
+    return best_order, ratios
+
+
 def _configure_context_windows(
     engine: DBSLMEngine,
     args: argparse.Namespace,
@@ -508,14 +603,28 @@ def _configure_context_windows(
     train_windows = int(getattr(args, "context_window_train_windows", 0) or 0)
     if train_windows > 0:
         manager.max_train_windows = max(1, train_windows)
+        manager.auto_train_windows = False
+        changed = True
+    elif train_windows == 0 and not getattr(manager, "auto_train_windows", False):
+        manager.max_train_windows = 0
+        manager.auto_train_windows = True
         changed = True
     infer_windows = int(getattr(args, "context_window_infer_windows", 0) or 0)
     if infer_windows > 0:
         manager.max_infer_windows = max(1, infer_windows)
+        manager.auto_infer_windows = False
+        changed = True
+    elif infer_windows == 0 and not getattr(manager, "auto_infer_windows", False):
+        manager.max_infer_windows = 0
+        manager.auto_infer_windows = True
         changed = True
     stride_ratio = float(getattr(args, "context_window_stride_ratio", 0.0) or 0.0)
     if stride_ratio > 0:
         manager.extractor.stride_ratio = max(0.1, min(stride_ratio, 1.0))
+        manager.auto_stride_ratio = False
+        changed = True
+    elif stride_ratio == 0.0 and not getattr(manager, "auto_stride_ratio", False):
+        manager.auto_stride_ratio = True
         changed = True
     depth_bonus = getattr(args, "context_window_depth", None)
     if depth_bonus is not None:
@@ -528,6 +637,9 @@ def _configure_context_windows(
         "max_train_windows": manager.max_train_windows,
         "max_infer_windows": manager.max_infer_windows,
         "depth_bonus": manager.depth_bonus,
+        "auto_train_windows": bool(getattr(manager, "auto_train_windows", False)),
+        "auto_infer_windows": bool(getattr(manager, "auto_infer_windows", False)),
+        "auto_stride_ratio": bool(getattr(manager, "auto_stride_ratio", False)),
     }
 
 
@@ -895,6 +1007,113 @@ def _context_matrix_payload(engine: DBSLMEngine, text: str) -> Sequence[Sequence
 
 def _encode_prediction_token(token_id: int) -> bytes:
     return token_id.to_bytes(4, "big", signed=False)
+
+
+_MERGE_INHERIT_SCAN_LIMIT = 256
+_MERGE_INHERIT_PENDING_LIMIT = 128
+_MERGE_INHERIT_PENDING_CAP = 512
+
+
+def _inherit_merged_token_predictions(
+    engine: DBSLMEngine,
+    args: argparse.Namespace,
+) -> None:
+    if getattr(args, "disable_cheetah_token_train", False):
+        return
+    if getattr(engine, "token_merge_max_tokens", 0) <= 1:
+        return
+    predict_inherit = getattr(engine.hot_path, "predict_inherit", None)
+    if not callable(predict_inherit) or isinstance(engine.hot_path, NullHotPathAdapter):
+        return
+    table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
+    key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
+    if not table or not key_label:
+        return
+    key_bytes = key_label.encode("utf-8")
+    seeded_tokens: set[int] = getattr(engine, "_prediction_seeded_tokens", set())
+    if not seeded_tokens:
+        return
+    inherited_tokens: set[int] = getattr(engine, "_prediction_inherited_tokens", set())
+    pending_tokens: set[int] = getattr(engine, "_merge_inherit_pending", set())
+    scan_cursor = int(getattr(engine, "_merge_inherit_cursor", 0))
+    updates = 0
+    skipped = 0
+
+    def _process_token(token_id: int, token_text: str) -> bool:
+        parts = engine.tokenizer.flattened_merged_parts(token_text)
+        if not parts or len(parts) < 2:
+            return True
+        source_ids: list[int] = []
+        for part in parts:
+            part_id = engine.vocab.lookup(part)
+            if part_id is None or part_id not in seeded_tokens:
+                return False
+            source_ids.append(part_id)
+        if len(source_ids) < 2:
+            return True
+        if token_id in inherited_tokens:
+            return True
+        success = predict_inherit(
+            key=key_bytes,
+            target=_encode_prediction_token(token_id),
+            sources=[_encode_prediction_token(part_id) for part_id in source_ids],
+            table=table,
+            merge_mode="avg",
+        )
+        if success:
+            inherited_tokens.add(token_id)
+            seeded_tokens.add(token_id)
+            nonlocal updates
+            updates += 1
+            return True
+        return False
+
+    if pending_tokens:
+        for token_id in list(pending_tokens)[:_MERGE_INHERIT_PENDING_LIMIT]:
+            token_text = engine.vocab.token_text(token_id)
+            if _process_token(token_id, token_text):
+                pending_tokens.discard(token_id)
+            else:
+                skipped += 1
+
+    rows = engine.db.query(
+        """
+        SELECT token_id, token_text
+        FROM tbl_l1_vocabulary
+        WHERE token_id > ?
+        ORDER BY token_id
+        LIMIT ?
+        """,
+        (scan_cursor, _MERGE_INHERIT_SCAN_LIMIT),
+    )
+    for row in rows:
+        token_id = int(row["token_id"])
+        token_text = row["token_text"]
+        scan_cursor = max(scan_cursor, token_id)
+        if token_id in inherited_tokens:
+            continue
+        if _process_token(token_id, token_text):
+            continue
+        if len(pending_tokens) < _MERGE_INHERIT_PENDING_CAP:
+            pending_tokens.add(token_id)
+        else:
+            skipped += 1
+
+    setattr(engine, "_merge_inherit_cursor", scan_cursor)
+    setattr(engine, "_prediction_inherited_tokens", inherited_tokens)
+    setattr(engine, "_merge_inherit_pending", pending_tokens)
+    setattr(engine, "_prediction_seeded_tokens", seeded_tokens)
+    if updates:
+        log(
+            "[merge] Inherited cheetah prediction weights for "
+            f"{updates} merged token(s) (pending={len(pending_tokens)})."
+        )
+    elif skipped and pending_tokens:
+        log_verbose(
+            3,
+            "[merge] Deferred cheetah prediction inheritance "
+            f"(pending={len(pending_tokens)}).",
+        )
 
 
 def _train_prediction_tables(
@@ -1868,6 +2087,96 @@ def load_eval_dataset(
     return records
 
 
+class DecoderPenaltyTuner:
+    def __init__(
+        self,
+        base_config: DecoderConfig | None,
+        *,
+        lock_presence: bool,
+        lock_frequency: bool,
+    ) -> None:
+        base = base_config or DecoderConfig()
+        self._profile = base.profile
+        self._max_tokens = base.max_tokens
+        self._presence = float(base.presence_penalty)
+        self._frequency = float(base.frequency_penalty)
+        self._lock_presence = lock_presence
+        self._lock_frequency = lock_frequency
+        self.enabled = not (lock_presence and lock_frequency)
+
+    def config(self) -> DecoderConfig:
+        return DecoderConfig(
+            max_tokens=self._max_tokens,
+            profile=self._profile,
+            presence_penalty=self._presence,
+            frequency_penalty=self._frequency,
+        )
+
+    def update_from_samples(
+        self,
+        samples: Sequence[EvaluationSampleResult],
+        *,
+        label: str,
+    ) -> DecoderConfig:
+        if not self.enabled or not samples:
+            return self.config()
+        summary = summarize_samples(samples)
+        if not summary:
+            return self.config()
+        repeat_avg = self._metric(summary, "char_repeat_avg_mean")
+        token_group = self._metric(summary, "token_group_share_mean")
+        common_penalty = self._metric(summary, "common_token_penalty_mean")
+        structure_variety = self._metric(summary, "structure_variety_mean")
+        quality_score = self._metric(summary, "quality_score_mean")
+        pressure = (
+            max(0.0, repeat_avg - 0.35) * 1.1
+            + max(0.0, token_group - 0.25) * 1.2
+            + max(0.0, common_penalty - 0.35) * 0.8
+        )
+        relief = (
+            max(0.0, structure_variety - 0.45) * 0.6
+            + max(0.0, quality_score - 0.6) * 0.4
+        )
+        net = max(-1.0, min(1.0, pressure - relief))
+        if net == 0.0:
+            return self.config()
+        delta_presence = max(-0.08, min(0.08, net * 0.08))
+        delta_frequency = max(-0.12, min(0.12, net * 0.12))
+        prior_presence = self._presence
+        prior_frequency = self._frequency
+        if not self._lock_presence:
+            next_presence = max(0.0, min(1.5, self._presence + delta_presence))
+            self._presence = (self._presence * 0.7) + (next_presence * 0.3)
+        if not self._lock_frequency:
+            next_frequency = max(0.0, min(1.5, self._frequency + delta_frequency))
+            self._frequency = (self._frequency * 0.7) + (next_frequency * 0.3)
+        if (
+            abs(self._presence - prior_presence) >= 0.01
+            or abs(self._frequency - prior_frequency) >= 0.01
+        ):
+            log(
+                "[eval] {label}: tuned decoder penalties to presence={presence:.2f} "
+                "frequency={frequency:.2f} (repeat_avg={repeat:.2f}, token_group={group:.2f}, "
+                "common_penalty={common:.2f}, structure_variety={variety:.2f}).".format(
+                    label=label,
+                    presence=self._presence,
+                    frequency=self._frequency,
+                    repeat=repeat_avg,
+                    group=token_group,
+                    common=common_penalty,
+                    variety=structure_variety,
+                )
+            )
+        return self.config()
+
+    @staticmethod
+    def _metric(summary: dict[str, float | None], key: str) -> float:
+        value = summary.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+        return 0.0
+
+
 class InferenceMonitor:
     _MIN_SAMPLES = 2
 
@@ -1887,6 +2196,7 @@ class InferenceMonitor:
         prediction_probe: ContextProbabilityProbe | None = None,
         prediction_source: str | None = None,
         adversarial_trainer: "AdversarialTrainer | None" = None,
+        penalty_tuner: DecoderPenaltyTuner | None = None,
     ) -> None:
         self.engine = engine
         self.dataset = dataset
@@ -1904,6 +2214,7 @@ class InferenceMonitor:
         self.prediction_probe = prediction_probe
         self.prediction_source = (prediction_source or "").strip().lower() if prediction_probe else None
         self.adversarial_trainer = adversarial_trainer
+        self.penalty_tuner = penalty_tuner
         log_verbose(
             3,
             "[eval:v3] Inference monitor configured "
@@ -1952,6 +2263,11 @@ class InferenceMonitor:
         )
         if self.adversarial_trainer:
             self.adversarial_trainer.apply(results, label=f"{threshold} token eval")
+        if self.penalty_tuner:
+            self.decoder_cfg = self.penalty_tuner.update_from_samples(
+                results,
+                label=f"{threshold} token eval",
+            )
 
     def refresh_dataset(self, new_records: Sequence[EvaluationRecord]) -> None:
         if not new_records:
@@ -2147,6 +2463,34 @@ def main() -> None:
         formatted = "\n".join(f"- {message}" for message in requirement_errors)
         parser.error(f"Missing training requirements:\n{formatted}")
 
+    file_inputs = collect_files(args.inputs, args.recursive)
+    file_inputs = [path.resolve() for path in file_inputs]
+
+    if args.ngram_order <= 0:
+        sample_tokens = _collect_ngram_sample_tokens(
+            file_inputs,
+            encoding=args.encoding,
+            dataset_config_override=args.dataset_config,
+        )
+        resolved_order, ratios = _auto_ngram_order(
+            sample_tokens,
+            merge_max_tokens=max(0, int(args.merge_max_tokens or 0)),
+        )
+        args.ngram_order = resolved_order
+        if ratios:
+            ratio_label = ", ".join(
+                f"{order}:{ratio:.3f}" for order, ratio in sorted(ratios.items())
+            )
+            log(
+                f"[train] Auto-selected ngram order {resolved_order} "
+                f"(sample_tokens={len(sample_tokens)}, ratios={ratio_label})."
+            )
+        else:
+            log(
+                f"[train] Auto-selected ngram order {resolved_order} "
+                f"(sample_tokens={len(sample_tokens)})."
+            )
+
     merge_max_tokens = max(0, int(args.merge_max_tokens or 0))
     if args.ngram_order < 5:
         merge_max_tokens = 0
@@ -2243,13 +2587,22 @@ def main() -> None:
     log(f"[train] Context dimensions: {dims_label}")
     context_window_config = _configure_context_windows(engine, args)
     if context_window_config:
+        auto_bits = []
+        if context_window_config.get("auto_train_windows"):
+            auto_bits.append("train")
+        if context_window_config.get("auto_infer_windows"):
+            auto_bits.append("infer")
+        if context_window_config.get("auto_stride_ratio"):
+            auto_bits.append("stride")
+        auto_label = f", auto={'+'.join(auto_bits)}" if auto_bits else ""
         log(
             "[train] Context window config: "
-            "stride={stride:.2f}, train_windows={train}, infer_windows={infer}, depth_bonus={depth}.".format(
+            "stride={stride:.2f}, train_windows={train}, infer_windows={infer}, depth_bonus={depth}{auto}.".format(
                 stride=context_window_config["stride_ratio"],
                 train=context_window_config["max_train_windows"],
                 infer=context_window_config["max_infer_windows"],
                 depth=context_window_config["depth_bonus"],
+                auto=auto_label,
             )
         )
     if getattr(engine, "token_merge_max_tokens", 0) > 1:
@@ -2297,9 +2650,21 @@ def main() -> None:
         decoder_overrides["frequency_penalty"] = float(args.decoder_frequency_penalty)
     if decoder_overrides:
         decoder_cfg_override = DecoderConfig(**decoder_overrides)
+    penalty_tuner = DecoderPenaltyTuner(
+        decoder_cfg_override,
+        lock_presence=args.decoder_presence_penalty is not None,
+        lock_frequency=args.decoder_frequency_penalty is not None,
+    )
+    if penalty_tuner.enabled:
+        decoder_cfg_override = penalty_tuner.config()
+        log(
+            "[train] Decoder penalty auto-tuning active "
+            f"(presence={decoder_cfg_override.presence_penalty:.2f}, "
+            f"frequency={decoder_cfg_override.frequency_penalty:.2f})."
+        )
+    else:
+        penalty_tuner = None
 
-    file_inputs = collect_files(args.inputs, args.recursive)
-    file_inputs = [path.resolve() for path in file_inputs]
     if resume_mode and resume_state:
         resume_errors = _validate_resume_inputs(
             file_inputs,
@@ -2396,6 +2761,7 @@ def main() -> None:
         prediction_probe=eval_prediction_probe,
         prediction_source=eval_prediction_source,
         adversarial_trainer=adversarial_trainer,
+        penalty_tuner=penalty_tuner,
     )
     if args.eval_interval > 0:
         dataset_path = Path(eval_dataset_path).expanduser()
@@ -2420,6 +2786,7 @@ def main() -> None:
                 prediction_probe=eval_prediction_probe,
                 prediction_source=eval_prediction_source,
                 adversarial_trainer=adversarial_trainer,
+                penalty_tuner=penalty_tuner,
             )
             log(f"[eval] Loaded {len(eval_records)} held-out sample(s) from {dataset_path}.")
             log_verbose(
@@ -2444,6 +2811,7 @@ def main() -> None:
                 prediction_probe=eval_prediction_probe,
                 prediction_source=eval_prediction_source,
                 adversarial_trainer=adversarial_trainer,
+                penalty_tuner=penalty_tuner,
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
@@ -2546,9 +2914,16 @@ def main() -> None:
                 )
                 if adversarial_trainer:
                     adversarial_trainer.apply(eval_results, label=f"{label} hold-out")
+                if penalty_tuner:
+                    decoder_cfg_override = penalty_tuner.update_from_samples(
+                        eval_results,
+                        label=f"{label} hold-out",
+                    )
+                    monitor.decoder_cfg = decoder_cfg_override
                 monitor.refresh_dataset(chunk.eval_records)
             if chunk.prediction_records:
                 _train_prediction_tables(engine, chunk.prediction_records, args)
+                _inherit_merged_token_predictions(engine, args)
             if resume_state:
                 if label not in resume_completed:
                     resume_completed.add(label)

@@ -140,7 +140,7 @@ continuation counts, and re-materializes quantized probability tables plus the T
 python src/train.py \
   data/corpus.txt docs/*.txt \
   --db var/db_slm.sqlite3 \
-  --ngram-order 3 \
+  --ngram-order 0 \
   --recursive \
   --reset
 ```
@@ -150,7 +150,7 @@ python src/train.py \
 ```bash
 python src/train.py datasets/emotion_data.json \
   --db var/db_slm.sqlite3 \
-  --ngram-order 4 \
+  --ngram-order 0 \
   --json-chunk-size 750 \
   --chunk-eval-percent 12.5 \
   --eval-interval 40000 \
@@ -171,8 +171,8 @@ python src/train.py datasets/emotion_data.json \
   - `--db`: Destination SQLite file. Parent directories are created automatically; use `:memory:` for scratch runs (cannot be combined with `--reset`). Keep the chosen path consistent with `run.py`.
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
   - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
-  - `--ngram-order`: Adjusts the context window length. Higher orders need larger corpora but produce richer continuations.
-  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries, then optionally recurse across the merged stream. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable.
+  - `--ngram-order`: Adjusts the context window length (use `0` for auto-selection based on a corpus sample). Higher orders need larger corpora but produce richer continuations.
+  - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries, then optionally recurse across the merged stream. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable. Composite tokens now inherit cheetah prediction weights from their component tokens during training.
   - `--merge-recursion-depth`: Recursive merge passes to attempt per tokenization step (defaults to 2 when merging is enabled).
   - `--merge-train-baseline` / `--no-merge-train-baseline`: Train the unmerged token sequence alongside merged tokens (defaults to enabled when merging is active).
   - `--merge-eval-baseline` / `--no-merge-eval-baseline`: Log perplexity metrics with merging disabled for comparison (defaults to enabled when merging is active).
@@ -180,9 +180,9 @@ python src/train.py datasets/emotion_data.json \
   - `--merge-significance-min-count`: Minimum candidate count before evaluating merge significance (default 2).
   - `--merge-significance-cap`: Cap how many retired merge tokens are persisted in metadata (default 128).
   - `--context-dimensions "<ranges>"`: Extends repeat penalties across grouped token spans (e.g., `1-2,3-5` or progressive lengths like `4,8,4`). Use presets `default`/`deep`/`shallow`, or `off`/`none` to disable. Selections persist in `tbl_metadata` and the cheetah metadata mirror.
-  - `--context-window-train-windows <n>`: Override the cap for adaptive windows-per-dimension sampling during training for context embeddings (0 = default).
-  - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = default).
-  - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = default).
+  - `--context-window-train-windows <n>`: Override the cap for adaptive windows-per-dimension sampling during training for context embeddings (0 = auto).
+  - `--context-window-infer-windows <n>`: Override how many windows per dimension are sampled during inference/evaluation for context embeddings (0 = auto).
+  - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = auto).
   - `--context-window-depth <n>`: Bias extra context-matrix fusion depth tiers (default engine preset). Use `0` to match legacy depth, negative values reduce depth.
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
 - **File reading helpers**
@@ -376,10 +376,12 @@ reports it as available. Unsupported requests automatically fall back to CPU and
 notice so the run keeps going.
 
 Supplying `--decoder-presence-penalty` or `--decoder-frequency-penalty` only affects the inference
-path used by those probes (including chunk hold-outs); training statistics stay unchanged. The chosen
-values flow into the `DecoderConfig` passed to `issue_prompt()` and are emitted in the metadata block
-inside `var/eval_logs/*.json`, so repeat-penalty sweeps can be compared later without scraping the
-console logs.
+path used by those probes (including chunk hold-outs); training statistics stay unchanged. When the
+flags are omitted, `train.py` auto-tunes the penalties after each probe/hold-out using the repetition
+and structure metrics, while explicit values lock those knobs. The chosen values flow into the
+`DecoderConfig` passed to `issue_prompt()` and are emitted in the metadata block inside
+`var/eval_logs/*.json`, so repeat-penalty sweeps can be compared later without scraping the console
+logs.
 
 Low-quality generations (grammar errors ≥ 3, CoLA < 0.45, semantic similarity < 0.55, or a >40%
 length mismatch) are streamed into `DBSLM_QUALITY_QUEUE_PATH` (defaults to
@@ -496,7 +498,7 @@ python src/run.py \
 Key arguments:
 
 - `--db`: SQLite file produced by `train.py`. Paths are created on demand, but `:memory:` is rejected so runs always persist conversation history.
-- `--ngram-order`: Should match the value used during training; override only when you intentionally built a database with a different order.
+- `--ngram-order`: Should match the value used during training; set to `0` to reuse the order stored in metadata (default behavior).
 - `--context-dimensions`: Same parser as `train.py`. Override span ranges ("1-2,4-6", `off`, etc.) when you want to force different repeat penalties than the metadata stored alongside the database.
 - `--prompt`: Skip the REPL and emit a single response (great for CI hooks or quick sanity checks). When omitted, interactive mode starts.
 - `--instruction`/`--instruction-label`: Provide a system or teacher instruction that should always precede the real prompt. The CLI emits the block as ``|INSTRUCTION|: ...`` by default, matching the dataset framing.

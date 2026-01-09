@@ -184,6 +184,10 @@ class DBSLMEngine:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
         self.hot_path = build_cheetah_adapter(self.settings)
+        self.db.set_metadata("ngram_order", str(ngram_order))
+        writer = getattr(self.hot_path, "write_metadata", None)
+        if writer:
+            writer("ngram_order", str(ngram_order))
         self.context_dimensions = self._init_context_dimensions(context_dimensions)
         merge_max, merge_depth, retired_tokens = self._init_token_merging(
             token_merge_max_tokens,

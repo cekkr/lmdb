@@ -243,6 +243,9 @@ SUCCESS,key=1_deleted
     hints from every training/adversarial context and blends them into queries automatically when no
     `windows=` payload is supplied. `PREDICT_CTX key=<prefix> ctx=<base64 json> [mode=bias|scale]
     [strength=1] [table=name]` applies an immediate context bias without retraining.
+  - `PREDICT_INHERIT key=<prefix> target=<bytes> sources=<hex,...> [merge=avg|sum|max] [table=name]`
+    merges existing prediction values into a new target (for example, to seed composite/merged
+    tokens with inherited context weights).
   - `PREDICT_BACKEND [mode=cpu|gpu] [table=name]` toggles the probability merger per table, and
     `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
     current host.

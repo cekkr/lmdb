@@ -598,6 +598,126 @@ func (p *PredictionTable) SetPrediction(key []byte, value []byte, baseProb float
 	return *entry, nil
 }
 
+func (p *PredictionTable) InheritValue(
+	key []byte,
+	target []byte,
+	sources [][]byte,
+	mode string,
+) (PredictionEntry, int, error) {
+	if len(sources) == 0 {
+		return PredictionEntry{}, 0, fmt.Errorf("inherit_requires_sources")
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "avg"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.entries[encodeKey(key)]
+	if !ok || len(entry.Values) == 0 {
+		return PredictionEntry{}, 0, errPredictionEntryNotFound
+	}
+	valueMap := make(map[string]PredictionValue, len(entry.Values))
+	for _, value := range entry.Values {
+		valueMap[value.Value] = value
+	}
+	type weightAgg struct {
+		sum    []float64
+		bias   float64
+		weight float64
+	}
+	weightsByDepth := make(map[int]*weightAgg)
+	scoreSum := 0.0
+	scoreMax := 0.0
+	used := 0
+	for _, source := range sources {
+		encoded := encodeKey(source)
+		src, ok := valueMap[encoded]
+		if !ok {
+			continue
+		}
+		score := src.BaseProbability
+		if used == 0 || score > scoreMax {
+			scoreMax = score
+		}
+		scoreSum += score
+		used++
+		weight := sigmoid(score)
+		if weight <= 0 {
+			continue
+		}
+		for _, ctxWeight := range src.ContextWeights {
+			agg := weightsByDepth[ctxWeight.Depth]
+			if agg == nil {
+				agg = &weightAgg{}
+				weightsByDepth[ctxWeight.Depth] = agg
+			}
+			if len(ctxWeight.Vector) > len(agg.sum) {
+				agg.sum = append(agg.sum, make([]float64, len(ctxWeight.Vector)-len(agg.sum))...)
+			}
+			for i := 0; i < len(ctxWeight.Vector); i++ {
+				agg.sum[i] += ctxWeight.Vector[i] * weight
+			}
+			agg.bias += ctxWeight.Bias * weight
+			agg.weight += weight
+		}
+	}
+	if used == 0 {
+		return PredictionEntry{}, 0, fmt.Errorf("inherit_sources_missing")
+	}
+	mergedScore := scoreSum / float64(used)
+	switch mode {
+	case "max":
+		mergedScore = scoreMax
+	case "sum":
+		mergedScore = scoreSum
+	}
+	mergedScore = clampScore(mergedScore)
+	mergedWeights := make([]ContextWeight, 0, len(weightsByDepth))
+	depths := make([]int, 0, len(weightsByDepth))
+	for depth := range weightsByDepth {
+		depths = append(depths, depth)
+	}
+	sort.Ints(depths)
+	for _, depth := range depths {
+		agg := weightsByDepth[depth]
+		if agg == nil || agg.weight <= 0 {
+			continue
+		}
+		vector := make([]float64, len(agg.sum))
+		for i := range agg.sum {
+			vector[i] = agg.sum[i] / agg.weight
+		}
+		mergedWeights = append(mergedWeights, ContextWeight{
+			Depth:  depth,
+			Vector: vector,
+			Bias:   agg.bias / agg.weight,
+		})
+	}
+	encodedTarget := encodeKey(target)
+	found := false
+	for idx := range entry.Values {
+		if entry.Values[idx].Value == encodedTarget {
+			entry.Values[idx].BaseProbability = mergedScore
+			entry.Values[idx].ContextWeights = mergedWeights
+			entry.Values[idx].LastUpdatedEpoch = time.Now().Unix()
+			found = true
+			break
+		}
+	}
+	if !found {
+		entry.Values = append(entry.Values, PredictionValue{
+			Value:            encodedTarget,
+			BaseProbability:  mergedScore,
+			ContextWeights:   mergedWeights,
+			LastUpdatedEpoch: time.Now().Unix(),
+		})
+	}
+	entry.UpdatedAt = time.Now().UTC()
+	p.markDirtyLocked(entry.Key)
+	return *entry, used, nil
+}
+
 func (p *PredictionTable) Evaluate(key []byte, ctx ContextMatrix, windows [][]float64) ([]PredictionResult, error) {
 	deepCtx := deepenContextMatrix(ctx)
 	p.mu.RLock()

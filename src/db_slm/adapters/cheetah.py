@@ -497,6 +497,30 @@ class CheetahClient:
         response = self._command(f"PREDICT_TRAIN {' '.join(args)}")
         return (response is not None and response.startswith("SUCCESS")), response
 
+    def predict_inherit(
+        self,
+        key: bytes,
+        target: bytes,
+        sources: Sequence[bytes | str],
+        *,
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> tuple[bool, str | None]:
+        args = [f"key=x{key.hex()}", f"target=x{target.hex()}"]
+        formatted_sources: list[str] = []
+        for value in sources:
+            encoded_value = self._format_prediction_value(value)
+            if encoded_value:
+                formatted_sources.append(encoded_value)
+        if formatted_sources:
+            args.append(f"sources={','.join(formatted_sources)}")
+        if merge_mode:
+            args.append(f"merge={merge_mode}")
+        if table:
+            args.append(f"table={table}")
+        response = self._command(f"PREDICT_INHERIT {' '.join(args)}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
     def predict_query(
         self,
         *,
@@ -2015,6 +2039,39 @@ class CheetahHotPathAdapter(HotPathAdapter):
             if not success:
                 logger.warning(
                     "cheetah predict_train failed for key=%s table=%s response=%s",
+                    key,
+                    table,
+                    response,
+                )
+            return success
+        except CheetahError as exc:
+            self._disable(exc)
+            return False
+
+    def predict_inherit(
+        self,
+        *,
+        key: bytes | str,
+        target: bytes | str,
+        sources: Sequence[bytes | str],
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        key_bytes = self._ensure_bytes(key)
+        target_bytes = self._ensure_bytes(target)
+        try:
+            success, response = self._client.predict_inherit(
+                key_bytes,
+                target_bytes,
+                sources,
+                table=table,
+                merge_mode=merge_mode,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_inherit failed for key=%s table=%s response=%s",
                     key,
                     table,
                     response,

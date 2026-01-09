@@ -1542,6 +1542,8 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handlePredictQuery(args)
 	case command == "PREDICT_TRAIN":
 		response, err = db.handlePredictTrain(args)
+	case command == "PREDICT_INHERIT":
+		response, err = db.handlePredictInherit(args)
 	case command == "PREDICT_BACKEND":
 		response = db.handlePredictBackend(args)
 	case command == "PREDICT_BENCH":
@@ -2878,6 +2880,52 @@ func (db *Database) handlePredictTrain(args string) (string, error) {
 		tableName,
 		len(entry.Values),
 		learningRate,
+	), nil
+}
+
+func (db *Database) handlePredictInherit(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
+	rawKey := params["key"]
+	rawTarget := params["target"]
+	rawSources := params["sources"]
+	if rawSources == "" {
+		rawSources = params["values"]
+	}
+	if rawKey == "" || rawTarget == "" || rawSources == "" {
+		return "ERROR,predict_inherit_requires_key_target_sources", nil
+	}
+	keyBytes, err := parseValue(rawKey)
+	if err != nil {
+		return err.Error(), nil
+	}
+	targetBytes, err := parseValue(rawTarget)
+	if err != nil {
+		return err.Error(), nil
+	}
+	sources, err := parseKeyList(rawSources)
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_sources:%v", err), nil
+	}
+	if len(sources) == 0 {
+		return "ERROR,predict_inherit_requires_sources", nil
+	}
+	mergeMode := params["merge"]
+	if mergeMode == "" {
+		mergeMode = params["mode"]
+	}
+	entry, used, err := table.InheritValue(keyBytes, targetBytes, sources, mergeMode)
+	if err != nil {
+		return err.Error(), nil
+	}
+	return fmt.Sprintf(
+		"SUCCESS,table=%s,prediction_values=%d,merged_sources=%d",
+		tableName,
+		len(entry.Values),
+		used,
 	), nil
 }
 

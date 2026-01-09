@@ -198,6 +198,9 @@ matrix.
   to control aggregation, and `table=<name>` whenever multiple prediction tables coexist.
 - `PREDICT_TRAIN key=<value> target=<result> [ctx=...] [lr=0.01]` runs the recursive update loop so
   contexts fine-tune weights without rewriting payloads.
+- `PREDICT_INHERIT key=<value> target=<result> sources=<hex,...> [merge=avg|sum|max]` merges existing
+  prediction values into a new target (useful for composite token inheritance without replaying full
+  training passes).
 - `PREDICT_BACKEND [cpu|gpu]` toggles between the CPU path and the simulated WebGPU merger
   (`CHEETAH_PREDICT_MERGER=gpu` sets the default). Acceleration fans out merges across CPU cores to
   mirror WebGPU behaviour until native bindings are available.
@@ -230,6 +233,9 @@ shared byte-span before aggregating and automatically normalizes outputs.
   assemble the dependency summary, derive a context matrix, `PREDICT_SET` the next-token entry (4-byte
   ID payloads), and `PREDICT_TRAIN` the corresponding weights. `--cheetah-token-*` knobs gate the
   learning rate, cap, and table/key; `--disable-cheetah-token-train` skips the cycle entirely.
+- When token merging is active, the trainer also issues `PREDICT_INHERIT` for newly merged tokens so
+  composite entries inherit the prediction weights of their component tokens without replaying the
+  full context training loop.
 - `Decoder` and `run.py` blend those predictions back into sampling. Every response computes a
   matrix from the current conversation history, `PREDICT_QUERY` hits the configured table/key, and
   the resulting probabilities mix into the Level 1 distribution using `--cheetah-token-weight`.

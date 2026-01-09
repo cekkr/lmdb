@@ -33,8 +33,8 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--ngram-order",
         type=int,
-        default=3,
-        help="N-gram order used when the database was created (default: %(default)s).",
+        default=0,
+        help="N-gram order used when the database was created (0 = use stored metadata).",
     )
     parser.add_argument(
         "--context-dimensions",
@@ -180,6 +180,23 @@ def resolve_db_path(raw: str) -> str:
     path = Path(raw).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+def resolve_ngram_order(db_path: str, requested: int) -> int:
+    if requested and requested > 0:
+        return requested
+    try:
+        import sqlite3
+
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM tbl_metadata WHERE key = 'ngram_order'"
+            ).fetchone()
+            if row and row[0]:
+                return max(2, int(row[0]))
+    except Exception:
+        return 3
+    return 3
 
 
 def conversation_exists(engine: DBSLMEngine, conversation_id: str) -> bool:
@@ -629,9 +646,10 @@ def main() -> None:
     worker: PromptWorker | None = None
     try:
         db_path = resolve_db_path(args.db)
+        ngram_order = resolve_ngram_order(db_path, args.ngram_order)
         worker = PromptWorker(
             db_path,
-            ngram_order=args.ngram_order,
+            ngram_order=ngram_order,
             context_dimensions=context_dimensions,
             settings=settings,
             user=args.user,

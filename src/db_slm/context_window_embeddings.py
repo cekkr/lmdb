@@ -331,9 +331,13 @@ class ContextWindowEmbeddingManager:
         self.db = db
         self.hot_path = hot_path
         self.extractor = ContextWindowExtractor(self.dimensions, stride_ratio=stride_ratio)
-        self.max_train_windows = max(1, max_train_windows)
-        self.max_infer_windows = max(1, max_infer_windows)
+        self.max_train_windows = max(1, int(max_train_windows))
+        self.max_infer_windows = max(1, int(max_infer_windows))
         self.depth_bonus = int(depth_bonus)
+        self.auto_train_windows = False
+        self.auto_infer_windows = False
+        self.auto_stride_ratio = False
+        self._stride_ratio_ema = self.extractor.stride_ratio
         self._prototypes: list[ContextDimensionPrototype] = []
         self._rng = random.Random(0xCEEDA7)
         self._tag_enumerator: dict[str, int] = {}
@@ -346,9 +350,11 @@ class ContextWindowEmbeddingManager:
     def observe_corpus(self, text: str) -> None:
         if not self.enabled():
             return
+        self._maybe_auto_stride_ratio(text)
+        train_windows = 0 if self.auto_train_windows else self.max_train_windows
         snippets = self.extractor.sample(
             text,
-            windows_per_dimension=self.max_train_windows,
+            windows_per_dimension=train_windows,
             rng=self._rng,
             adaptive_windows=True,
         )
@@ -369,12 +375,15 @@ class ContextWindowEmbeddingManager:
     def weights_for_text(self, text: str) -> list[float]:
         if not self.enabled() or not text.strip():
             return [1.0 for _ in self.dimensions]
+        self._maybe_auto_stride_ratio(text)
         seed = self._seed_for_text(text)
         infer_rng = random.Random(seed)
+        infer_windows = 0 if self.auto_infer_windows else self.max_infer_windows
         snippets = self.extractor.sample(
             text,
-            windows_per_dimension=self.max_infer_windows,
+            windows_per_dimension=infer_windows,
             rng=infer_rng,
+            adaptive_windows=self.auto_infer_windows,
         )
         if not snippets:
             return [1.0 for _ in self.dimensions]
@@ -446,12 +455,15 @@ class ContextWindowEmbeddingManager:
     ) -> tuple[list[list[float]], list[float] | None]:
         if not self.enabled() or not text.strip():
             return [], None
+        self._maybe_auto_stride_ratio(text)
         seed = self._seed_for_text(text)
         infer_rng = random.Random(seed)
+        infer_windows = 0 if self.auto_infer_windows else self.max_infer_windows
         snippets = self.extractor.sample(
             text,
-            windows_per_dimension=self.max_infer_windows,
+            windows_per_dimension=infer_windows,
             rng=infer_rng,
+            adaptive_windows=self.auto_infer_windows,
         )
         if not snippets:
             return [], None
@@ -670,6 +682,10 @@ class ContextWindowEmbeddingManager:
             "model": self.embedder.model_name,
             "stride_ratio": self.extractor.stride_ratio,
             "max_train_windows": self.max_train_windows,
+            "max_infer_windows": self.max_infer_windows,
+            "auto_train_windows": self.auto_train_windows,
+            "auto_infer_windows": self.auto_infer_windows,
+            "auto_stride_ratio": self.auto_stride_ratio,
             "depth_bonus": self.depth_bonus,
             "dimensions": [proto.as_dict() for proto in self._prototypes if proto.count > 0],
         }
@@ -735,6 +751,24 @@ class ContextWindowEmbeddingManager:
         intensity = min(0.35, math.log1p(proto.count) / 15.0)
         scale = 1.0 - similarity * (0.2 + intensity)
         return max(0.5, min(1.5, scale))
+
+    def _maybe_auto_stride_ratio(self, text: str) -> None:
+        if not self.auto_stride_ratio:
+            return
+        token_count = len(text.split())
+        if token_count < 8:
+            return
+        if not self.dimensions:
+            return
+        avg_span = sum(dim.span for dim in self.dimensions) / float(len(self.dimensions))
+        target_windows = max(4, int(round(math.log1p(token_count) ** 2)))
+        candidate = token_count / (max(1.0, avg_span) * float(target_windows))
+        candidate = max(0.1, min(candidate, 1.0))
+        blended = (self._stride_ratio_ema * 0.7) + (candidate * 0.3)
+        blended = max(0.1, min(blended, 1.0))
+        self._stride_ratio_ema = blended
+        if abs(self.extractor.stride_ratio - blended) >= 0.01:
+            self.extractor.stride_ratio = blended
 
     def _cosine_similarity(self, base: Sequence[float], other: Sequence[float]) -> float:
         length = min(len(base), len(other))

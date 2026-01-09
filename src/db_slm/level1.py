@@ -151,6 +151,21 @@ class Vocabulary:
     def token_id(self, token: str) -> int:
         return self.get_or_create(token)
 
+    def lookup(self, token: str) -> int | None:
+        cached = self._text_to_id.get(token)
+        if cached is not None:
+            return cached
+        rows = self.db.query(
+            "SELECT token_id FROM tbl_l1_vocabulary WHERE token_text = ?",
+            (token,),
+        )
+        if not rows:
+            return None
+        token_id = rows[0]["token_id"]
+        self._text_to_id[token] = token_id
+        self._id_to_text[token_id] = token
+        return token_id
+
     def token_text(self, token_id: int) -> str:
         cached = self._id_to_text.get(token_id)
         if cached is not None:
@@ -550,6 +565,15 @@ class Tokenizer:
         if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
             return None
         return parts
+
+    def merged_token_parts(self, token: str) -> list[str] | None:
+        return self._parse_merged_token_parts(token)
+
+    def flattened_merged_parts(self, token: str) -> list[str] | None:
+        parts = self._parse_merged_token_parts(token)
+        if not parts:
+            return None
+        return self._flatten_merged_parts(parts)
 
     @classmethod
     def _flatten_merged_parts(cls, parts: Sequence[str]) -> List[str]:
