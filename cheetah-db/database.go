@@ -49,6 +49,7 @@ type Database struct {
 	predictStore     *PredictionManager
 	clusterMessenger *ClusterMessenger
 	reduceJobs       *reduceJobManager
+	predictJobs      *predictInheritJobManager
 }
 
 type pairTableCache struct {
@@ -212,6 +213,10 @@ func entryHasTerminal(entry []byte) bool {
 	return len(entry) > 0 && (entry[0]&FlagIsTerminal) != 0
 }
 
+func entryIsHidden(entry []byte) bool {
+	return len(entry) > 0 && (entry[0]&FlagHidden) != 0
+}
+
 func entryHasChild(entry []byte) bool {
 	if len(entry) == 0 || (entry[0]&FlagHasChild) == 0 {
 		return false
@@ -282,11 +287,16 @@ func entryIsEmpty(entry []byte) bool {
 	return (entry[0] & (FlagIsTerminal | FlagHasChild | FlagHasJump)) == 0
 }
 
-func setEntryTerminal(entry []byte, absKey uint64) {
+func setEntryTerminal(entry []byte, absKey uint64, hidden bool) {
 	if len(entry) < pairEntryKeyOffset+PairEntryKeySize {
 		return
 	}
 	entry[0] |= FlagIsTerminal
+	if hidden {
+		entry[0] |= FlagHidden
+	} else {
+		entry[0] &^= FlagHidden
+	}
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], absKey)
 	copy(entry[pairEntryKeyOffset:pairEntryKeyOffset+PairEntryKeySize], buf[8-PairEntryKeySize:])
@@ -297,6 +307,7 @@ func clearEntryTerminal(entry []byte) {
 		return
 	}
 	entry[0] &^= FlagIsTerminal
+	entry[0] &^= FlagHidden
 	for i := 0; i < PairEntryKeySize; i++ {
 		entry[pairEntryKeyOffset+i] = 0
 	}
@@ -362,6 +373,7 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		nextJumpIDPath: filepath.Join(jumpDir, "next_id.dat"),
 		forkScheduler:  newForkScheduler(path),
 		reduceJobs:     newReduceJobManager(),
+		predictJobs:    newPredictInheritJobManager(),
 	}
 	db.predictStore = newPredictionManager(path)
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
@@ -538,14 +550,14 @@ func (db *Database) closePairTable(tableID uint32, table *PairTable, deleteFile 
 	return nil
 }
 
-func (db *Database) setPairValue(value []byte, absKey uint64) error {
+func (db *Database) setPairValue(value []byte, absKey uint64, hidden bool) error {
 	if len(value) == 0 {
 		return fmt.Errorf("pair value cannot be empty")
 	}
-	return db.insertPairAt(0, value, 0, absKey)
+	return db.insertPairAt(0, value, 0, absKey, hidden)
 }
 
-func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey uint64) error {
+func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey uint64, hidden bool) error {
 	chunk, index, isLast, err := db.nextChunk(key, offset)
 	if err != nil {
 		return err
@@ -565,7 +577,7 @@ func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey 
 			return err
 		}
 		if entryHasJump(entry) {
-			if err := db.insertThroughJump(tableID, table, index, entry, key, offset+len(chunk), absKey); err != nil {
+			if err := db.insertThroughJump(tableID, table, index, entry, key, offset+len(chunk), absKey, hidden); err != nil {
 				if shouldRetryJump(err) {
 					retries++
 					continue
@@ -578,24 +590,24 @@ func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey 
 	}
 	nextOffset := offset + len(chunk)
 	if isLast {
-		setEntryTerminal(entry, absKey)
+		setEntryTerminal(entry, absKey, hidden)
 		if err := table.WriteEntry(index, entry); err != nil {
 			return err
 		}
 		return nil
 	}
 	if entryHasChild(entry) {
-		return db.insertPairAt(entryChildID(entry), key, nextOffset, absKey)
+		return db.insertPairAt(entryChildID(entry), key, nextOffset, absKey, hidden)
 	}
 	remainder := key[nextOffset:]
 	if len(remainder) == 0 {
-		setEntryTerminal(entry, absKey)
+		setEntryTerminal(entry, absKey, hidden)
 		if err := table.WriteEntry(index, entry); err != nil {
 			return err
 		}
 		return nil
 	}
-	jumpID, err := db.createJump(remainder, true, absKey, 0)
+	jumpID, err := db.createJump(remainder, true, absKey, hidden, 0)
 	if err != nil {
 		return err
 	}
@@ -606,7 +618,7 @@ func (db *Database) insertPairAt(tableID uint32, key []byte, offset int, absKey 
 	return nil
 }
 
-func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int, absKey uint64) error {
+func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchIndex uint32, entry []byte, key []byte, offset int, absKey uint64, hidden bool) error {
 	jumpID := entryJumpID(entry)
 	node, err := db.loadJump(jumpID)
 	if err != nil {
@@ -618,6 +630,7 @@ func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchI
 		offset += common
 		if offset == len(key) {
 			node.HasTerminal = true
+			node.HiddenTerminal = hidden
 			node.TerminalKey = absKey
 			return db.writeJump(node)
 		}
@@ -631,13 +644,13 @@ func (db *Database) insertThroughJump(tableID uint32, parent *PairTable, branchI
 				return err
 			}
 		}
-		return db.insertPairAt(node.NextTableID, key, offset, absKey)
+		return db.insertPairAt(node.NextTableID, key, offset, absKey, hidden)
 	}
 	childID, err := db.splitJumpIntoChild(parent, branchIndex, entry, node, common)
 	if err != nil {
 		return err
 	}
-	return db.insertPairAt(childID, key, offset+common, absKey)
+	return db.insertPairAt(childID, key, offset+common, absKey, hidden)
 }
 
 func (db *Database) splitJumpIntoChild(parent *PairTable, branchIndex uint32, entry []byte, node *JumpNode, splitOffset int) (uint32, error) {
@@ -649,7 +662,7 @@ func (db *Database) splitJumpIntoChild(parent *PairTable, branchIndex uint32, en
 	if len(remaining) == 0 {
 		return 0, fmt.Errorf("invalid jump split state")
 	}
-	if err := db.insertSuffixWithContinuation(childID, remaining, node.HasTerminal, node.TerminalKey, node.NextTableID); err != nil {
+	if err := db.insertSuffixWithContinuation(childID, remaining, node.HasTerminal, node.TerminalKey, node.HiddenTerminal, node.NextTableID); err != nil {
 		return 0, err
 	}
 	if err := db.deleteJump(node.ID); err != nil {
@@ -663,7 +676,7 @@ func (db *Database) splitJumpIntoChild(parent *PairTable, branchIndex uint32, en
 	return childID, nil
 }
 
-func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, hasTerminal bool, terminalKey uint64, nextTableID uint32) error {
+func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, hasTerminal bool, terminalKey uint64, terminalHidden bool, nextTableID uint32) error {
 	current := tableID
 	offset := 0
 	for {
@@ -682,7 +695,7 @@ func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, 
 		nextOffset := offset + len(chunk)
 		if isLast {
 			if hasTerminal {
-				setEntryTerminal(entry, terminalKey)
+				setEntryTerminal(entry, terminalKey, terminalHidden)
 			}
 			if nextTableID != 0 {
 				setEntryChild(entry, nextTableID)
@@ -697,14 +710,14 @@ func (db *Database) insertSuffixWithContinuation(tableID uint32, suffix []byte, 
 		remainder := suffix[nextOffset:]
 		if len(remainder) == 0 {
 			if hasTerminal {
-				setEntryTerminal(entry, terminalKey)
+				setEntryTerminal(entry, terminalKey, terminalHidden)
 			}
 			if nextTableID != 0 {
 				setEntryChild(entry, nextTableID)
 			}
 			return table.WriteEntry(index, entry)
 		}
-		jumpID, err := db.createJump(remainder, hasTerminal, terminalKey, nextTableID)
+		jumpID, err := db.createJump(remainder, hasTerminal, terminalKey, terminalHidden, nextTableID)
 		if err != nil {
 			return err
 		}
@@ -841,7 +854,7 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
-		if offset == targetLen && acc != nil && entryHasTerminal(entry) {
+		if offset == targetLen && acc != nil && entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			acc.add(append([]byte{}, path...), decodeAbsoluteKey(entry))
 		}
 		if entryHasJump(entry) {
@@ -866,7 +879,7 @@ func (db *Database) resolveScanPrefix(prefix []byte, acc *pairScanAccumulator) (
 				pref = append(pref, jumpBytes...)
 				offset += len(jumpBytes)
 			}
-			if offset == targetLen && acc != nil && node.HasTerminal {
+			if offset == targetLen && acc != nil && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				acc.add(append([]byte{}, path...), node.TerminalKey)
 			}
 			if node.NextTableID == 0 {
@@ -933,7 +946,7 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 		}
 		path = append(path, chunk...)
 		offset += len(chunk)
-		if offset == targetLen && entryHasTerminal(entry) {
+		if offset == targetLen && entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), decodeAbsoluteKey(entry)); err != nil {
 				return 0, path, err
 			}
@@ -960,7 +973,7 @@ func (db *Database) resolveSummaryPrefix(prefix []byte, acc *pairSummaryAccumula
 				pref = append(pref, jumpBytes...)
 				offset += len(jumpBytes)
 			}
-			if offset == targetLen && node.HasTerminal {
+			if offset == targetLen && node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				if err := db.recordSummaryTerminal(acc, append([]byte{}, path...), node.TerminalKey); err != nil {
 					return 0, path, err
 				}
@@ -1081,6 +1094,7 @@ func (db *Database) deleteWithinJump(parent *PairTable, branchIndex uint32, entr
 			return false, false, errPairNotFound
 		}
 		node.HasTerminal = false
+		node.HiddenTerminal = false
 		if !node.HasTerminal && node.NextTableID == 0 {
 			if err := db.deleteJump(node.ID); err != nil {
 				return false, false, err
@@ -1135,14 +1149,14 @@ func (db *Database) promoteChildToJump(parentTableID uint32, branchIndex uint32,
 		return nil
 	}
 	childID := entryChildID(entry)
-	path, hasTerminal, terminalKey, nextTableID, tables, jumps, ok, err := db.collectSingleBranchPath(childID)
+	path, hasTerminal, terminalHidden, terminalKey, nextTableID, tables, jumps, ok, err := db.collectSingleBranchPath(childID)
 	if err != nil || !ok {
 		return err
 	}
 	if len(path) == 0 {
 		return nil
 	}
-	jumpID, err := db.createJump(path, hasTerminal, terminalKey, nextTableID)
+	jumpID, err := db.createJump(path, hasTerminal, terminalKey, terminalHidden, nextTableID)
 	if err != nil {
 		return err
 	}
@@ -1161,13 +1175,14 @@ func (db *Database) promoteChildToJump(parentTableID uint32, branchIndex uint32,
 	return nil
 }
 
-func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint64, uint32, []uint32, []uint32, bool, error) {
+func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, bool, uint64, uint32, []uint32, []uint32, bool, error) {
 	for attempts := 0; attempts < maxJumpReloadAttempts; attempts++ {
 		current := tableID
 		path := make([]byte, 0)
 		tables := make([]uint32, 0, 4)
 		jumps := make([]uint32, 0, 2)
 		var terminal bool
+		var terminalHidden bool
 		var terminalKey uint64
 		var nextTableID uint32
 		retry := false
@@ -1175,7 +1190,7 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint6
 			tables = append(tables, current)
 			table, err := db.getPairTable(current)
 			if err != nil {
-				return nil, false, 0, 0, nil, nil, false, err
+				return nil, false, false, 0, 0, nil, nil, false, err
 			}
 			branchCount := table.BranchCount()
 			var branchEntry []byte
@@ -1184,7 +1199,7 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint6
 			for i := 0; i < branchCount; i++ {
 				e, err := table.ReadEntry(uint32(i))
 				if err != nil {
-					return nil, false, 0, 0, nil, nil, false, err
+					return nil, false, false, 0, 0, nil, nil, false, err
 				}
 				if len(e) == 0 || entryIsEmpty(e) {
 					continue
@@ -1193,20 +1208,22 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint6
 				branchEntry = e
 				branchIndex = i
 				if nonEmpty > 1 {
-					return nil, false, 0, 0, nil, nil, false, nil
+					return nil, false, false, 0, 0, nil, nil, false, nil
 				}
 			}
 			if nonEmpty == 0 {
-				return nil, false, 0, 0, nil, nil, false, nil
+				return nil, false, false, 0, 0, nil, nil, false, nil
 			}
 			chunk, ok := db.branchCodec.decode(uint32(branchIndex))
 			if !ok {
-				return nil, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
+				return nil, false, false, 0, 0, nil, nil, false, fmt.Errorf("invalid branch index %d", branchIndex)
 			}
 			path = append(path, chunk...)
 			terminal = entryHasTerminal(branchEntry)
+			terminalHidden = false
 			if terminal {
 				terminalKey = decodeAbsoluteKey(branchEntry)
+				terminalHidden = entryIsHidden(branchEntry)
 			}
 			if entryHasJump(branchEntry) {
 				jumpID := entryJumpID(branchEntry)
@@ -1216,27 +1233,28 @@ func (db *Database) collectSingleBranchPath(tableID uint32) ([]byte, bool, uint6
 						retry = true
 						break
 					}
-					return nil, false, 0, 0, nil, nil, false, err
+					return nil, false, false, 0, 0, nil, nil, false, err
 				}
 				path = append(path, node.Bytes...)
 				terminal = node.HasTerminal
 				terminalKey = node.TerminalKey
+				terminalHidden = node.HiddenTerminal && node.HasTerminal
 				nextTableID = node.NextTableID
 				jumps = append(jumps, jumpID)
-				return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
+				return path, terminal, terminalHidden, terminalKey, nextTableID, tables, jumps, true, nil
 			}
 			if entryHasChild(branchEntry) {
 				current = entryChildID(branchEntry)
 				continue
 			}
 			nextTableID = 0
-			return path, terminal, terminalKey, nextTableID, tables, jumps, true, nil
+			return path, terminal, terminalHidden, terminalKey, nextTableID, tables, jumps, true, nil
 		}
 		if retry {
 			continue
 		}
 	}
-	return nil, false, 0, 0, nil, nil, false, fmt.Errorf("jump reload limit exceeded (collect single branch table=%d)", tableID)
+	return nil, false, false, 0, 0, nil, nil, false, fmt.Errorf("jump reload limit exceeded (collect single branch table=%d)", tableID)
 }
 
 // ExecuteCommand analizza ed esegue un comando.
@@ -1340,6 +1358,27 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		response, err = db.PairSet(value, absKey)
+	case command == "PAIR_SET_HIDDEN":
+		setArgs := strings.SplitN(args, " ", 2)
+		if len(setArgs) < 2 {
+			response = "ERROR,pair_set_requires_value_and_key"
+			break
+		}
+		var value []byte
+		value, err = parseValue(setArgs[0])
+		if err != nil {
+			response = err.Error()
+			err = nil
+			break
+		}
+		var absKey uint64
+		absKey, err = strconv.ParseUint(setArgs[1], 10, 64)
+		if err != nil {
+			response = "ERROR,invalid_absolute_key_format"
+			err = nil
+			break
+		}
+		response, err = db.PairSetHidden(value, absKey)
 	case command == "PAIR_GET":
 		var value []byte
 		value, err = parseValue(args)
@@ -1369,37 +1408,23 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		var prefix []byte
-		if fields[0] != "*" {
-			prefix, err = parseValue(fields[0])
-			if err != nil {
-				response = err.Error()
-				err = nil
-				break
-			}
-		}
-		limit := 0
-		if len(fields) > 1 {
-			limit, err = strconv.Atoi(fields[1])
-			if err != nil {
-				response = "ERROR,invalid_limit"
-				err = nil
-				break
-			}
-		}
+		var limit int
 		var cursor []byte
-		if len(fields) > 2 {
-			if fields[2] != "*" {
-				cursor, err = parseValue(fields[2])
-				if err != nil {
-					response = err.Error()
-					err = nil
-					break
-				}
-			}
+		var includeHidden bool
+		var errResp string
+		var parseErr error
+		prefix, limit, cursor, includeHidden, errResp, parseErr = parsePairScanArgs(fields)
+		if errResp != "" {
+			response = errResp
+			break
+		}
+		if parseErr != nil {
+			err = parseErr
+			break
 		}
 		var results []PairScanResult
 		var nextCursor []byte
-		results, nextCursor, err = db.PairScan(prefix, limit, cursor)
+		results, nextCursor, err = db.PairScanWithOptions(prefix, limit, cursor, includeHidden)
 		if err != nil {
 			response = ""
 			break
@@ -1446,7 +1471,7 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		fields := strings.Fields(args)
-		mode, prefix, limit, cursor, errResp, parseErr := parsePairReduceArgs(fields)
+		mode, prefix, limit, cursor, includeHidden, errResp, parseErr := parsePairReduceArgs(fields)
 		if errResp != "" {
 			response = errResp
 			break
@@ -1455,14 +1480,14 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			err = parseErr
 			break
 		}
-		response, err = db.handlePairReduce(mode, prefix, limit, cursor)
+		response, err = db.handlePairReduce(mode, prefix, limit, cursor, includeHidden)
 	case command == "PAIR_REDUCE_ASYNC":
 		if args == "" {
 			response = "ERROR,pair_reduce_requires_args"
 			break
 		}
 		fields := strings.Fields(args)
-		mode, prefix, limit, cursor, errResp, parseErr := parsePairReduceArgs(fields)
+		mode, prefix, limit, cursor, includeHidden, errResp, parseErr := parsePairReduceArgs(fields)
 		if errResp != "" {
 			response = errResp
 			break
@@ -1471,7 +1496,7 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			err = parseErr
 			break
 		}
-		response, err = db.handleAsyncReduce(mode, prefix, limit, cursor)
+		response, err = db.handleAsyncReduce(mode, prefix, limit, cursor, includeHidden)
 	case command == "PAIR_REDUCE_FETCH":
 		jobID := strings.TrimSpace(args)
 		if jobID == "" {
@@ -1497,34 +1522,22 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 			break
 		}
 		var prefix []byte
-		if fields[0] != "*" {
-			prefix, err = parseValue(fields[0])
-			if err != nil {
-				response = err.Error()
-				err = nil
-				break
-			}
+		var depth int
+		var branchLimit int
+		var includeHidden bool
+		var errResp string
+		var parseErr error
+		prefix, depth, branchLimit, includeHidden, errResp, parseErr = parsePairSummaryArgs(fields)
+		if errResp != "" {
+			response = errResp
+			break
 		}
-		depth := pairSummaryDefaultDepth
-		if len(fields) > 1 {
-			depth, err = strconv.Atoi(fields[1])
-			if err != nil {
-				response = "ERROR,invalid_depth"
-				err = nil
-				break
-			}
-		}
-		branchLimit := pairSummaryDefaultBranchLimit
-		if len(fields) > 2 {
-			branchLimit, err = strconv.Atoi(fields[2])
-			if err != nil {
-				response = "ERROR,invalid_branch_limit"
-				err = nil
-				break
-			}
+		if parseErr != nil {
+			err = parseErr
+			break
 		}
 		var summary *PairSummaryResult
-		summary, err = db.PairSummary(prefix, depth, branchLimit)
+		summary, err = db.PairSummaryWithOptions(prefix, depth, branchLimit, includeHidden)
 		if err != nil {
 			response = ""
 			break
@@ -1544,6 +1557,14 @@ func (db *Database) ExecuteCommand(line string) (string, error) {
 		response, err = db.handlePredictTrain(args)
 	case command == "PREDICT_INHERIT":
 		response, err = db.handlePredictInherit(args)
+	case command == "PREDICT_INHERIT_BATCH":
+		response, err = db.handlePredictInheritBatch(args)
+	case command == "PREDICT_INHERIT_ASYNC":
+		response, err = db.handlePredictInheritAsync(args)
+	case command == "PREDICT_INHERIT_FETCH":
+		response = db.handlePredictInheritFetch(args)
+	case command == "PREDICT_INHERIT_STATUS":
+		response = db.handlePredictInheritStatus(args)
 	case command == "PREDICT_BACKEND":
 		response = db.handlePredictBackend(args)
 	case command == "PREDICT_BENCH":
@@ -1608,9 +1629,13 @@ func (db *Database) deletePairTable(tableID uint32) error {
 }
 
 func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairScanResult, []byte, error) {
+	return db.PairScanWithOptions(prefix, limit, cursor, false)
+}
+
+func (db *Database) PairScanWithOptions(prefix []byte, limit int, cursor []byte, includeHidden bool) ([]PairScanResult, []byte, error) {
 	limit = normalizePairScanLimit(limit)
 	db.observeFork(prefix)
-	acc := newPairScanAccumulator(limit, cursor)
+	acc := newPairScanAccumulator(limit, cursor, includeHidden)
 	startTable := uint32(0)
 	expandedPrefix := append([]byte{}, prefix...)
 	if len(prefix) > 0 {
@@ -1640,6 +1665,10 @@ func (db *Database) PairScan(prefix []byte, limit int, cursor []byte) ([]PairSca
 }
 
 func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) (*PairSummaryResult, error) {
+	return db.PairSummaryWithOptions(prefix, depthLimit, branchLimit, false)
+}
+
+func (db *Database) PairSummaryWithOptions(prefix []byte, depthLimit int, branchLimit int, includeHidden bool) (*PairSummaryResult, error) {
 	db.observeFork(prefix)
 	if depthLimit < 0 {
 		depthLimit = -1
@@ -1650,7 +1679,7 @@ func (db *Database) PairSummary(prefix []byte, depthLimit int, branchLimit int) 
 	if branchLimit > pairSummaryMaxBranchLimit {
 		branchLimit = pairSummaryMaxBranchLimit
 	}
-	acc := newPairSummaryAccumulator(prefix, depthLimit, branchLimit)
+	acc := newPairSummaryAccumulator(prefix, depthLimit, branchLimit, includeHidden)
 	startTable := uint32(0)
 	expandedPrefix := append([]byte{}, prefix...)
 	if len(prefix) > 0 {
@@ -1717,6 +1746,7 @@ type pairSummaryAccumulator struct {
 	prefix       []byte
 	depthLimit   int
 	branchLimit  int
+	includeHidden bool
 	mu           sync.Mutex
 	branches     map[string]*pairSummaryBranch
 	terminalCnt  int64
@@ -1732,23 +1762,26 @@ type pairSummaryAccumulator struct {
 type pairScanAccumulator struct {
 	cursor  []byte
 	limit   int
+	includeHidden bool
 	mu      sync.Mutex
 	results []PairScanResult
 	count   atomic.Int64
 }
 
-func newPairScanAccumulator(limit int, cursor []byte) *pairScanAccumulator {
+func newPairScanAccumulator(limit int, cursor []byte, includeHidden bool) *pairScanAccumulator {
 	return &pairScanAccumulator{
 		cursor: append([]byte{}, cursor...),
 		limit:  limit,
+		includeHidden: includeHidden,
 	}
 }
 
-func newPairSummaryAccumulator(prefix []byte, depthLimit int, branchLimit int) *pairSummaryAccumulator {
+func newPairSummaryAccumulator(prefix []byte, depthLimit int, branchLimit int, includeHidden bool) *pairSummaryAccumulator {
 	return &pairSummaryAccumulator{
 		prefix:      append([]byte{}, prefix...),
 		depthLimit:  depthLimit,
 		branchLimit: branchLimit,
+		includeHidden: includeHidden,
 		branches:    make(map[string]*pairSummaryBranch),
 	}
 }
@@ -1797,6 +1830,10 @@ func (a *pairSummaryAccumulator) recordTerminal(path []byte, key uint64, payload
 	bucket.Count++
 }
 
+func (a *pairSummaryAccumulator) shouldInclude(hidden bool) bool {
+	return a.includeHidden || !hidden
+}
+
 func (a *pairSummaryAccumulator) finalize() *PairSummaryResult {
 	branches := make([]pairSummaryBranch, 0, len(a.branches))
 	for _, branch := range a.branches {
@@ -1835,6 +1872,10 @@ func (a *pairScanAccumulator) add(value []byte, key uint64) bool {
 	a.mu.Unlock()
 	a.count.Add(1)
 	return a.shouldStop()
+}
+
+func (a *pairScanAccumulator) shouldInclude(hidden bool) bool {
+	return a.includeHidden || !hidden
 }
 
 func (a *pairScanAccumulator) shouldStop() bool {
@@ -2018,7 +2059,7 @@ func (db *Database) walkPairSummary(
 			continue
 		}
 		value := append(append([]byte{}, task.path...), chunk...)
-		if entryHasTerminal(entry) {
+		if entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			key := decodeAbsoluteKey(entry)
 			if key != 0 {
 				if err := db.recordSummaryTerminal(acc, value, key); err != nil {
@@ -2036,7 +2077,7 @@ func (db *Database) walkPairSummary(
 		}
 		if entryHasJump(entry) {
 			extended := append(append([]byte{}, value...), node.Bytes...)
-			if node.HasTerminal {
+			if node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				if err := db.recordSummaryTerminal(acc, extended, node.TerminalKey); err != nil {
 					return err
 				}
@@ -2146,7 +2187,7 @@ func (db *Database) walkPairTable(
 				continue
 			}
 		}
-		if entryHasTerminal(entry) {
+		if entryHasTerminal(entry) && acc.shouldInclude(entryIsHidden(entry)) {
 			if acc.add(value, decodeAbsoluteKey(entry)) && abort != nil && acc.limit > 0 {
 				abort.Store(true)
 				return nil
@@ -2154,7 +2195,7 @@ func (db *Database) walkPairTable(
 		}
 		if entryHasJump(entry) {
 			extended := append(append([]byte{}, value...), node.Bytes...)
-			if node.HasTerminal {
+			if node.HasTerminal && acc.shouldInclude(node.HiddenTerminal) {
 				if acc.add(extended, node.TerminalKey) && abort != nil && acc.limit > 0 {
 					abort.Store(true)
 					return nil
@@ -2188,9 +2229,28 @@ func (db *Database) walkPairTable(
 	return nil
 }
 
-func parsePairReduceArgs(fields []string) (string, []byte, int, []byte, string, error) {
+func parsePairScanArgs(fields []string) ([]byte, int, []byte, bool, string, error) {
+	if len(fields) < 1 {
+		return nil, 0, nil, false, "ERROR,pair_scan_requires_prefix", nil
+	}
+	var prefix []byte
+	var err error
+	if fields[0] != "*" {
+		prefix, err = parseValue(fields[0])
+		if err != nil {
+			return nil, 0, nil, false, err.Error(), nil
+		}
+	}
+	limit, cursor, includeHidden, errResp, parseErr := parsePairScanOptions(fields[1:])
+	if errResp != "" || parseErr != nil {
+		return nil, 0, nil, false, errResp, parseErr
+	}
+	return prefix, limit, cursor, includeHidden, "", nil
+}
+
+func parsePairReduceArgs(fields []string) (string, []byte, int, []byte, bool, string, error) {
 	if len(fields) < 2 {
-		return "", nil, 0, nil, "ERROR,pair_reduce_requires_mode_and_prefix", nil
+		return "", nil, 0, nil, false, "ERROR,pair_reduce_requires_mode_and_prefix", nil
 	}
 	mode := strings.ToLower(fields[0])
 	var prefix []byte
@@ -2198,33 +2258,156 @@ func parsePairReduceArgs(fields []string) (string, []byte, int, []byte, string, 
 	if fields[1] != "*" {
 		prefix, err = parseValue(fields[1])
 		if err != nil {
-			return "", nil, 0, nil, err.Error(), nil
+			return "", nil, 0, nil, false, err.Error(), nil
 		}
 	}
-	limit := 0
-	if len(fields) > 2 && strings.TrimSpace(fields[2]) != "" {
-		limit, err = strconv.Atoi(fields[2])
-		if err != nil {
-			return "", nil, 0, nil, "ERROR,invalid_limit", nil
-		}
+	limit, cursor, includeHidden, errResp, parseErr := parsePairScanOptions(fields[2:])
+	if errResp != "" || parseErr != nil {
+		return "", nil, 0, nil, false, errResp, parseErr
 	}
-	var cursor []byte
-	if len(fields) > 3 {
-		cursorField := strings.TrimSpace(fields[3])
-		if cursorField != "" && cursorField != "*" {
-			cursor, err = parseValue(cursorField)
-			if err != nil {
-				return "", nil, 0, nil, err.Error(), nil
-			}
-		}
-	}
-	return mode, prefix, limit, cursor, "", nil
+	return mode, prefix, limit, cursor, includeHidden, "", nil
 }
 
-func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {
+func parsePairScanOptions(fields []string) (int, []byte, bool, string, error) {
+	limit := 0
+	var cursor []byte
+	includeHidden := false
+	limitSet := false
+	cursorSet := false
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if strings.Contains(field, "=") {
+			key, val, _ := strings.Cut(field, "=")
+			key = strings.ToLower(strings.TrimSpace(key))
+			val = strings.TrimSpace(val)
+			switch key {
+			case "limit":
+				parsed, err := strconv.Atoi(val)
+				if err != nil {
+					return 0, nil, false, "ERROR,invalid_limit", nil
+				}
+				limit = parsed
+				limitSet = true
+			case "cursor":
+				if val != "" && val != "*" {
+					parsed, err := parseValue(val)
+					if err != nil {
+						return 0, nil, false, err.Error(), nil
+					}
+					cursor = parsed
+				}
+				cursorSet = true
+			case "include_hidden", "includehidden", "hidden", "show_hidden":
+				includeHidden = parseBoolFlag(val)
+			}
+			continue
+		}
+		if !limitSet {
+			parsed, err := strconv.Atoi(field)
+			if err != nil {
+				return 0, nil, false, "ERROR,invalid_limit", nil
+			}
+			limit = parsed
+			limitSet = true
+			continue
+		}
+		if !cursorSet {
+			if field != "*" {
+				parsed, err := parseValue(field)
+				if err != nil {
+					return 0, nil, false, err.Error(), nil
+				}
+				cursor = parsed
+			}
+			cursorSet = true
+		}
+	}
+	return limit, cursor, includeHidden, "", nil
+}
+
+func parsePairSummaryArgs(fields []string) ([]byte, int, int, bool, string, error) {
+	if len(fields) < 1 {
+		return nil, 0, 0, false, "ERROR,pair_summary_requires_prefix", nil
+	}
+	var prefix []byte
+	var err error
+	if fields[0] != "*" {
+		prefix, err = parseValue(fields[0])
+		if err != nil {
+			return nil, 0, 0, false, err.Error(), nil
+		}
+	}
+	depth := pairSummaryDefaultDepth
+	branchLimit := pairSummaryDefaultBranchLimit
+	includeHidden := false
+	depthSet := false
+	branchSet := false
+	for _, field := range fields[1:] {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if strings.Contains(field, "=") {
+			key, val, _ := strings.Cut(field, "=")
+			key = strings.ToLower(strings.TrimSpace(key))
+			val = strings.TrimSpace(val)
+			switch key {
+			case "depth":
+				parsed, err := strconv.Atoi(val)
+				if err != nil {
+					return nil, 0, 0, false, "ERROR,invalid_depth", nil
+				}
+				depth = parsed
+				depthSet = true
+			case "branch_limit", "branchlimit":
+				parsed, err := strconv.Atoi(val)
+				if err != nil {
+					return nil, 0, 0, false, "ERROR,invalid_branch_limit", nil
+				}
+				branchLimit = parsed
+				branchSet = true
+			case "include_hidden", "includehidden", "hidden", "show_hidden":
+				includeHidden = parseBoolFlag(val)
+			}
+			continue
+		}
+		if !depthSet {
+			parsed, err := strconv.Atoi(field)
+			if err != nil {
+				return nil, 0, 0, false, "ERROR,invalid_depth", nil
+			}
+			depth = parsed
+			depthSet = true
+			continue
+		}
+		if !branchSet {
+			parsed, err := strconv.Atoi(field)
+			if err != nil {
+				return nil, 0, 0, false, "ERROR,invalid_branch_limit", nil
+			}
+			branchLimit = parsed
+			branchSet = true
+		}
+	}
+	return prefix, depth, branchLimit, includeHidden, "", nil
+}
+
+func parseBoolFlag(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (string, error) {
 	switch mode {
 	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, nil)
+		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, includeHidden, nil)
 		if err != nil {
 			return "", err
 		}
@@ -2234,8 +2417,8 @@ func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, curs
 	}
 }
 
-func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, progress func(done int, total int)) ([]PairReduceResult, []byte, error) {
-	scanResults, nextCursor, err := db.PairScan(prefix, limit, cursor)
+func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, includeHidden bool, progress func(done int, total int)) ([]PairReduceResult, []byte, error) {
+	scanResults, nextCursor, err := db.PairScanWithOptions(prefix, limit, cursor, includeHidden)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2334,14 +2517,14 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, p
 	return reduced, nextCursor, nil
 }
 
-func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, cursor []byte) (*reduceJob, error) {
+func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (*reduceJob, error) {
 	if db.reduceJobs == nil {
 		return nil, fmt.Errorf("async reducer unavailable")
 	}
 	job := db.reduceJobs.newJob(mode)
 	go func(j *reduceJob) {
 		j.markRunning()
-		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, func(done int, total int) {
+		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, includeHidden, func(done int, total int) {
 			j.updateProgress(done, total)
 		})
 		if err != nil {
@@ -2353,10 +2536,10 @@ func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, 
 	return job, nil
 }
 
-func (db *Database) handleAsyncReduce(mode string, prefix []byte, limit int, cursor []byte) (string, error) {
+func (db *Database) handleAsyncReduce(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (string, error) {
 	switch mode {
 	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor)
+		job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor, includeHidden)
 		if err != nil {
 			return "", err
 		}
@@ -2929,6 +3112,327 @@ func (db *Database) handlePredictInherit(args string) (string, error) {
 	), nil
 }
 
+type predictInheritSpec struct {
+	Key     string   `json:"key"`
+	Target  string   `json:"target"`
+	Sources []string `json:"sources"`
+	Merge   string   `json:"merge,omitempty"`
+	Mode    string   `json:"mode,omitempty"`
+}
+
+type predictInheritRequest struct {
+	Key       []byte
+	Target    []byte
+	Sources   [][]byte
+	MergeMode string
+}
+
+type inheritResult struct {
+	merged  int
+	skipped int
+	failed  int
+}
+
+func (db *Database) handlePredictInheritBatch(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
+	requests, defaultMerge, err := parsePredictInheritBatchPayload(params)
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_predict_inherit_batch:%v", err), nil
+	}
+	if len(requests) == 0 {
+		return "ERROR,predict_inherit_batch_empty", nil
+	}
+	merged, skipped, failed := db.runPredictInheritBatch(table, requests, defaultMerge, nil)
+	return fmt.Sprintf(
+		"SUCCESS,table=%s,merged=%d,skipped=%d,failed=%d,total=%d",
+		tableName,
+		merged,
+		skipped,
+		failed,
+		len(requests),
+	), nil
+}
+
+func (db *Database) handlePredictInheritAsync(args string) (string, error) {
+	params := parseKeyValueArgs(args)
+	table, tableName, err := db.getPredictionTableFromParams(params)
+	if err != nil {
+		return "", err
+	}
+	requests, defaultMerge, err := parsePredictInheritBatchPayload(params)
+	if err != nil {
+		return fmt.Sprintf("ERROR,invalid_predict_inherit_batch:%v", err), nil
+	}
+	if len(requests) == 0 {
+		return "ERROR,predict_inherit_batch_empty", nil
+	}
+	job, err := db.submitPredictInheritJob(table, tableName, requests, defaultMerge)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,table=%s,job=%s,state=queued,total=%d", tableName, job.id, len(requests)), nil
+}
+
+func (db *Database) handlePredictInheritStatus(args string) string {
+	jobID := strings.TrimSpace(args)
+	if jobID == "" {
+		return "ERROR,missing_job_id"
+	}
+	if db.predictJobs == nil {
+		return "ERROR,async_inherit_unavailable"
+	}
+	job := db.predictJobs.getJob(jobID)
+	if job == nil {
+		return "ERROR,predict_inherit_job_not_found"
+	}
+	state, total, completed, merged, skipped, failed, err := job.statusSnapshot()
+	progress := job.progressPercent()
+	if state == predictJobFailed && err != nil {
+		return fmt.Sprintf("ERROR,job_failed:%v", err)
+	}
+	return fmt.Sprintf(
+		"SUCCESS,job=%s,state=%s,progress=%.2f,completed=%d,total=%d,merged=%d,skipped=%d,failed=%d",
+		jobID,
+		job.stateString(),
+		progress,
+		completed,
+		total,
+		merged,
+		skipped,
+		failed,
+	)
+}
+
+func (db *Database) handlePredictInheritFetch(args string) string {
+	jobID := strings.TrimSpace(args)
+	if jobID == "" {
+		return "ERROR,missing_job_id"
+	}
+	if db.predictJobs == nil {
+		return "ERROR,async_inherit_unavailable"
+	}
+	job := db.predictJobs.getJob(jobID)
+	if job == nil {
+		return "ERROR,predict_inherit_job_not_found"
+	}
+	state, total, completed, merged, skipped, failed, err := job.statusSnapshot()
+	switch state {
+	case predictJobCompleted:
+		db.predictJobs.deleteJob(jobID)
+		return fmt.Sprintf(
+			"SUCCESS,job=%s,merged=%d,skipped=%d,failed=%d,total=%d",
+			jobID,
+			merged,
+			skipped,
+			failed,
+			total,
+		)
+	case predictJobFailed:
+		db.predictJobs.deleteJob(jobID)
+		if err != nil {
+			return fmt.Sprintf("ERROR,job_failed:%v", err)
+		}
+		return "ERROR,job_failed"
+	default:
+		progress := job.progressPercent()
+		return fmt.Sprintf(
+			"PENDING,job=%s,state=%s,progress=%.2f,completed=%d,total=%d,merged=%d,skipped=%d,failed=%d",
+			jobID,
+			job.stateString(),
+			progress,
+			completed,
+			total,
+			merged,
+			skipped,
+			failed,
+		)
+	}
+}
+
+func parsePredictInheritBatchPayload(params map[string]string) ([]predictInheritRequest, string, error) {
+	payload := params["items"]
+	if payload == "" {
+		payload = params["batch"]
+	}
+	if payload == "" {
+		payload = params["payload"]
+	}
+	if payload == "" {
+		return nil, "", fmt.Errorf("predict_inherit_batch_requires_items")
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	var specs []predictInheritSpec
+	if err := json.Unmarshal(data, &specs); err != nil {
+		return nil, "", err
+	}
+	defaultKey := strings.TrimSpace(params["key"])
+	defaultMerge := strings.TrimSpace(params["merge"])
+	if defaultMerge == "" {
+		defaultMerge = strings.TrimSpace(params["mode"])
+	}
+	requests := make([]predictInheritRequest, 0, len(specs))
+	for _, spec := range specs {
+		keyValue := strings.TrimSpace(spec.Key)
+		if keyValue == "" {
+			keyValue = defaultKey
+		}
+		if keyValue == "" {
+			return nil, "", fmt.Errorf("missing_key")
+		}
+		targetValue := strings.TrimSpace(spec.Target)
+		if targetValue == "" {
+			return nil, "", fmt.Errorf("missing_target")
+		}
+		if len(spec.Sources) == 0 {
+			return nil, "", fmt.Errorf("missing_sources")
+		}
+		keyBytes, err := parseValue(keyValue)
+		if err != nil {
+			return nil, "", err
+		}
+		targetBytes, err := parseValue(targetValue)
+		if err != nil {
+			return nil, "", err
+		}
+		sources := make([][]byte, 0, len(spec.Sources))
+		for _, rawSource := range spec.Sources {
+			sourceValue := strings.TrimSpace(rawSource)
+			if sourceValue == "" {
+				continue
+			}
+			srcBytes, err := parseValue(sourceValue)
+			if err != nil {
+				return nil, "", err
+			}
+			sources = append(sources, srcBytes)
+		}
+		if len(sources) == 0 {
+			return nil, "", fmt.Errorf("missing_sources")
+		}
+		mergeMode := strings.TrimSpace(spec.Merge)
+		if mergeMode == "" {
+			mergeMode = strings.TrimSpace(spec.Mode)
+		}
+		if mergeMode == "" {
+			mergeMode = defaultMerge
+		}
+		requests = append(requests, predictInheritRequest{
+			Key:       keyBytes,
+			Target:    targetBytes,
+			Sources:   sources,
+			MergeMode: mergeMode,
+		})
+	}
+	return requests, defaultMerge, nil
+}
+
+func (db *Database) submitPredictInheritJob(
+	table *PredictionTable,
+	tableName string,
+	requests []predictInheritRequest,
+	defaultMerge string,
+) (*predictInheritJob, error) {
+	if db.predictJobs == nil {
+		return nil, fmt.Errorf("async_inherit_unavailable")
+	}
+	job := db.predictJobs.newJob(tableName, len(requests))
+	go func(j *predictInheritJob) {
+		j.markRunning()
+		db.runPredictInheritBatch(table, requests, defaultMerge, func(res inheritResult) {
+			j.recordResult(res.merged, res.skipped, res.failed)
+		})
+		j.markCompleted()
+	}(job)
+	return job, nil
+}
+
+func (db *Database) runPredictInheritBatch(
+	table *PredictionTable,
+	requests []predictInheritRequest,
+	defaultMerge string,
+	progress func(inheritResult),
+) (int, int, int) {
+	if table == nil || len(requests) == 0 {
+		return 0, 0, 0
+	}
+	workerCount := 1
+	if db.resources != nil {
+		if recommended := db.resources.RecommendedWorkers(len(requests)); recommended > 0 {
+			workerCount = recommended
+		}
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(requests) {
+		workerCount = len(requests)
+	}
+	jobs := make(chan predictInheritRequest, workerCount)
+	results := make(chan inheritResult, workerCount)
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for req := range jobs {
+			mode := req.MergeMode
+			if mode == "" {
+				mode = defaultMerge
+			}
+			_, _, err := table.InheritValue(req.Key, req.Target, req.Sources, mode)
+			if err == nil {
+				results <- inheritResult{merged: 1}
+				continue
+			}
+			if isPredictInheritSkipError(err) {
+				results <- inheritResult{skipped: 1}
+				continue
+			}
+			results <- inheritResult{failed: 1}
+		}
+	}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for _, req := range requests {
+		jobs <- req
+	}
+	close(jobs)
+	merged := 0
+	skipped := 0
+	failed := 0
+	for res := range results {
+		merged += res.merged
+		skipped += res.skipped
+		failed += res.failed
+		if progress != nil {
+			progress(res)
+		}
+	}
+	return merged, skipped, failed
+}
+
+func isPredictInheritSkipError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errPredictionEntryNotFound) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "inherit_sources_missing") || strings.Contains(msg, "inherit_requires_sources")
+}
+
 func (db *Database) handlePredictBackend(args string) string {
 	params := parseKeyValueArgs(args)
 	table, tableName, err := db.getPredictionTableFromParams(params)
@@ -3302,7 +3806,7 @@ func (db *Database) applyForkTransferPayload(payload *forkTransferPayload) error
 		if err != nil {
 			return err
 		}
-		if err := db.setPairValue(pathBytes, key); err != nil {
+		if err := db.setPairValue(pathBytes, key, false); err != nil {
 			return err
 		}
 	}

@@ -140,6 +140,16 @@ class HotPathAdapter(Protocol):
     ) -> bool:
         """Inherit prediction weights from existing values (PREDICT_INHERIT)."""
 
+    def predict_inherit_batch(
+        self,
+        *,
+        key: bytes | str,
+        items: Sequence[dict[str, object]],
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> bool:
+        """Batch inherit prediction weights (PREDICT_INHERIT_BATCH/ASYNC)."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -263,6 +273,16 @@ class NullHotPathAdapter:
         key: bytes | str,
         target: bytes | str,
         sources: Sequence[bytes | str],
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> bool:
+        return False
+
+    def predict_inherit_batch(
+        self,
+        *,
+        key: bytes | str,
+        items: Sequence[dict[str, object]],
         table: str | None = None,
         merge_mode: str | None = None,
     ) -> bool:

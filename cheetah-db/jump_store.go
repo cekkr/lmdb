@@ -15,6 +15,7 @@ type JumpNode struct {
 	ID          uint32
 	Bytes       []byte
 	HasTerminal bool
+	HiddenTerminal bool
 	TerminalKey uint64
 	NextTableID uint32
 }
@@ -41,7 +42,7 @@ func (db *Database) getNewJumpID() (uint32, error) {
 	return newID, os.WriteFile(db.nextJumpIDPath, buf, 0644)
 }
 
-func (db *Database) createJump(bytes []byte, hasTerminal bool, terminalKey uint64, nextTableID uint32) (uint32, error) {
+func (db *Database) createJump(bytes []byte, hasTerminal bool, terminalKey uint64, terminalHidden bool, nextTableID uint32) (uint32, error) {
 	if len(bytes) == 0 {
 		return 0, fmt.Errorf("cannot create jump for empty path")
 	}
@@ -53,6 +54,7 @@ func (db *Database) createJump(bytes []byte, hasTerminal bool, terminalKey uint6
 		ID:          id,
 		Bytes:       append([]byte{}, bytes...),
 		HasTerminal: hasTerminal,
+		HiddenTerminal: terminalHidden && hasTerminal,
 		TerminalKey: terminalKey,
 		NextTableID: nextTableID,
 	}
@@ -175,6 +177,9 @@ func (db *Database) writeJumpLocked(node *JumpNode) error {
 	if node.HasTerminal {
 		flags |= 0x01
 	}
+	if node.HiddenTerminal {
+		flags |= 0x04
+	}
 	if node.NextTableID != 0 {
 		flags |= 0x02
 	}
@@ -285,6 +290,7 @@ func (db *Database) loadJumpFromLegacyFileLocked(id uint32) (*JumpNode, error) {
 		ID:          id,
 		Bytes:       bytes,
 		HasTerminal: (flags & 0x01) != 0,
+		HiddenTerminal: (flags & 0x04) != 0,
 		TerminalKey: terminalKey,
 		NextTableID: nextTableID,
 	}, nil
@@ -359,6 +365,7 @@ func decodeJumpAt(reader io.ReaderAt, offset int64, id uint32) (*JumpNode, error
 		ID:          id,
 		Bytes:       bytes,
 		HasTerminal: (flags & 0x01) != 0,
+		HiddenTerminal: (flags & 0x04) != 0,
 		TerminalKey: terminalKey,
 		NextTableID: nextTableID,
 	}, nil

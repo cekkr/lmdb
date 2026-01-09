@@ -737,7 +737,12 @@ def _purge_cheetah_namespace(
     scan_failures = 0
     shrink_logged = False
     while True:
-        result = client.pair_scan(prefix=prefix, limit=current_page_size, cursor=cursor)
+        result = client.pair_scan(
+            prefix=prefix,
+            limit=current_page_size,
+            cursor=cursor,
+            include_hidden=True,
+        )
         if result is None:
             scan_failures += 1
             if current_page_size > _CHEETAH_PURGE_MIN_PAGE_SIZE:
@@ -1023,7 +1028,11 @@ def _inherit_merged_token_predictions(
     if getattr(engine, "token_merge_max_tokens", 0) <= 1:
         return
     predict_inherit = getattr(engine.hot_path, "predict_inherit", None)
-    if not callable(predict_inherit) or isinstance(engine.hot_path, NullHotPathAdapter):
+    predict_inherit_batch = getattr(engine.hot_path, "predict_inherit_batch", None)
+    if (
+        (not callable(predict_inherit) and not callable(predict_inherit_batch))
+        or isinstance(engine.hot_path, NullHotPathAdapter)
+    ):
         return
     table = (getattr(args, "cheetah_token_table", None) or "token_predictions").strip()
     key_label = (getattr(args, "cheetah_token_key", None) or "meta:token_predictions").strip()
@@ -1038,8 +1047,11 @@ def _inherit_merged_token_predictions(
     scan_cursor = int(getattr(engine, "_merge_inherit_cursor", 0))
     updates = 0
     skipped = 0
+    batch_requests: list[tuple[int, list[bytes]]] = []
+    batch_items: list[dict[str, object]] = []
+    batch_tokens: set[int] = set()
 
-    def _process_token(token_id: int, token_text: str) -> bool:
+    def _queue_token(token_id: int, token_text: str) -> bool:
         parts = engine.tokenizer.flattened_merged_parts(token_text)
         if not parts or len(parts) < 2:
             return True
@@ -1051,27 +1063,20 @@ def _inherit_merged_token_predictions(
             source_ids.append(part_id)
         if len(source_ids) < 2:
             return True
-        if token_id in inherited_tokens:
+        if token_id in inherited_tokens or token_id in batch_tokens:
             return True
-        success = predict_inherit(
-            key=key_bytes,
-            target=_encode_prediction_token(token_id),
-            sources=[_encode_prediction_token(part_id) for part_id in source_ids],
-            table=table,
-            merge_mode="avg",
+        sources_bytes = [_encode_prediction_token(part_id) for part_id in source_ids]
+        batch_items.append(
+            {"target": _encode_prediction_token(token_id), "sources": sources_bytes}
         )
-        if success:
-            inherited_tokens.add(token_id)
-            seeded_tokens.add(token_id)
-            nonlocal updates
-            updates += 1
-            return True
-        return False
+        batch_requests.append((token_id, sources_bytes))
+        batch_tokens.add(token_id)
+        return True
 
     if pending_tokens:
         for token_id in list(pending_tokens)[:_MERGE_INHERIT_PENDING_LIMIT]:
             token_text = engine.vocab.token_text(token_id)
-            if _process_token(token_id, token_text):
+            if _queue_token(token_id, token_text):
                 pending_tokens.discard(token_id)
             else:
                 skipped += 1
@@ -1092,12 +1097,50 @@ def _inherit_merged_token_predictions(
         scan_cursor = max(scan_cursor, token_id)
         if token_id in inherited_tokens:
             continue
-        if _process_token(token_id, token_text):
+        if _queue_token(token_id, token_text):
             continue
         if len(pending_tokens) < _MERGE_INHERIT_PENDING_CAP:
             pending_tokens.add(token_id)
         else:
             skipped += 1
+
+    if batch_items:
+        batch_success = False
+        if callable(predict_inherit_batch):
+            batch_success = predict_inherit_batch(
+                key=key_bytes,
+                items=batch_items,
+                table=table,
+                merge_mode="avg",
+            )
+        if batch_success:
+            for token_id, _sources in batch_requests:
+                inherited_tokens.add(token_id)
+                seeded_tokens.add(token_id)
+            updates += len(batch_requests)
+        elif callable(predict_inherit):
+            for token_id, sources in batch_requests:
+                success = predict_inherit(
+                    key=key_bytes,
+                    target=_encode_prediction_token(token_id),
+                    sources=sources,
+                    table=table,
+                    merge_mode="avg",
+                )
+                if success:
+                    inherited_tokens.add(token_id)
+                    seeded_tokens.add(token_id)
+                    updates += 1
+                elif len(pending_tokens) < _MERGE_INHERIT_PENDING_CAP:
+                    pending_tokens.add(token_id)
+                else:
+                    skipped += 1
+        else:
+            for token_id, _sources in batch_requests:
+                if len(pending_tokens) < _MERGE_INHERIT_PENDING_CAP:
+                    pending_tokens.add(token_id)
+                else:
+                    skipped += 1
 
     setattr(engine, "_merge_inherit_cursor", scan_cursor)
     setattr(engine, "_prediction_inherited_tokens", inherited_tokens)

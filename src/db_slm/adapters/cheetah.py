@@ -149,6 +149,8 @@ class CheetahClient:
         except ValueError:
             poll_interval = 5.0
         self._reduce_poll_interval = max(1.0, poll_interval)
+        async_inherit_raw = os.environ.get("CHEETAH_PREDICT_INHERIT_ASYNC", "1").strip().lower()
+        self._async_inherit = async_inherit_raw not in {"0", "false", "no", "off"}
 
     # ------------------------------------------------------------------ #
     # Public helpers
@@ -208,6 +210,10 @@ class CheetahClient:
         response = self._command(f"PAIR_SET x{value.hex()} {key}")
         return (response is not None and response.startswith("SUCCESS")), response
 
+    def pair_set_hidden(self, value: bytes, key: int) -> tuple[bool, str | None]:
+        response = self._command(f"PAIR_SET_HIDDEN x{value.hex()} {key}")
+        return (response is not None and response.startswith("SUCCESS")), response
+
     def pair_get(self, value: bytes) -> int | None:
         response = self._command(f"PAIR_GET x{value.hex()}")
         return self._parse_key_response(response)
@@ -221,6 +227,7 @@ class CheetahClient:
         prefix: bytes = b"",
         limit: int = 0,
         cursor: bytes | None = None,
+        include_hidden: bool = False,
     ) -> tuple[list[tuple[bytes, int]], bytes | None] | None:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_SCAN {arg}"
@@ -230,6 +237,8 @@ class CheetahClient:
             if limit <= 0:
                 command = f"{command} 0"
             command = f"{command} x{cursor.hex()}"
+        if include_hidden:
+            command = f"{command} include_hidden=1"
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
@@ -241,12 +250,25 @@ class CheetahClient:
         prefix: bytes = b"",
         limit: int = 0,
         cursor: bytes | None = None,
+        include_hidden: bool = False,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
         if self._async_reducers:
-            result = self._pair_reduce_async(mode, prefix, limit=limit, cursor=cursor)
+            result = self._pair_reduce_async(
+                mode,
+                prefix,
+                limit=limit,
+                cursor=cursor,
+                include_hidden=include_hidden,
+            )
             if result is not None:
                 return result
-        return self._pair_reduce_sync(mode, prefix, limit=limit, cursor=cursor)
+        return self._pair_reduce_sync(
+            mode,
+            prefix,
+            limit=limit,
+            cursor=cursor,
+            include_hidden=include_hidden,
+        )
 
     def _pair_reduce_sync(
         self,
@@ -255,8 +277,16 @@ class CheetahClient:
         *,
         limit: int,
         cursor: bytes | None,
+        include_hidden: bool,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
-        command = self._format_pair_reduce_command("PAIR_REDUCE", mode, prefix, limit, cursor)
+        command = self._format_pair_reduce_command(
+            "PAIR_REDUCE",
+            mode,
+            prefix,
+            limit,
+            cursor,
+            include_hidden=include_hidden,
+        )
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
@@ -269,8 +299,16 @@ class CheetahClient:
         *,
         limit: int,
         cursor: bytes | None,
+        include_hidden: bool,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
-        command = self._format_pair_reduce_command("PAIR_REDUCE_ASYNC", mode, prefix, limit, cursor)
+        command = self._format_pair_reduce_command(
+            "PAIR_REDUCE_ASYNC",
+            mode,
+            prefix,
+            limit,
+            cursor,
+            include_hidden=include_hidden,
+        )
         response = self._command(command)
         if not response:
             return None
@@ -376,6 +414,8 @@ class CheetahClient:
         prefix: bytes,
         limit: int,
         cursor: bytes | None,
+        *,
+        include_hidden: bool = False,
     ) -> str:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"{command_name} {mode} {arg}"
@@ -385,6 +425,8 @@ class CheetahClient:
             if limit == 0:
                 command = f"{command} 0"
             command = f"{command} x{cursor.hex()}"
+        if include_hidden:
+            command = f"{command} include_hidden=1"
         return command
 
     @staticmethod
@@ -521,6 +563,43 @@ class CheetahClient:
         response = self._command(f"PREDICT_INHERIT {' '.join(args)}")
         return (response is not None and response.startswith("SUCCESS")), response
 
+    def predict_inherit_batch(
+        self,
+        items: Sequence[dict[str, object]],
+        *,
+        table: str | None = None,
+        merge_mode: str | None = None,
+        async_mode: bool | None = None,
+    ) -> tuple[bool, str | None]:
+        payload = self._encode_inherit_batch_payload(items)
+        if not payload:
+            return False, "ERROR,empty_batch"
+        args = [f"items={payload}"]
+        if merge_mode:
+            args.append(f"merge={merge_mode}")
+        if table:
+            args.append(f"table={table}")
+        if async_mode is None:
+            async_mode = self._async_inherit
+        if async_mode:
+            response = self._command(f"PREDICT_INHERIT_ASYNC {' '.join(args)}")
+            if not response:
+                return False, response
+            lowered = response.lower()
+            if lowered.startswith("error,unknown_command") or "async_inherit_unavailable" in lowered:
+                self._async_inherit = False
+                return self.predict_inherit_batch(
+                    items,
+                    table=table,
+                    merge_mode=merge_mode,
+                    async_mode=False,
+                )
+            return response.startswith("SUCCESS"), response
+        response = self._command(f"PREDICT_INHERIT_BATCH {' '.join(args)}")
+        if response and response.lower().startswith("error,unknown_command"):
+            return False, response
+        return (response is not None and response.startswith("SUCCESS")), response
+
     def predict_query(
         self,
         *,
@@ -574,6 +653,7 @@ class CheetahClient:
         *,
         depth: int = 1,
         branch_limit: int = 32,
+        include_hidden: bool = False,
     ) -> NamespaceSummary | None:
         arg = "*" if not prefix else f"x{prefix.hex()}"
         command = f"PAIR_SUMMARY {arg}"
@@ -581,6 +661,8 @@ class CheetahClient:
             command = f"{command} {depth}"
         if branch_limit is not None:
             command = f"{command} {branch_limit}"
+        if include_hidden:
+            command = f"{command} include_hidden=1"
         response = self._command(command)
         if not response or not response.startswith("SUCCESS"):
             return None
@@ -1101,6 +1183,54 @@ class CheetahClient:
             if not normalized_windows:
                 continue
             serialized.append({"key": formatted_key, "windows": normalized_windows})
+        if not serialized:
+            return None
+        payload = json.dumps(serialized, separators=(",", ":")).encode("utf-8")
+        return base64.b64encode(payload).decode("ascii")
+
+    @classmethod
+    def _encode_inherit_batch_payload(
+        cls,
+        items: Sequence[dict[str, object]] | None,
+    ) -> str | None:
+        if not items:
+            return None
+        serialized: list[dict[str, object]] = []
+        for item in items:
+            if not item:
+                continue
+            key = item.get("key")
+            target = item.get("target")
+            sources = item.get("sources") or []
+            merge = item.get("merge") or item.get("mode")
+            formatted_key = cls._format_prediction_value(key) if key is not None else None
+            formatted_target = (
+                cls._format_prediction_value(target) if target is not None else None
+            )
+            if not formatted_key or not formatted_target:
+                continue
+            if isinstance(sources, (bytes, str, bytearray)):
+                sources_iter = [sources]
+            else:
+                try:
+                    sources_iter = list(sources)
+                except TypeError:
+                    sources_iter = []
+            formatted_sources: list[str] = []
+            for source in sources_iter:
+                formatted = cls._format_prediction_value(source)
+                if formatted:
+                    formatted_sources.append(formatted)
+            if not formatted_sources:
+                continue
+            spec: dict[str, object] = {
+                "key": formatted_key,
+                "target": formatted_target,
+                "sources": formatted_sources,
+            }
+            if merge:
+                spec["merge"] = merge
+            serialized.append(spec)
         if not serialized:
             return None
         payload = json.dumps(serialized, separators=(",", ":")).encode("utf-8")
@@ -2077,6 +2207,57 @@ class CheetahHotPathAdapter(HotPathAdapter):
                     response,
                 )
             return success
+        except CheetahError as exc:
+            self._disable(exc)
+            return False
+
+    def predict_inherit_batch(
+        self,
+        *,
+        key: bytes | str,
+        items: Sequence[dict[str, object]],
+        table: str | None = None,
+        merge_mode: str | None = None,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        key_bytes = self._ensure_bytes(key)
+        payload_items: list[dict[str, object]] = []
+        for item in items or []:
+            if not item:
+                continue
+            target = item.get("target")
+            sources = item.get("sources") or []
+            if target is None or not sources:
+                continue
+            payload = dict(item)
+            payload["key"] = key_bytes
+            payload_items.append(payload)
+        if not payload_items:
+            return False
+        try:
+            success, response = self._client.predict_inherit_batch(
+                payload_items,
+                table=table,
+                merge_mode=merge_mode,
+            )
+            if not success:
+                logger.warning(
+                    "cheetah predict_inherit_batch failed for key=%s table=%s response=%s",
+                    key,
+                    table,
+                    response,
+                )
+                return False
+            job_id = self._client._extract_response_field(response or "", "job")
+            if job_id:
+                logger.warning(
+                    "cheetah predict_inherit batch queued (job=%s table=%s count=%d)",
+                    job_id,
+                    table,
+                    len(payload_items),
+                )
+            return True
         except CheetahError as exc:
             self._disable(exc)
             return False

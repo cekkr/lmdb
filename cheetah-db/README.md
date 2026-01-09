@@ -113,13 +113,17 @@ INSERT:<size> <payload>         # create payload, returns abs key
 READ <abs_key>                  # fetch payload by key
 EDIT:<size> <abs_key> <payload> # overwrite payload in-place
 PAIR_SET <hex_prefix> <payload> # map trie prefix to payload key
-PAIR_SCAN <prefix> [limit]      # stream ordered namespace slices (cursors supported)
-PAIR_REDUCE <mode> <prefix>     # stream reducer payloads (counts/probabilities/etc.)
+PAIR_SET_HIDDEN <hex_prefix> <payload>
+                                # map a hidden trie prefix to payload key
+PAIR_SCAN <prefix> [limit] [cursor] [include_hidden=1]
+                                # stream ordered namespace slices (cursors supported)
+PAIR_REDUCE <mode> <prefix> [limit] [cursor] [include_hidden=1]
+                                # stream reducer payloads (counts/probabilities/etc.)
 PAIR_REDUCE_ASYNC <mode> <prefix> [limit] [cursor]
                                 # enqueue reducer job and return a job identifier
 PAIR_REDUCE_STATUS <job_id>     # report reducer job progress/state
 PAIR_REDUCE_FETCH <job_id>      # fetch reducer results once completed (PENDING while running)
-PAIR_SUMMARY <prefix> [depth] [branch_limit]
+PAIR_SUMMARY <prefix> [depth] [branch_limit] [include_hidden=1]
                                 # aggregate namespace statistics (payload totals, branch fan-out)
 RESET_DB [name]                 # delete/recreate the current (or named) database on disk
 DELETE <abs_key>                # tombstone entry
@@ -131,7 +135,7 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - Prefix strings (`ctx:`, `ctxv:`, `prob:2`, etc.) are treated as raw bytes; encode binary prefixes
   as `x<HEX>`.
 - `PAIR_SCAN` replies include `items=<hex_prefix>:<abs_key>` pairs plus `next_cursor=<token>` when
-  additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue.
+  additional pages remain. Reissue the command with `CURSOR <token>` (TCP) or `PAIR_SCAN <prefix> <limit> <token>` (CLI) to continue. Add `include_hidden=1` to return hidden terminals.
 - `PAIR_REDUCE` includes inline base64 payloads so reducers can hydrate counters/probabilities
   without extra `READ` calls. Each response also includes `next_cursor` when more items exist.
 - `PAIR_REDUCE_ASYNC` is ideal for long-running reducers: it queues the request, returns a `job`
@@ -143,7 +147,7 @@ LOG_FLUSH [limit]               # dump + clear the in-memory log ring buffer (op
 - `PAIR_SUMMARY` walks the trie beneath a namespace prefix, counts terminal entries, sums payload
   sizes (without hydrating the bytes), tracks min/max payloads and keys, and emits branch-level
   fan-out counts up to the requested depth. Use the optional `branch_limit` to cap the number of
-  branch digests returned (default: 32). This is the entry point for data-centric statistics—e.g.,
+  branch digests returned (default: 32) and `include_hidden=1` to count hidden terminals. This is the entry point for data-centric statistics—e.g.,
   estimating hot prefixes before launching GPU reducers or precomputing rolling hashes described in
   the tree-indexing section below.
 - `DATABASE` and `RESET_DB` accept optional overrides (`DATABASE ctx pair_bytes=1 payload_cache_entries=0`)
@@ -246,6 +250,13 @@ SUCCESS,key=1_deleted
   - `PREDICT_INHERIT key=<prefix> target=<bytes> sources=<hex,...> [merge=avg|sum|max] [table=name]`
     merges existing prediction values into a new target (for example, to seed composite/merged
     tokens with inherited context weights).
+  - `PREDICT_INHERIT_BATCH items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
+    processes multiple inherit requests in one call. The JSON payload is an array of
+    `{ "key": "<hex>", "target": "<hex>", "sources": ["<hex>", ...], "merge": "avg" }` objects.
+  - `PREDICT_INHERIT_ASYNC items=<base64 json> [key=<prefix>] [merge=avg|sum|max] [table=name]`
+    queues a batch job and returns a `job` token for later polling.
+  - `PREDICT_INHERIT_STATUS <job_id>` reports job progress (merged/skipped/failed counts).
+  - `PREDICT_INHERIT_FETCH <job_id>` returns batch results once the job completes (or `PENDING` while running).
   - `PREDICT_BACKEND [mode=cpu|gpu] [table=name]` toggles the probability merger per table, and
     `PREDICT_BENCH samples=<n> window=<len> [table=name]` compares CPU vs accelerated merges on the
     current host.

@@ -60,6 +60,9 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   server skips entire subtrees that fall lexicographically below that cursor so the next reducer page
   no longer re-walks millions of keys just to reach the next chunk. Iterating large namespaces is now
   proportional to the number of rows returned, not the total namespace size.
+- Pair trie terminals now support a hidden flag. Use `PAIR_SET_HIDDEN` to register hidden entries and
+  pass `include_hidden=1` to `PAIR_SCAN`, `PAIR_REDUCE`, or `PAIR_SUMMARY` when you need to surface
+  them; default scans/reducers ignore hidden rows so cache-only joins do not pollute namespace stats.
 - The adapter now retries failed `PAIR_SET` registrations and confirms success with `PAIR_GET` before raising a fatal error. Tweak `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over slow or noisy links.
 - Probability/backoff slices (`prob:<order>`) and continuation metadata (`cont:`) are mirrored into
   cheetah alongside counts, and the Go reducers now return inline payloads for `counts`,
@@ -200,7 +203,9 @@ matrix.
   contexts fine-tune weights without rewriting payloads.
 - `PREDICT_INHERIT key=<value> target=<result> sources=<hex,...> [merge=avg|sum|max]` merges existing
   prediction values into a new target (useful for composite token inheritance without replaying full
-  training passes).
+  training passes). `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC` accept base64 JSON batches plus
+  `PREDICT_INHERIT_STATUS`/`PREDICT_INHERIT_FETCH` to monitor jobs. Set
+  `CHEETAH_PREDICT_INHERIT_ASYNC=0` to force synchronous batches.
 - `PREDICT_BACKEND [cpu|gpu]` toggles between the CPU path and the simulated WebGPU merger
   (`CHEETAH_PREDICT_MERGER=gpu` sets the default). Acceleration fans out merges across CPU cores to
   mirror WebGPU behaviour until native bindings are available.
@@ -233,9 +238,9 @@ shared byte-span before aggregating and automatically normalizes outputs.
   assemble the dependency summary, derive a context matrix, `PREDICT_SET` the next-token entry (4-byte
   ID payloads), and `PREDICT_TRAIN` the corresponding weights. `--cheetah-token-*` knobs gate the
   learning rate, cap, and table/key; `--disable-cheetah-token-train` skips the cycle entirely.
-- When token merging is active, the trainer also issues `PREDICT_INHERIT` for newly merged tokens so
-  composite entries inherit the prediction weights of their component tokens without replaying the
-  full context training loop.
+- When token merging is active, the trainer issues `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC`
+  for newly merged tokens so composite entries inherit the prediction weights of their component
+  tokens without replaying the full context training loop.
 - `Decoder` and `run.py` blend those predictions back into sampling. Every response computes a
   matrix from the current conversation history, `PREDICT_QUERY` hits the configured table/key, and
   the resulting probabilities mix into the Level 1 distribution using `--cheetah-token-weight`.

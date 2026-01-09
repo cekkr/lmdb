@@ -10,6 +10,8 @@
 
 - `src/train.py` now prints the cheetah hot-path endpoint plus the final Top-K hit ratio, and evaluation uses `helpers/char_tree_similarity.py` to surface `char_repeat_*` metrics, feed them into quality gating, and re-run repeats with stronger penalties.
 - cheetah prediction tables now deepen context matrices with derived mean/variance/contrast/interaction layers (toggle via `CHEETAH_PREDICT_DEEPEN`) so prediction weights can react to richer context signals.
+- cheetah-db pair entries now support hidden terminals with `PAIR_SET_HIDDEN` and `include_hidden=1` scan/reduce/summary filters.
+- `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC` jobs are live and the trainer queues merged-token inheritance through them.
 
 ## Active tasks
 - Cheetah-only smoke ingest follow-up:
@@ -18,7 +20,5 @@
 - Investigate the cheetah smoke helper hang: `scripts/start_cheetah_smoke_session.sh` + `scripts/run_cheetah_smoke.sh` still wedge on `datasets/emotion_data.json#chunk1` (originally in `var/eval_logs/cheetah_smoke_train_20251112-190626.log`, now reproducible in `var/cheetah_smoke_train_20251112-205914.log` where the eval loop burns retries indefinitely). Capture stack traces and cheetah telemetry the moment it wedges so we can remove the repetitive â€œZooming inâ€¦â€ scaffolds and finally unlock reliable latency/top-K recordings.
 
 - Validate the new deepened prediction layers against GPTeacher eval probes and log whether punctuation repetition drops; adjust `CHEETAH_PREDICT_DEEPEN` or `--cheetah-token-weight` based on the quality metrics.
-- Design/implement hidden pair entries in cheetah-db (visibility flag + scan/reduce filters) to cache prediction-join work for context dimensions without polluting namespace scans.
-- Add batch/async support for `PREDICT_INHERIT` (merged-token inheritance) and wire it into the trainer so cheetah jobs can process large merge sets in parallel.
 ## Remember
 - The development works also on Cheetah: don't fallback on sqlite if it doesn't works, but fix the issue.

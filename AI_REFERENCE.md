@@ -11,8 +11,10 @@ NEXT_STEPS.md so new agents inherit the latest state.
   (train/infer windows and stride ratio).
 - Decoder presence/frequency penalties auto-tune after evaluation probes/hold-outs unless explicit
   overrides are supplied; overrides lock the tuner.
-- cheetah-db adds `PREDICT_INHERIT` so merged tokens can inherit prediction weights from their
-  component tokens during training; run.py uses stored `ngram_order` when `--ngram-order 0`.
+- cheetah-db now supports batched/async `PREDICT_INHERIT` jobs (plus `STATUS`/`FETCH`), and the
+  trainer queues merged-token inheritance through those batches when available.
+- Pair trie terminals can be hidden via `PAIR_SET_HIDDEN`; `PAIR_SCAN`/`PAIR_REDUCE`/`PAIR_SUMMARY`
+  accept `include_hidden=1` to surface cached joins without polluting default namespace scans.
 
 ## Pointers
 
