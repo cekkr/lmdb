@@ -1,6 +1,8 @@
 # lmdb
 [Experimental] Database centric LLM
 
+**Currently the project lacks totally of algorithmic optimizations by humans**
+
 ## Overview
 
 This repository explores the production-grade database-native statistical language model (DB-SLM)
