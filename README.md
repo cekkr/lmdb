@@ -187,6 +187,7 @@ python src/train.py datasets/emotion_data.json \
   - `--context-window-stride-ratio <float>`: Override the window stride ratio used for context embeddings (0.1-1.0, 0 = auto).
   - `--context-window-depth <n>`: Bias extra context-matrix fusion depth tiers (default engine preset). Use `0` to match legacy depth, negative values reduce depth.
   - `--dataset-config <path>`: Force a specific dataset metadata/label file for `.json`/`.ndjson` corpora instead of inferring `<dataset>.config.json` or honoring `DBSLM_DATASET_CONFIG_PATH`. Plain `.txt` corpora bypass this path and are treated as already tagged.
+  - `--sentence-splitting` / `--no-sentence-splitting`: Enable punctuation-based sentence segmentation during training (disabled by default; set `DBSLM_SENTENCE_SPLIT=1` to change the default).
 - **File reading helpers**
   - `--recursive`: When scanning folders, include subdirectories (default is to read only the top level).
   - `--encoding`: Override the UTF-8 reader if the corpus uses another encoding.
@@ -272,10 +273,12 @@ to the environment variable).
 
 ### Adaptive Tokenization + Context Tags
 
-`DBSLMEngine` now performs a realtime corpus scan before every ingest to discover the most productive
+`DBSLMEngine` can run an optional realtime corpus scan before ingest to discover productive
 punctuation splits, slice long responses into manageable segments, and tag those fragments with
 device-aware embeddings from `sentence-transformers` (defaults to `all-MiniLM-L6-v2`, configurable
-via `DBSLM_EMBEDDER_MODEL`). Dataset-specific metadata is described in
+via `DBSLM_EMBEDDER_MODEL`). This punctuation splitting is disabled by default; enable it with
+`--sentence-splitting` or `DBSLM_SENTENCE_SPLIT=1` if you need the legacy segmentation pass.
+Dataset-specific metadata is described in
 `datasets/<name>.config.json` (for example `datasets/emotion_data.config.json`), which declares the
 prompt/response fields and any additional context columns that should be tokenized. The JSON loader
 uses that config to emit human-readable headers plus canonical `|CTX|:<token>:<value>` (or other

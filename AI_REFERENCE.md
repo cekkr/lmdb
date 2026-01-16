@@ -5,6 +5,8 @@ NEXT_STEPS.md so new agents inherit the latest state.
 
 ## Recent changes
 
+- Sentence punctuation splitting during training is now disabled by default; enable it with
+  `--sentence-splitting` or `DBSLM_SENTENCE_SPLIT=1` when needed.
 - `src/train.py` defaults `--ngram-order` to auto (`0`), sampling the input corpus to pick a stable
   order; the resolved value is stored as `ngram_order` metadata for later reuse.
 - Context-window sampling now supports auto windows/stride when the CLI knobs are left at `0`

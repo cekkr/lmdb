@@ -30,6 +30,7 @@ class DBSLMSettings:
     quality_queue_path: str
     env_file: Path | None
     embedder_model: str
+    sentence_split_enabled: bool
     cheetah_host: str
     cheetah_port: int
     cheetah_database: str
@@ -60,6 +61,8 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         "DBSLM_QUALITY_QUEUE_PATH", "var/eval_logs/quality_retrain_queue.jsonl"
     )
     embedder_model = read("DBSLM_EMBEDDER_MODEL", "all-MiniLM-L6-v2")
+    sentence_split_flag = read("DBSLM_SENTENCE_SPLIT", "0").strip().lower()
+    sentence_split_enabled = sentence_split_flag in {"1", "true", "yes", "on"}
     cheetah_host = read("DBSLM_CHEETAH_HOST", "127.0.0.1")
     cheetah_port = int(read("DBSLM_CHEETAH_PORT", "4455"))
     cheetah_database = read("DBSLM_CHEETAH_DATABASE", "default")
@@ -95,6 +98,7 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         quality_queue_path=quality_queue_path,
         env_file=env_file_used,
         embedder_model=embedder_model,
+        sentence_split_enabled=sentence_split_enabled,
         cheetah_host=cheetah_host,
         cheetah_port=cheetah_port,
         cheetah_database=cheetah_database,

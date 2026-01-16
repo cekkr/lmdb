@@ -14,7 +14,7 @@ import sys
 import time
 from collections import Counter, deque
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Sequence, Tuple
 
@@ -196,6 +196,15 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help=(
             "Path to a dataset config JSON applied to *.json/NDJSON corpora. "
             "Defaults to <dataset>.config.json or DBSLM_DATASET_CONFIG_PATH."
+        ),
+    )
+    parser.add_argument(
+        "--sentence-splitting",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable punctuation-based sentence segmentation before tokenization "
+            "(default: disabled; set DBSLM_SENTENCE_SPLIT=1 to change the default)."
         ),
     )
     parser.add_argument(
@@ -2461,6 +2470,9 @@ def main() -> None:
     if resume_mode and getattr(args, "reset", False):
         log("[resume] Ignoring --reset from the interrupted run to preserve progress.")
         args.reset = False
+
+    if args.sentence_splitting is not None:
+        settings = replace(settings, sentence_split_enabled=bool(args.sentence_splitting))
 
     log_verbose(3, f"[train:v3] Parsed CLI arguments: {vars(args)}")
 

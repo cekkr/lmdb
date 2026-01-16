@@ -225,14 +225,15 @@ class ExternalEmbedder:
 
 class SentencePartEmbeddingPipeline:
     """
-    Performs punctuation-aware segmentation, optional embedding lookups,
+    Performs punctuation-aware segmentation (when enabled), optional embedding lookups,
     and injects dataset-provided context hints ahead of Level 1 tokenization.
     """
 
     def __init__(self, settings: DBSLMSettings) -> None:
         model = settings.embedder_model or os.environ.get("DBSLM_EMBEDDER_MODEL", "all-MiniLM-L6-v2")
-        self.profiler = RealtimeTokenizerProfiler()
-        self.segmenter = SentenceSegmenter()
+        self.sentence_split_enabled = settings.sentence_split_enabled
+        self.profiler = RealtimeTokenizerProfiler() if self.sentence_split_enabled else None
+        self.segmenter = SentenceSegmenter() if self.sentence_split_enabled else None
         self.embedder = ExternalEmbedder(model)
 
     def prepare_for_training(self, text: str) -> str:
@@ -240,6 +241,10 @@ class SentencePartEmbeddingPipeline:
         if not payload:
             return text
         payload, header_line = self._context_header(payload)
+        if not self.sentence_split_enabled:
+            if header_line:
+                return "\n".join([header_line, payload]).strip()
+            return payload
         self.profiler.observe(payload)
         # Restrict sentence breaking to periods to keep other punctuation attached
         # to the surrounding context; fall back to the profiler suggestion if no

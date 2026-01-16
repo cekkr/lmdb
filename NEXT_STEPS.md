@@ -12,6 +12,7 @@
 - cheetah prediction tables now deepen context matrices with derived mean/variance/contrast/interaction layers (toggle via `CHEETAH_PREDICT_DEEPEN`) so prediction weights can react to richer context signals.
 - cheetah-db pair entries now support hidden terminals with `PAIR_SET_HIDDEN` and `include_hidden=1` scan/reduce/summary filters.
 - `PREDICT_INHERIT_BATCH`/`PREDICT_INHERIT_ASYNC` jobs are live and the trainer queues merged-token inheritance through them.
+- Sentence punctuation splitting is now disabled by default during training, with opt-in flags/env to enable the legacy pass.
 
 ## Active tasks
 - Cheetah-only smoke ingest follow-up:
