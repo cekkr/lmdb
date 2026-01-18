@@ -17,6 +17,11 @@ NEXT_STEPS.md so new agents inherit the latest state.
   trainer queues merged-token inheritance through those batches when available.
 - Pair trie terminals can be hidden via `PAIR_SET_HIDDEN`; `PAIR_SCAN`/`PAIR_REDUCE`/`PAIR_SUMMARY`
   accept `include_hidden=1` to surface cached joins without polluting default namespace scans.
+- Decoder scoring now flows through `TokenScoringPipeline` (`src/db_slm/scoring.py`) with optional
+  `ScoreObserver` snapshots wired through `DBSLMEngine.respond()` and `issue_prompt()` for
+  statistical debugging.
+- cheetah-db now resolves `PAIR_REDUCE` modes through a reducer registry (`cheetah-db/reducers.go`)
+  so new reducer implementations can be added without editing command dispatch.
 
 ## Pointers
 

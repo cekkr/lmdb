@@ -21,5 +21,6 @@
 - Investigate the cheetah smoke helper hang: `scripts/start_cheetah_smoke_session.sh` + `scripts/run_cheetah_smoke.sh` still wedge on `datasets/emotion_data.json#chunk1` (originally in `var/eval_logs/cheetah_smoke_train_20251112-190626.log`, now reproducible in `var/cheetah_smoke_train_20251112-205914.log` where the eval loop burns retries indefinitely). Capture stack traces and cheetah telemetry the moment it wedges so we can remove the repetitive â€œZooming inâ€¦â€ scaffolds and finally unlock reliable latency/top-K recordings.
 
 - Validate the new deepened prediction layers against GPTeacher eval probes and log whether punctuation repetition drops; adjust `CHEETAH_PREDICT_DEEPEN` or `--cheetah-token-weight` based on the quality metrics.
+- Use the new decoder scoring pipeline traces to isolate punctuation collapse (base vs cache vs prediction) and decide whether to add a dedicated punctuation-penalty stage or a run.py trace flag.
 ## Remember
 - The development works also on Cheetah: don't fallback on sqlite if it doesn't works, but fix the issue.

@@ -19,6 +19,7 @@ from .context_window_embeddings import ContextWindowEmbeddingManager
 from .db import DatabaseEnvironment
 from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
+from .scoring import ScoreObserver
 from .level1 import (
     LogProbQuantizer,
     MKNSmoother,
@@ -575,6 +576,7 @@ class DBSLMEngine:
         rng_seed: int | None = None,
         *,
         scaffold_response: bool = True,
+        score_observer: ScoreObserver | None = None,
     ) -> str:
         rng = random.Random(rng_seed) if rng_seed is not None else random.Random()
         self.memory.log_message(conversation_id, "user", user_message)
@@ -628,6 +630,7 @@ class DBSLMEngine:
                 banned_token_ids=self._prompt_tag_token_ids,
                 commit_cache=False,
                 prediction_matrix=prediction_matrix,
+                score_observer=score_observer,
             )
             decoded_text = self.tokenizer.decode(decoded_ids)
             attempt_segments = [segment for segment in prefix_segments if segment]

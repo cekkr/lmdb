@@ -50,6 +50,7 @@ type Database struct {
 	clusterMessenger *ClusterMessenger
 	reduceJobs       *reduceJobManager
 	predictJobs      *predictInheritJobManager
+	reducers         *ReducerRegistry
 }
 
 type pairTableCache struct {
@@ -374,9 +375,11 @@ func NewDatabase(name, path string, monitor *ResourceMonitor, cfg DatabaseConfig
 		forkScheduler:  newForkScheduler(path),
 		reduceJobs:     newReduceJobManager(),
 		predictJobs:    newPredictInheritJobManager(),
+		reducers:       newReducerRegistry(),
 	}
 	db.predictStore = newPredictionManager(path)
 	db.clusterMessenger = newClusterMessenger(db.forkScheduler)
+	db.registerDefaultReducers()
 
 	// Carica il contatore degli ID delle tabelle pair
 	if err := db.loadNextPairTableID(); err != nil {
@@ -2405,16 +2408,18 @@ func parseBoolFlag(raw string) bool {
 }
 
 func (db *Database) handlePairReduce(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (string, error) {
-	switch mode {
-	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, includeHidden, nil)
-		if err != nil {
-			return "", err
-		}
-		return formatPairReduceResponse(results, mode, nextCursor), nil
-	default:
+	if db.reducers == nil {
+		db.registerDefaultReducers()
+	}
+	reducer := db.reducers.Resolve(mode)
+	if reducer == nil {
 		return "ERROR,unknown_reducer_mode", nil
 	}
+	results, nextCursor, err := reducer(db, prefix, limit, cursor, includeHidden, nil)
+	if err != nil {
+		return "", err
+	}
+	return formatPairReduceResponse(results, mode, nextCursor), nil
 }
 
 func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, includeHidden bool, progress func(done int, total int)) ([]PairReduceResult, []byte, error) {
@@ -2517,14 +2522,24 @@ func (db *Database) reduceWithPayload(prefix []byte, limit int, cursor []byte, i
 	return reduced, nextCursor, nil
 }
 
-func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (*reduceJob, error) {
+func (db *Database) submitAsyncReduceJob(
+	mode string,
+	prefix []byte,
+	limit int,
+	cursor []byte,
+	includeHidden bool,
+	reducer PairReducerFunc,
+) (*reduceJob, error) {
 	if db.reduceJobs == nil {
 		return nil, fmt.Errorf("async reducer unavailable")
+	}
+	if reducer == nil {
+		return nil, fmt.Errorf("unknown reducer")
 	}
 	job := db.reduceJobs.newJob(mode)
 	go func(j *reduceJob) {
 		j.markRunning()
-		results, nextCursor, err := db.reduceWithPayload(prefix, limit, cursor, includeHidden, func(done int, total int) {
+		results, nextCursor, err := reducer(db, prefix, limit, cursor, includeHidden, func(done int, total int) {
 			j.updateProgress(done, total)
 		})
 		if err != nil {
@@ -2537,16 +2552,18 @@ func (db *Database) submitAsyncReduceJob(mode string, prefix []byte, limit int, 
 }
 
 func (db *Database) handleAsyncReduce(mode string, prefix []byte, limit int, cursor []byte, includeHidden bool) (string, error) {
-	switch mode {
-	case "counts", "count", "probabilities", "probs", "backoffs", "continuations", "continuation":
-		job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor, includeHidden)
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("SUCCESS,reducer=%s,job=%s,state=queued", mode, job.id), nil
-	default:
+	if db.reducers == nil {
+		db.registerDefaultReducers()
+	}
+	reducer := db.reducers.Resolve(mode)
+	if reducer == nil {
 		return "ERROR,unknown_reducer_mode", nil
 	}
+	job, err := db.submitAsyncReduceJob(mode, prefix, limit, cursor, includeHidden, reducer)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SUCCESS,reducer=%s,job=%s,state=queued", mode, job.id), nil
 }
 
 func (db *Database) handleReduceJobStatus(jobID string) string {

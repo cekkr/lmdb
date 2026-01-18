@@ -8,6 +8,7 @@ from .db import DatabaseEnvironment
 from .context_dimensions import ContextDimension, ContextDimensionTracker
 from .level1 import LogProbQuantizer, NGramStore, TokenCandidate, Tokenizer
 from .level2 import BiasEngine, SessionCache
+from .scoring import ScoreObserver, ScoreResult, ScoreSnapshot, TokenScoringPipeline
 from .adapters.base import HotPathAdapter
 
 
@@ -48,6 +49,7 @@ class Decoder:
         self.prediction_table = (prediction_table or "").strip()
         self.prediction_key = (prediction_key or "").strip()
         self.prediction_weight = max(0.0, min(1.0, float(prediction_weight or 0.0)))
+        self.scoring = TokenScoringPipeline(self.quantizer, self.tokenizer, self.cache, self.bias)
 
     def decode(
         self,
@@ -61,6 +63,7 @@ class Decoder:
         banned_token_ids: Sequence[int] | None = None,
         commit_cache: bool = True,
         prediction_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
+        score_observer: ScoreObserver | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
@@ -77,14 +80,15 @@ class Decoder:
                 dimension_weights=dimension_weights,
             )
         prediction_bias = self._prediction_distribution(prediction_matrix)
-        for _ in range(config.max_tokens):
+        for step_index in range(config.max_tokens):
+            context_snapshot = tuple(context_ids)
             order = min(self.store.order, len(context_ids) + 1)
             candidates = self._resolve_candidates(context_ids, order, profile["topk"])
             if not candidates:
                 candidates = self._relativistic_fallback(context_ids, order, profile["topk"])
                 if not candidates:
                     break
-            adjusted = self._adjust_candidates(
+            score_result = self._score_candidates(
                 conversation_id,
                 candidates,
                 generated,
@@ -94,12 +98,23 @@ class Decoder:
                 context_snippet,
                 dimension_tracker,
                 prediction_bias,
+                collect_trace=score_observer is not None,
             )
+            adjusted = score_result.distribution
             if not adjusted:
                 break
             next_token = self._sample(adjusted, profile["topp"], rng)
             if next_token is None:
                 break
+            if score_observer and score_result.trace is not None:
+                score_observer(
+                    ScoreSnapshot(
+                        step_index=step_index,
+                        context_ids=context_snapshot,
+                        scores=score_result.trace,
+                        chosen_token_id=next_token,
+                    )
+                )
             generated.append(next_token)
             context_ids.append(next_token)
             context_ids[:] = context_ids[-(self.store.order - 1) :]
@@ -111,7 +126,7 @@ class Decoder:
             self.cache.update(conversation_id, generated)
         return generated
 
-    def _adjust_candidates(
+    def _score_candidates(
         self,
         conversation_id: str,
         candidates: Sequence[TokenCandidate],
@@ -122,53 +137,26 @@ class Decoder:
         context_snippet: str,
         dimension_tracker: ContextDimensionTracker | None,
         prediction_bias: Optional[Dict[int, float]],
-    ) -> Dict[int, float]:
-        base: Dict[int, float] = {}
-        bias_map = self.bias.lookup(conversation_id, context_snippet)
-        cache_dist = self.cache.distribution(conversation_id)
+        *,
+        collect_trace: bool = False,
+    ) -> ScoreResult:
+        temperature = float(profile.get("temp", 1.0))
         lambda_cache = float(profile.get("lambda_cache", 0.15))
-        lambda_cache = max(0.0, min(lambda_cache, 0.95))
-        penalties: Dict[int, int] = {}
-        for token_id in generated:
-            penalties[token_id] = penalties.get(token_id, 0) + 1
-        for candidate in candidates:
-            token_id = candidate.token_id
-            if token_id in banned:
-                continue
-            log10_val = self.quantizer.dequantize_log10(candidate.q_logprob)
-            temperature = float(profile.get("temp", 1.0))
-            if temperature != 1.0 and temperature > 0:
-                log10_val /= temperature
-            bias_delta = bias_map.get(token_id, 0)
-            if bias_delta:
-                log10_val += self._log_delta(bias_delta)
-            penalty = 0.0
-            if token_id in penalties:
-                penalty += config.presence_penalty
-                penalty += penalties[token_id] * config.frequency_penalty
-            if dimension_tracker:
-                penalty += dimension_tracker.penalty_for(
-                    token_id,
-                    config.presence_penalty,
-                    config.frequency_penalty,
-                )
-            if penalty:
-                log10_val -= penalty
-            prob = 10 ** log10_val
-            base[token_id] = prob
-        if not base:
-            return {}
-        if cache_dist and lambda_cache > 0:
-            for token_id in set(base) | set(cache_dist):
-                cache_prob = cache_dist.get(token_id, 0.0)
-                base_prob = base.get(token_id, 0.0)
-                base[token_id] = (1 - lambda_cache) * base_prob + lambda_cache * cache_prob
-        total = sum(base.values())
-        if total <= 0:
-            return {}
-        for token_id in list(base.keys()):
-            base[token_id] = base[token_id] / total
-        return self._apply_prediction_bias(base, prediction_bias)
+        return self.scoring.score(
+            conversation_id,
+            candidates,
+            generated,
+            banned=banned,
+            context_snippet=context_snippet,
+            temperature=temperature,
+            lambda_cache=lambda_cache,
+            presence_penalty=config.presence_penalty,
+            frequency_penalty=config.frequency_penalty,
+            dimension_tracker=dimension_tracker,
+            prediction_bias=prediction_bias,
+            prediction_weight=self.prediction_weight,
+            collect_trace=collect_trace,
+        )
 
     def _resolve_candidates(
         self,
@@ -251,25 +239,6 @@ class Decoder:
             distribution[token_id] = distribution[token_id] / total
         return distribution
 
-    def _apply_prediction_bias(
-        self,
-        base: Dict[int, float],
-        prediction_bias: Optional[Dict[int, float]],
-    ) -> Dict[int, float]:
-        if not prediction_bias or self.prediction_weight <= 0.0:
-            return base
-        blended: Dict[int, float] = dict(base)
-        weight = self.prediction_weight
-        for token_id, prob in prediction_bias.items():
-            existing = blended.get(token_id, 0.0)
-            blended[token_id] = (1.0 - weight) * existing + weight * prob
-        total = sum(blended.values())
-        if total <= 0:
-            return base
-        for token_id in list(blended.keys()):
-            blended[token_id] = blended[token_id] / total
-        return blended
-
     @staticmethod
     def _decode_prediction_token(raw_value: bytes) -> Optional[int]:
         if not raw_value:
@@ -284,10 +253,6 @@ class Decoder:
             (profile,),
         )
         return {row["token_id"] for row in rows}
-
-    def _log_delta(self, q_bias: int) -> float:
-        span = self.quantizer.Lmax - self.quantizer.Lmin
-        return (q_bias / 255.0) * span
 
     def _relativistic_fallback(self, context_ids: Sequence[int], order: int, k: int) -> List[TokenCandidate]:
         if order <= 1:

@@ -15,6 +15,8 @@ the spec end-to-end:
   Top-K materialization path for fast sampling. cheetah-db now persists the canonical vocabulary and
   probability tables; SQLite survives only as a scratch/export file for fast rebuilds while every
   context/Top-K slice is streamed into cheetah namespaces so hot reads bypass SQL entirely.
+  The decoder scoring pipeline now supports optional trace snapshots, making it easier to inspect
+  base log10 values, penalties, cache blends, and prediction-table biasing when debugging output.
 - **Level 2 — Episodic memory + biasing:** Conversation logging, correction digests, logit-bias
   materialization, and pointer-sentinel session caches that feed the decoder without tensors.
 - **Level 3 — Concept model:** Concept dictionaries, templates, and probability tables that can

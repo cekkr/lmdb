@@ -60,6 +60,8 @@ Read and collect potential implementation to do in NEXT_STEPS.md
   server skips entire subtrees that fall lexicographically below that cursor so the next reducer page
   no longer re-walks millions of keys just to reach the next chunk. Iterating large namespaces is now
   proportional to the number of rows returned, not the total namespace size.
+- `PAIR_REDUCE` dispatch now routes through a reducer registry (`reducers.go`) so new statistical
+  reducers can be added without editing the core command parser.
 - Pair trie terminals now support a hidden flag. Use `PAIR_SET_HIDDEN` to register hidden entries and
   pass `include_hidden=1` to `PAIR_SCAN`, `PAIR_REDUCE`, or `PAIR_SUMMARY` when you need to surface
   them; default scans/reducers ignore hidden rows so cache-only joins do not pollute namespace stats.

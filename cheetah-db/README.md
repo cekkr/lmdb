@@ -285,8 +285,9 @@ SUCCESS,key=1_deleted
 
 - `PAIR_REDUCE counts ctx:` aggregates follower counts directly inside Go and emits the packed
   payloads inline, allowing MKNS-style reducers or other statistical aggregators to run without SQL.
-- Custom reducers can be registered in Go (see `commands.go`). Each reducer receives the pair-trie
-  iterator and can emit any payload format; clients decode the base64 payload per reducer contract.
+- Custom reducers can be registered in Go via the reducer registry (see `reducers.go`). Each reducer
+  receives the pair-trie iterator and can emit any payload format; clients decode the base64 payload
+  per reducer contract.
 
 ## Operational Notes
 
