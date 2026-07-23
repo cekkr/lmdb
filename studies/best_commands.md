@@ -13,9 +13,9 @@ python3 src/train.py datasets/emotion_data.json \
   --reset \
   --json-chunk-size 500 \
   --eval-interval 5000 \
-  --eval-samples 1 \
+  --eval-samples 2 \
   --eval-pool-size 200 \
-  --chunk-eval-percent 1.0 \
+  --chunk-eval-percent 0.2 \
   --profile-ingest \
   --metrics-export var/eval_logs/train-$(date +%Y%m%d-%H%M%S).json
 ```
