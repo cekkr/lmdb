@@ -1,8 +1,8 @@
 # Algorithm Flow Notes (rough map for future perf/parallel work)
 
 ## Training (`src/train.py`)
-- CLI inputs (selected): `inputs...`, `--db`, `--ngram-order`, `--context-dimensions`, `--recursive`, `--reset` (wipes cheetah caches), `--eval-interval/--eval-samples/--eval-dataset/--eval-pool-size`, `--json-chunk-size/--max-json-lines/--chunk-eval-percent`, `--profile-ingest`, `--decoder-* penalties`, `--backonsqlite`.
-- Bootstrap: load settings → parse/validate args and context dimensions → optional metrics writer → init `DBSLMEngine` (cheetah hot-path if reachable, SQLite otherwise) → log RNG seeds.
+- CLI inputs (selected): `inputs...`, `--db`, `--ngram-order`, `--context-dimensions`, `--recursive`, `--reset` (wipes cheetah caches), `--eval-interval/--eval-samples/--eval-dataset/--eval-pool-size`, `--json-chunk-size/--max-json-lines/--chunk-eval-percent`, `--profile-ingest`, and `--decoder-*` penalties. `--backonsqlite` is parsed but does not currently catch an unreachable configured Cheetah backend because adapter construction exits first; use an explicit `DBSLM_BACKEND=sqlite` only for an intentional reduced-feature run.
+- Bootstrap: load settings → parse/validate args and context dimensions → optional metrics writer → init `DBSLMEngine` (configured Cheetah startup fails closed; explicit SQLite mode receives the null hot-path adapter) → log RNG seeds.
 - Input staging: `collect_files` + `iter_corpora` expand files (and JSON/NDJSON chunking) with per-chunk holdouts via `_sample_holdouts`; `IngestProfiler` can wrap ingest calls with resource snapshots.
 - Prefetch/parallel staging: `parallel_corpus_stream` uses a `ProcessPoolExecutor` (spawn) to run dataset parsing + dependency layers in parallel; `--prep-workers` defaults to `cpu_count()-1` and `--prep-prefetch` controls in-flight futures so ingest can stay busy even while long JSON chunks are processed.
 - Ingest loop: for each `CorpusChunk`, `engine.train_from_text` runs on the main thread with progress throttling via `TrainingProgressPrinter`; totals/windows tracked.

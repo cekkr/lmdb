@@ -12,9 +12,9 @@ the spec end-to-end:
 
 - **Level 1 — Aria-style n-gram engine:** Byte-free (regex) tokenization backed by a relational
   vocabulary, hashed contexts, Modified Kneser–Ney smoothing, quantized log-prob tables, and a
-  Top-K materialization path for fast sampling. cheetah-db now persists the canonical vocabulary and
-  probability tables; SQLite survives only as a scratch/export file for fast rebuilds while every
-  context/Top-K slice is streamed into cheetah namespaces so hot reads bypass SQL entirely.
+  Top-K materialization path for fast sampling. SQLite owns the relational vocabulary and
+  materialization workspace, while every context/count/probability/Top-K slice is streamed into
+  Cheetah namespaces so Level 1 distribution reads can use the Go hot path.
   The decoder scoring pipeline now supports optional trace snapshots, making it easier to inspect
   base log10 values, penalties, cache blends, and prediction-table biasing when debugging output.
 - **Level 2 — Episodic memory + biasing:** Conversation logging, correction digests, logit-bias
@@ -67,10 +67,12 @@ from the database.
   scripts (`scripts/start_cheetah_server.sh`, `scripts/stop_cheetah_server.sh`) for bounded,
   screen-first process management, exact PID tracking, and log rotation. They fall back to `tmux`
   only when `screen` cannot run on the host.
-- Leave `DBSLM_BACKEND=cheetah-db` (the baked-in default) so the trainer, decoder, and helpers fetch
-  everything from the Go engine. The only sanctioned downgrade is a short-lived SQLite export:
-  set `DBSLM_BACKEND=sqlite` plus `python src/train.py ... --backonsqlite` **only** when cheetah is
-  temporarily unreachable and you accept a reduced feature set.
+- Leave `DBSLM_BACKEND=cheetah-db` (the baked-in default) so Level 1 contexts and prediction signals
+  use the Go hot path; vocabulary and relational Level 2/3 state still use SQLite. A configured
+  Cheetah backend currently fails closed when its startup connection is unavailable. For an
+  intentional reduced-feature SQLite experiment, set `DBSLM_BACKEND=sqlite` before invoking the
+  trainer; do not rely on `--backonsqlite` to catch an unreachable configured Cheetah service until
+  the startup fallback is repaired.
 - The `DBSLM_CHEETAH_HOST/PORT/DATABASE/TIMEOUT_SECONDS` variables (see `.env.example`) point the
   adapter at the right instance; the default matches the server exposed by `cheetah-db/src/main.go`. Use
   a real address (127.0.0.1, LAN IP, Windows bridge IP inside WSL) rather than `0.0.0.0`.
@@ -134,8 +136,8 @@ server runs outside WSL; the adapter auto-detects that scenario via `/etc/resolv
 - `python src/train.py ... --reset` clears the SQLite scratch file **and** purges cheetah namespaces.
   The trainer now attempts `RESET_DB <DBSLM_CHEETAH_DATABASE>` first (instant file deletion), then
   falls back to `PAIR_PURGE` or the incremental scanner when connecting to older cheetah binaries.
-  so cached Top-K slices never drift. Add `--backonsqlite` only if you accept a degraded run without
-  cheetah (e.g., CI sandboxes where the service is intentionally offline).
+  so cached Top-K slices never drift. For a deliberately degraded run without Cheetah (for example,
+  an offline CI sandbox), set `DBSLM_BACKEND=sqlite` explicitly.
 
 #### Verified emotion-data path
 
@@ -196,7 +198,10 @@ python src/train.py datasets/emotion_data.json \
   - `inputs`: Files or directories to ingest. Directories respect `--recursive` and only pull in `*.txt` files; explicit file arguments may be pre-tagged `.txt` corpora or `.json`/`.ndjson` datasets that pick up their configs automatically.
   - `--db`: Destination SQLite file. Parent directories are created automatically; use `:memory:` for scratch runs (cannot be combined with `--reset`). Keep the chosen path consistent with `run.py`.
   - `--reset`: Delete the existing database before ingesting so you start from a clean slate.
-  - `--backonsqlite`: Allow a SQLite-only fallback when `DBSLM_BACKEND=cheetah-db` but the Go service is down. Without this flag the trainer exits instead of silently downgrading.
+  - `--backonsqlite`: Reserved for an explicit SQLite fallback, but the current adapter exits during
+    startup before this branch can handle an unreachable configured Cheetah backend. Use
+    `DBSLM_BACKEND=sqlite` for an intentional SQLite-only run until the fallback path has a startup
+    regression test.
   - `--ngram-order`: Adjusts the context window length (use `0` for auto-selection based on a corpus sample). Higher orders need larger corpora but produce richer continuations.
   - `--merge-max-tokens`: When `--ngram-order` is 5 or higher, merge repeated token runs (up to `merge-max-tokens`, default 5) into composite vocabulary entries, then optionally recurse across the merged stream. Only spans at or above the average frequency of all candidate spans survive, and runs dominated by high-frequency tokens are down-weighted so generic phrases are less likely to merge. Set `--merge-max-tokens 0` to disable. Composite tokens inherit cheetah prediction weights via batched PREDICT_INHERIT jobs during training.
   - `--merge-recursion-depth`: Recursive merge passes to attempt per tokenization step (defaults to 2 when merging is enabled).
@@ -594,12 +599,13 @@ Use `make clean-smoke` to delete the per-scenario SQLite files and the `var/smok
 
 ## SQLite helpers
 
-SQLite is now a convenience scratchpad: use it for fast ingest experiments, CI smoke runs, or quick
-exports where deleting the file to reset state is desirable. WAL keeps throughput high even for
-those short-lived runs, but cheetah-db mirrors every context and Top-K bucket, so once
-`DBSLM_BACKEND=cheetah-db` is active the decoder never touches SQLite. There is no migration step or
-MySQL target anymore—cheetah is both the hot path and the archival story. Run the Go server, point
-the env vars at it, and use helpers such as `engine.iter_hot_context_hashes()` or
+SQLite remains the relational workspace for the vocabulary, schema materialization, conversations,
+biases, and concepts; use disposable paths for fast ingest experiments, CI smoke runs, or quick
+exports where deleting the file to reset state is desirable. WAL keeps throughput high for those
+runs, while cheetah-db mirrors Level 1 contexts, counts, probabilities, continuations, and Top-K
+buckets for hot distribution reads. There is no MySQL target or automated migration path. Preserve
+both the SQLite file and the selected Cheetah database when a full trained/conversational state must
+survive. Run the Go server, point the env vars at it, and use helpers such as
+`engine.iter_hot_context_hashes()` or
 `engine.context_relativism(...)` when you need ordered scans or probabilistic tree walks over the
-stored contexts. When SQLite grows too large, simply delete/vacuum the scratch file; cheetah already
-keeps the low-latency copy alive.
+stored contexts. Delete or vacuum SQLite only when its relational state is explicitly disposable.

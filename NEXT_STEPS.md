@@ -29,6 +29,10 @@
   Full commands and storage/benchmark details are recorded in `studies/BENCHMARKS.md`.
 
 ## Active tasks
+- Repair the `--backonsqlite` startup contract: `build_cheetah_adapter()` currently raises
+  `SystemExit` before `train.py` can honor the flag when a configured Cheetah service is
+  unreachable. Add a focused startup regression, then either make the explicit fallback work or
+  remove the flag and stale compatibility branch.
 - Scale the repaired Cheetah-only path from the bounded 20-record validation to an
   evaluation-enabled 250/1,000-record emotion run; record decoder latency, Top-K hit ratio, and
   quality metrics without enabling SQLite fallback.

@@ -446,7 +446,7 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         "--cheetah-adversarial-learning-rate",
         type=float,
         default=None,
-        help="Override learning rate for adversarial prediction updates (default: 60% of --cheetah-token-learning-rate).",
+        help="Override learning rate for adversarial prediction updates (default: 60%% of --cheetah-token-learning-rate).",
     )
     parser.add_argument(
         "--cheetah-eval-predict",

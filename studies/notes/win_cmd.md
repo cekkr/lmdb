@@ -54,7 +54,8 @@ python -m spacy download en_core_web_sm
 > riccardo
 
 ### Default "next steps" prompt:
-[AI_REFERENCE.md](AI_REFERENCE.md): continue with NEXT_STEPS.md implementations to do in code or later updating [NEXT_STEPS.md](NEXT_STEPS.md). 
+[AGENTS.md](../../AGENTS.md): continue with the implementations in
+[NEXT_STEPS.md](../../NEXT_STEPS.md), updating that backlog as work changes.
 
 The current OS is Windows: use Ubuntu 24 through WSL, golang available, pip packages installed on python3.11.
 Example execution command on Ubuntu on Powershell: wsl.exe -d Ubuntu-24.04 -- echo example

@@ -1,336 +1,1262 @@
-# AI Reference
+# lmdb / DB-SLM — AI Agent Operational Reference
 
-Fast-access knowledge base for CUDAway. Update this alongside `README.md` whenever code or docs
-change so the next agent inherits the latest context.
+This is the fast-access operational map for `lmdb`, an experimental database-native statistical
+language model (DB-SLM). The Python stack implements n-gram generation, conversational memory,
+concept templates, evaluation, and Cheetah-backed prediction signals. It is research software, not a
+production large language model, not the Lightning Memory-Mapped Database library, and not proof
+that the planned quality or scale targets have been achieved.
 
-## Collaboration Rules
+## Read Order and Sources of Truth
 
-- Mirror meaningful changes into `README.md`, `AI_REFERENCE.md`, and (if a study) `studies/*`.
-- Read and record research results under `studies/` and cross-link them here so we avoid re-running the same
-  investigations.
-- Work incrementally, document breaking changes, and run the available build/test commands before
-  yielding control.
-- Always launch long-running services and workloads (smoke-train/benchmark runs, CI smoke tests, etc.) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent. When the WSL image cannot keep `screen` alive (missing setuid bit), fall back to `tmux` with the exact same discipline and log the substitution in your notes/runbook. Service-specific server guidance lives in `cheetah-db/AGENTS.md`.
+Use the following authority order. If two sources disagree, inspect the enforcing code and focused
+tests, correct stale documentation in the same task, and record unresolved contradictions under
+[Known Gaps](#known-gaps).
 
-### Next Steps
+1. [`LICENSE`](LICENSE) — legal terms for this repository.
+2. [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py), the executable dataset mappings
+   in [`datasets/`](datasets/), and the tests governed by
+   [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) — executable protocol and regression contracts.
+3. [`src/`](src/), [`scripts/`](scripts/), [`Makefile`](Makefile), [`requirements.txt`](requirements.txt),
+   and [`.env.example`](.env.example) — current implementation, command, dependency, and
+   configuration behavior.
+4. [`README.md`](README.md) — user-facing setup and CLI documentation. It does not override source
+   behavior.
+5. [`studies/DB_SLM_DATABASE_AND_ALGORITHMS.md`](studies/DB_SLM_DATABASE_AND_ALGORITHMS.md) —
+   algorithm and relational-schema design. Sections that still discuss MariaDB or future work are
+   design history unless current source implements them.
+6. [`NEXT_STEPS.md`](NEXT_STEPS.md) — the single active backlog. A backlog item is not shipped
+   behavior.
+7. [`studies/BENCHMARKS.md`](studies/BENCHMARKS.md) and the remaining [`studies/`](studies/) notes —
+   measured results, rationale, and historical research. Dates and performance numbers belong
+   there, not in this handbook.
 
-`NEXT_STEPS.md` is now the single backlog source; consult it for active tooling tasks and update that file first before mirroring high-level context here. Update it with your new objectives, remove already completed and no more important steps to remember.
+The root handbook governs the Python DB-SLM application and its orchestration. The nested
+[`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) is mandatory and more specific for the Go submodule,
+its wire protocol, on-disk formats, tests, runtime configuration, and server operations.
 
-### Working With cheetah-db
+## Collaboration and Maintenance Rules
 
-Cheetah is the `cheetah-db/` Git submodule, sourced from `https://github.com/cekkr/cheetah`. Read `cheetah-db/AGENTS.md` before launching the Go service, touching cheetah namespaces, or editing env vars such as `DBSLM_CHEETAH_*`.
+- Read this file completely, check `git status`, and locate every nested `AGENTS.md` applicable to
+  the files being changed before editing. Preserve unrelated user changes and untracked data.
+- Keep one owner for each kind of knowledge: user workflows in [`README.md`](README.md), active work
+  in [`NEXT_STEPS.md`](NEXT_STEPS.md), research and benchmark evidence in [`studies/`](studies/), and
+  durable agent-facing contracts and ownership here. This file is the only root operational
+  handbook; MUST NOT recreate a second reference with overlapping authority.
+- Update this handbook in the same change whenever a durable fact changes: file ownership, public
+  symbols, CLI or protocol surfaces, configuration, persistence, lifecycle, feature status,
+  recurring failure prevention, or focused test ownership.
+- Mirror user-visible commands and configuration changes into [`README.md`](README.md). Record
+  studies and measurements under [`studies/`](studies/) and cross-link them; update
+  [`NEXT_STEPS.md`](NEXT_STEPS.md) first for new or completed backlog work.
+- Run focused checks for every changed subsystem and report checks not run. Do not claim benchmark,
+  quality, or scale improvements without recording a reproducible run in
+  [`studies/BENCHMARKS.md`](studies/BENCHMARKS.md).
+- Treat `.env`, `var/`, raw `datasets/*.json`, Cheetah data directories, logs, PID files, SQLite
+  files/WALs, model caches, and built binaries as local runtime state. They are ignored and MUST NOT
+  become implementation owners or be committed.
+- Keep generic database-server work in the [`cheetah-db`](cheetah-db/) submodule. Commit and test
+  the change in the Cheetah repository, then advance this repository's gitlink. Keep only DB-SLM
+  adapters and orchestration in this repository; never re-vendor Cheetah source.
+- Launch every long-running service, smoke train, benchmark, or CI-style workload in `screen`.
+  Before launch, inspect `screen -ls` for a lingering session, use an explicit timeout of at most
+  30 minutes by default (at most one hour only when justified before launch), and monitor its log
+  while it runs. If `screen` cannot stay alive, use `tmux` with the same checks and record the
+  substitution. Prefer the bounded helpers in [`scripts/`](scripts/).
+- Before a commit, review the full diff, confirm `AGENTS.md` describes the post-commit tree, validate
+  local links and exact commands touched, and make sure no runtime artifacts or secrets are staged.
 
-Keep reusable database-server work upstream: make generic fixes, protocol improvements, and shared implementations in the `cheetah-db` submodule; follow its documentation and test requirements; then commit the change in the Cheetah repository itself. Update this repository's submodule gitlink to the resulting Cheetah commit. Keep only DB-SLM-specific adapter and orchestration changes in this repository—never re-vendor Cheetah sources here.
+## Essential Project Principles
 
-- The current submodule repair commit is `6866be9`: `ValuesTable` reserves distinct append slots
-  with an atomic high-water mark, and the database serializes full pair mutations so equal-size
-  inserts and concurrent shared-prefix `PAIR_SET` traffic cannot overwrite one another. Keep the
-  associated Go regression tests green before advancing the gitlink.
-- Trainer `--reset` now shrinks the cheetah namespace scan page size whenever `PAIR_SCAN` stalls and bumps the TCP idle-grace window to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)` seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`, clamp via `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS`). Fresh databases therefore stop flooding the console with `cheetah response timed out after 30.0s of inactivity`, and slow disks can be accommodated by simply raising the timeout or idle-grace fields. When supported, `--reset` first issues `RESET_DB <DBSLM_CHEETAH_DATABASE>` to delete the entire cheetah namespace in one shot, then falls back to `PAIR_PURGE` (and finally the incremental scan loop) when older binaries lack the command.
-- The hot-path adapter now queues reducers through Cheetah's canonical `JOB submit command=<base64>`,
-  polls `JOB status id=...`, and retrieves completion once with `JOB fetch id=...`. It falls back to
-  `PAIR_REDUCE_ASYNC` / `PAIR_REDUCE_FETCH` only when an older server rejects `JOB`. Reducer rows
-  also remove Cheetah's storage-transport base64 layer before DB-SLM deserialization. Tweak
-  `CHEETAH_REDUCE_ASYNC` or `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to control async use and polling;
-  synchronous fallbacks still honor the idle-grace clamp.
-- cheetah-db now keeps a bounded number of open pair-table handles. Idle trie nodes close their file descriptors and re-open automatically when accessed so long ingest runs no longer trip `too many open files`. Override the cap via `CHEETAH_MAX_PAIR_TABLES` (defaults to the detected `RLIMIT_NOFILE` minus a safety margin) when running on hosts with larger limits or very dense namespaces.
-- Pair trie tables now ride on a managed I/O layer that caches 4 KiB sectors in RAM, queues dirty sectors through a background flusher, and only touches disk when necessary. Concurrent writers therefore hit in-memory buffers while the queue drains in the background, which both respects the descriptor cap and slashes SSD churn during heavy ingest.
-- The managed file cache now listens to `ResourceMonitor` memory pressure and aggressively flushes/evicts idle sectors. Dirty pages are forced to disk (default 30s after last access, hard cap 5 minutes), freed immediately after the write completes, and low-usage sectors are culled whenever RAM pressure crosses ~90% (tunable via `CHEETAH_CACHE_*`). Set `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`, `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH/LOW`, or the read/write weight knobs to bias which sectors survive.
-- The Python hot-path adapter now retries failed `PAIR_SET` registrations (default 4 attempts) and verifies the mapping with `PAIR_GET` before giving up. Tune the behavior via `CHEETAH_PAIR_REGISTER_ATTEMPTS` and `CHEETAH_PAIR_REGISTER_BACKOFF_SECONDS` when mirroring namespaces over high-latency links.
-- `src/train.py --cheetah-token-progress-interval` controls how often long-running cheetah prediction-table training emits progress logs (default 60s). Use this alongside the existing `--cheetah-token-*` knobs so evaluation cycles no longer appear "hung" while context matrices finish training.
+### Database-native generation is the product boundary
 
-## Prompt Tag Guardrails (High Priority)
+- Core token generation MUST flow through stored vocabulary, n-gram, cache, bias, and concept data;
+  do not replace it with a transformer call while presenting the result as DB-SLM behavior.
+- Sentence Transformers and the CoLA classifier are optional guidance/evaluation components. They
+  may use PyTorch, CUDA, or Metal Performance Shaders (MPS), but they do not own token generation.
 
-- `DBSLMEngine.register_prompt_tags()` (`src/db_slm/pipeline.py`) now seeds the built-in structural tokens (`|INSTRUCTION|:`, `|USER|:`, `|RESPONSE|:`, `|CONTEXT|:`, etc.), appends every dataset-specific tag in discovery order, and forwards that enumeration to both the tokenizer and `ContextWindowEmbeddingManager`. Always call `collect_prompt_tag_tokens()` before ingest/eval so the global enumerator stays authoritative.
-- Decoder sampling (`src/db_slm/pipeline.py` + `src/db_slm/decoder.py`) hard-bans those tokens and scans the first ~160 characters of every candidate for alias strings such as `user:` or `|instruction|:`. If any scaffold tag appears, the engine discards the text and re-runs decoding with a new RNG up to three times, mirroring how `|END|` retries work for too-short outputs.
-- If every decoder candidate still contains scaffold tags, `DBSLMEngine.respond()` clears the
-  rejected token IDs and emits a scaffold-free response backstop instead of returning the last
-  invalid candidate. `TaggedResponseFormatter` removes an already-framed terminal response tag
-  before wrapping so interactive inference never nests `|USER|:` frames.
-- Prompt-tag bans and evaluation detection now normalize case when `DBSLM_TOKENIZER_LOWERCASE=1`, preventing lowercased tags (e.g., `|response|:`) from leaking into generations or slipping past retry gates.
-- Context windows (`src/db_slm/context_window_embeddings.py`) now store the running mean/variance of each tag enumerator per dimension. These tag-aware weights flow into `ContextDimensionTracker`, so predicting a tag that belongs to a different prompt segment immediately increases the presence/frequency penalty even before the string-level guard activates.
-- Level 3 `ContextSummary` payloads now stay internal to decoding. `DBSLMEngine.respond()` still feeds the summary into the rolling context and context-window bias text, but the synthesized `|CONTEXT|:` line is never prepended to user-visible generations, keeping datasets in full control of which tags reach the prompt/response stream.
+### Cheetah is the Level 1 operational path
 
-## Codebase State
+- With `DBSLM_BACKEND=cheetah-db`, Level 1 contexts, counts, probabilities, Top-K rows, metadata,
+  and prediction signals MUST use the Cheetah adapter. SQLite remains the relational working store
+  for schema bootstrap, Level 2/3 state, and scratch/export workflows.
+- Do not hide Cheetah failures by silently changing backends. A SQLite-only run must be explicitly
+  requested and treated as a reduced-capability experiment.
 
-- `src/db_slm` now mirrors the v2 DB-SLM spec. Level 1 owns the vocabulary, tokenizer (regex by
-  default or Hugging Face `tokenizers` when configured), hashed
-  context registry, Modified Kneser–Ney smoother, quantized probability tables, and Top-K cache.
-  Level 2 combines episodic logging, concept-ready correction digests, pointer-sentinel session
-  caches, and token-level bias plumbing. Level 3 provides concept dictionaries, template
-  verbalization, probability materialization, and conversation-scoped signals.
-- `studies/DB_SLM_DATABASE_AND_ALGORITHMS.md` remains the authoritative schema/algorithm reference
-  for the relational layout plus the KN materialization + decoding loops implemented in Python.
-- `requirements.txt` now installs `sentence-transformers` (external embedding baseline),
-  `language-tool-python` (grammar deltas for the quality gate), Hugging Face `tokenizers` (regex
-  replacement backend), plus spaCy **and** Stanza so at least one dependency-parser stack is ready for
-  the new training annotations. Optional GPU acceleration is auto-detected via PyTorch when present.
-- `src/train.py` passes every JSON/NDJSON prompt/response through the dependency parser (preferring
-  spaCy via `DBSLM_SPACY_MODEL`, falling back to Stanza via `DBSLM_DEP_LANG`/`DBSLM_STANZA_PROCESSORS`)
-  and appends a `DependencyLayer: {...}` JSON blob to the staged corpus text. The blob enumerates the
-  arcs plus a strong-token bucket list (subjects, objects, actions, modifiers, etc.) so the trainer
-  and quality gate can weight those terms without growing the n-gram order. When neither backend is
-  installed we emit a single warning and continue without the metadata.
-- `src/train.py` parallelizes corpus staging (JSON chunking, dependency parsing, hold-out selection)
-  via the new `--prep-workers` (default: `max(1, cpu_count-1)`) and `--prep-prefetch` options so the
-  ingestion loop can stay CPU-bound on the DB/Smoother while workers feed ready-to-train chunks.
-  Std-in payloads are still staged synchronously to avoid buffering surprises.
-- Dataset configs now honor `context_fields[].placement` so structured metadata (for example the
-  GPTeacher `instruction` column) can be injected ahead of the user prompt as `|INSTRUCTION|: ...`.
-  `DatasetConfig.compose_prompt()` mirrors that preface for evaluation prompts, guaranteeing that
-  training chunks and held-out probes share the same `|INSTRUCTION|` + `|USER|` framing. The
-  inference CLI exposes `--instruction`, `--instruction-label`, and `--user-label` so `run.py`
-  sessions can generate prompts with the identical scaffolding.
-- Evaluation probes reuse the stored dependency layers to compute `strong_token_overlap` and
-  `dependency_arc_overlap` metrics for each generation. Both are logged next to ROUGE/perplexity and
-  folded into the metrics export so we can tell whether the decoder is preserving grammatical
-  structure vs. just matching surface tokens.
-- Trainer start-up now hard-fails when `language_tool_python` or a local `java` runtime are missing,
-  so we no longer discover hours later that grammar metrics could not run. Install Java and
-  `language-tool-python` before invoking `src/train.py`.
-- Every staged response line now includes a trailing `|END|` tag. The decoder strips this token
-  before responses hit the REPL/logs, and `EvalLogWriter` records a `cycle_reference` entry with the
-  first full reference/generated sentence for each evaluation batch so the JSON timeline always
-  captures a non-truncated exemplar for the cycle.
-- Prompts handed to the decoder now always finish with the dataset-provided response label via
-  `db_slm.prompt_tags.ensure_response_prompt_tag()`. `train.py`, `load_eval_dataset()`, and
-  `run_inference_records()` call the helper before decoding, and `run.py` exposes
-  `--response-label` for interactive sessions. This is a high-priority invariant: without the
-  terminal `|RESPONSE|:` (or override) the model continues the `|USER|:` frame instead of producing a
-  reply, corrupting both training chunks and eval probes.
-- Dataset configs now advertise every `|TAG|:` prefix (prompt/response labels plus any context
-  `canonical_tag` entry such as `|CTX|`), and `train.py` registers those sequences as atomic tokens
-  so the regex tokenizer never splits them into stray pipes/colons. That guarantees stable vocab IDs
-  for tags like `|USER|:` / `|INSTRUCTION|:` and lets each corpus opt-in to canonical context headers
-  by setting `canonical_tag`; datasets that skip the field no longer receive automatic `|CTX|:`
-  prefixes.
-- Training runs with `--ngram-order` >= 5 now merge repeated token runs into composite tokens by default
-  (`--merge-max-tokens 5`) and can recurse merges via `--merge-recursion-depth`. Spans below the
-  average frequency of all candidate spans are discarded, and runs dominated by high-frequency
-  tokens are down-weighted so generic phrases are less likely to merge. When merging is active the
-  trainer can also ingest baseline (unmerged) tokens (`--merge-train-baseline`) and evaluation logs
-  baseline perplexity (`--merge-eval-baseline`). Merge significance tracking records
-  applied/candidate ratios and can retire low-significance merged tokens via
-  `--merge-significance-threshold`; the retired list persists in metadata (SQLite + cheetah) so
-  future tokenization skips those merges (IDs remain in vocab for now). Set `--merge-max-tokens 0`
-  to disable.
-- `src/train.py` streams corpora into the SQLite store, triggering KN rebuilds + Top-K refreshes per
-  ingest; `src/run.py` exposes the concept-aware REPL that performs Level 3 → Level 1 decoding with
-  cache/bias adjustments. `run.py` now spawns a child decoder process (spawn context) so REPL input
-  stays responsive on multi-core hosts; `:history` and the new `:status` alias proxy through the
-  worker to fetch conversation windows/dim metadata.
-- Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
-  large JSON chunks no longer look frozen; the logs include approximate line counts to show where
-  the trainer is spending time.
-- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the screen-first helpers are documented in `README.md` and `cheetah-db/AGENTS.md`.
-- Realtime resource telemetry now flows through `src/helpers/resource_monitor.py`: during ingest profiles and every evaluation probe we record CPU %, RSS deltas, thread counts, and disk I/O (leveraging psutil with `resource` fallbacks) and push those samples both to the console and to the metrics export JSON.
-- `CheetahHotPathAdapter` now spins up a dedicated cheetah-db TCP client per thread (with a shared factory + warm connection) so ingest, evaluation, and background workers can exercise true multi-core concurrency without funneling through a single socket; custom clients can still be injected for tests, but the default path uses the thread-local pool.
-- `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
-  segments, embedding signatures, and context keyword tokens so Level 1 learns efficient splits in
-  real time. Dataset metadata is now declared via `datasets/<name>.config.json`, which lets the
-  loader emit canonical `|CTX|:<token>:<value>` lines whenever a context field sets `canonical_tag`; the sentence-part embedder lifts those tags
-  into headers and supplements them with `|CTX_KEY|` keywords derived solely from the segment text +
-  embedder energy (the `_EMOTION_WORDS` allowlist is gone). Configure the embedding backbone with
-  `DBSLM_EMBEDDER_MODEL`, or force hashed-only, offline guidance (no Hugging Face downloads) via
-  `DBSLM_EMBEDDER_OFFLINE=1`.
-- Context dimensions now double as MiniLM-driven window embeddings. When you pass spans such as
-  `--context-dimensions 6,12,24`, the trainer samples that many words per dimension (stride → 50%),
-  embeds the windows with `all-MiniLM-L6-v2`, and keeps running prototypes per dimension inside both
-  SQLite metadata and the cheetah hot-path namespace. During inference the decoder reuses those
-  prototypes to scale the per-dimension presence/frequency penalties via cosine similarity, so the
-  learned multi-scale contexts influence sampling without needing per-token embedding calls. The
-  same context matrices now append dimension-level summary/fusion vectors so cheetah prediction
-  tables see a hidden-layer style projection that differentiates short vs. long window signals, and
-  extra fused tiers are added automatically when dimension summaries diverge; `--context-window-depth`
-  biases how deep those tiers run (default now deeper). Training window sampling now adapts to token
-  volume (with `--context-window-train-windows` acting as the cap), and prototype counts gate how deep
-  those extra tiers run so early training stays shallow while richer corpora unlock more depth. Token
-  prediction calls can now send weighted context matrices (`{"rows":[...],"weights":[...]}`) so cheetah
-  scales each row before applying prediction-table updates or queries.
-  Presets `default`, `deep`, and `shallow` are now accepted for `--context-dimensions` (default spans
-  1-2,3-5,6-10,11-18; deep adds 19-31). cheetah-db now deepens every context matrix with derived
-  mean/variance/contrast/interaction layers that scale with context diversity before prediction
-  training/querying; toggle via `CHEETAH_PREDICT_DEEPEN=0` if needed. `train.py` also exposes
-  `--context-window-train-windows`, `--context-window-infer-windows`, and `--context-window-stride-ratio`
-  to control how densely those windows are sampled.
-- `src/train.py` now persists a fast-resume state under `var/train_resume.json` and automatically
-  resumes the last interrupted ingest when invoked with no arguments, skipping completed chunks.
-- Future idea: promote each dimension to a small codebook (k-means per window size) and expose a CLI
-  inspector so we can audit the learned prototypes or pin certain domains (code, poetry, etc.)
-  before wiring them into penalty scaling.
-- Tokenization now supports a Hugging Face-backed backend: set
-  `DBSLM_TOKENIZER_BACKEND=huggingface`, point `DBSLM_TOKENIZER_JSON` at a tokenizer.json
-  (usually exported from `tokenizers` or HF Hub), and optionally disable lower-casing with
-  `DBSLM_TOKENIZER_LOWERCASE=0`. Missing packages or files trigger a logged warning and fall back to
-  the legacy regex splitter so training/evals always proceed.
-- Evaluation probes now request at least 20 generated words (scaling up toward the reference length)
-  via a response backstop so lexical / ROUGE / perplexity logs never drop a row due to blank or
-  truncated generations.
-- `run_inference_records()` now retries with a fresh RNG seed whenever the decoder emits a prompt tag
-  (|USER|, |INSTRUCTION|, |RESPONSE|, etc.) so evaluation logs capture actual completions instead of
-  scaffolding tokens; retries still consume the `_MAX_BATCH_ATTEMPTS` budget to keep probes bounded.
-- Evaluation now tracks cross-sample repetition via `helpers/char_tree_similarity.py`, exposes
-  `char_repeat_max/avg` metrics, feeds them into `QualityGate`, and automatically re-queues variants
-  with stronger presence/frequency penalties whenever the generated text matches earlier prompts too
-  closely.
-- Level 2 metadata now rides the same channel: `ConversationMemory` writes stats to
-  `meta:l2:stats:<conversation_id>`, correction digests to `meta:l2:corr:<conversation_id>`, and
-  bias presets to `meta:l2:bias:<conversation_id|__global__>`. Decoder/cache components consult those
-  JSON blobs first so a restarted trainer no longer needs warm-up SQL reads before issuing concept or
-  bias-aware generations. Metadata helpers now strip duplicate `meta:` prefixes and fall back to
-  legacy `meta:meta:l2:*` entries so existing mirrors stay readable while new writes remain canonical.
-- `src/train.py` now exposes `--profile-ingest` for RSS/latency logging and prints lexical overlap,
-  ROUGE-L, plus generated/reference perplexity in every evaluation probe so we can quantify gains
-  during long streaming ingests.
-- `src/train.py` now accepts `--decoder-presence-penalty` and `--decoder-frequency-penalty` so repeat
-  penalty grids can run directly from the CLI; overrides propagate to periodic + hold-out probes and
-  are recorded inside the metrics metadata for downstream comparisons. These knobs only influence
-  evaluation decoding—training statistics still reflect the raw corpus, so use higher penalties plus
-  richer context dimensions when repetition creeps into probe outputs.
-- `src/train.py` can reserve a slice of every JSON/NDJSON chunk for immediate evaluation via
-  `--chunk-eval-percent`; those hold-out prompts/responses skip training, run through the same
-  inference metrics the moment the chunk finishes ingesting, and refresh the rolling evaluation pool
-  so future periodic probes always contain freshly sampled rows instead of the initial fixed set.
-- Randomness controls now live on the CLI: `--seed` pins Python's RNG for chunk sampling/hold-outs,
-  `--eval-seed` sets the base for evaluation randomness (auto-generating one per run when omitted),
-  and `--eval-variants` forces multiple generations per prompt even when context dimensions are off.
-  `VariantSeedPlanner` derives unique sub-seeds for every prompt/variant/attempt combination so
-  repeated probes explore different structures while remaining reproducible when the base seed is
-  provided.
-- Training-time probes now spin up seedless conversations so low-resource scaffolding never masks
-  evaluation outputs; if you still need the canned turns (e.g., via `run.py`) the helper stays
-  enabled for interactive sessions only.
-- `DBSLMEngine` still seeds low-resource conversations with two caretaker turns, but the paraphraser
-  now uses length-aware thresholds and explicit guard rails so multi-turn prompts or corrective
-  instructions are never rewritten while we avoid verbatim echoes.
-- Responses produced via `train.py` probes and `run.py` REPL now emit tagged frames
-  (`|USER|`, `|RESPONSE|`, and similarly `|TAG_NAME|`) with randomized keyword-focused openers so evaluation logs and
-  training data never echo prompts verbatim and clearly distinguish generated text from context.
-- Evaluation summaries are written both to stdout and to structured JSON under
-  `var/eval_logs/train-*.json`. Set `--metrics-export <path>` (or `-` to disable) to control the feed,
-  which captures probe averages plus optional ingest profiling samples.
-- Context-dimension runs automatically score every held-out prompt twice per probe, logging variants
-  `#idx.1`/`#idx.2` separately so the grouped frequency penalty can adapt in real time and surface
-  duplicate structures that still leak through.
-- Sentence quality checks now combine LanguageTool grammar deltas, the CoLA acceptability head, and
-  embedder-based semantic similarity/novelty. Metrics land next to lexical/ROUGE/perplexity in the
-  eval logs, and low-scoring generations are appended to `DBSLM_QUALITY_QUEUE_PATH`
-  (`var/eval_logs/quality_retrain_queue.jsonl` by default) so we can re-train against the weakest
-  samples later.
-- Set `DEVICE=cuda` or `DEVICE=mps` before invoking `src/train.py` to run the sentence-transformer
-  embedder plus the CoLA acceptability head on that accelerator whenever PyTorch reports it as
-  available. Invalid requests log a single notice and the trainer falls back to CPU automatically.
-- Evaluation probes now emit structural-diversity metrics (`structure_variety`, `common_token_penalty`,
-  `token_group_share`, `top_token_share`, opener diversity, punctuation balance) that explicitly devalue templated
-  responses. `QualityGate` ingests the same metrics so over-repeated openings or punctuation abuse
-  get queued for retraining, and both periodic and chunk hold-out probes always run at least two
-  samples (topped up from the rolling pool when needed). `SentenceQualityScorer` now scales
-  `quality_score` down whenever `token_group_share` exceeds 0.30 so repetition spikes show up in the
-  aggregate means.
-- Adversarial prediction fixes now ride alongside evaluation. When a probe is flagged or its
-  `quality_score` dips below `--cheetah-adversarial-threshold`, the trainer derives a context matrix
-  from the prompt + metadata, reinforces the reference tokens, and down-weights the generated tokens
-  with a single `PREDICT_TRAIN` call that carries `negatives=`. Tune via
-  `--disable-cheetah-adversarial-train`, `--cheetah-adversarial-max-negatives`, and
-  `--cheetah-adversarial-learning-rate` (defaults to 60% of the main cheetah-token rate) so bad
-  generations immediately correct the prediction table instead of waiting for a full retrain.
-- Prediction tables now persist normalized window hints from every training/adversarial context. The
-  Go reducers blend those stored hints with any caller-supplied windows (or fall back to the hints
-  when none are provided), exposing hidden correlations in context matrices without extra CLI
-  arguments.
-- Latest smoke-train matrix (2025-11-10, python3.11) now runs
-  `baseline_profiled` (400-row ingest, profiling enabled) followed by
-  `penalty_sweep_holdout` (240-row ingest with chunk hold-outs + penalty overrides) via
-  `scripts/smoke_train.py`. Combined they logged ~882k tokens with avg quality 0.599 and
-  structure_variety 0.317 (`studies/BENCHMARKS.md`). Real-time stats stream into
-  `var/smoke_train/benchmarks.json`, while full evaluation payloads land in
-  `var/smoke_train/metrics/<scenario>.json`. Monitor the 64% flagged rate—pool diversity or penalty
-  tuning is still needed to push it below the new 0.55 `common_token_ceiling`.
-- Latest Cheetah-only validation (2026-07-23, python3.11) trained 20 actual
-  `datasets/emotion_data.json` records into a named Cheetah database: 380,200 tokens and 380,198
-  n-grams completed in 206.82 seconds, with 431 prediction updates and no hot-path disable or SQLite
-  fallback. A follow-up `run.py` prompt reused that database and returned one correctly framed
-  `|USER|` / `|RESPONSE|` / `|TAGS|` response. Commands and adaptive Go benchmark numbers are in
-  `studies/BENCHMARKS.md`.
-- Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
-  re-queued into a random spot of the current probe before being eligible for up to three additional
-  appearances in later random batches so probes cannot loop forever when the generator keeps
-  emitting low-quality responses.
-- The evaluator infers `min_response_words` from the reference length (capped at 512) so long-form
-  corpora like `emotion_data.json` do not lose the substantive portion of the `|RESPONSE|` frame, and
-  CPU-heavy quality scoring is gated behind the adaptive load monitor to avoid starving ingestion.
-- Both `train.py` and `run.py` now rely on `db_slm.inference_shared.issue_prompt()` so scripted probes
-  and the REPL reuse the same conversation bootstrapper.
-- `scripts/run_paraphraser_regression.py` consumes `studies/paraphraser_regression.jsonl` to ensure
-  multi-turn corrective threads, structural tags, and ordinary prompts all trigger the expected
-  paraphraser behavior.
-- Inserts/edits now seed the cache and deletes invalidate their slots, so you can chain
-  ingest → reducer → decoder without reopening the same offsets. Keep the server alive between
-  pipeline stages to retain the warm cache; restarting the process will cold-start the cache and
-  briefly spike SSD I/O on the next run.
-- After restarts, prime the cache by issuing low-limit `PAIR_SCAN ctx:` passes (with cursors) or
-  scripted `READ` loops over the namespaces the trainer/decoder will rely on. This shifts the
-  initial churn into RAM and prevents a fresh workload from hammering the same disk sectors.
-## Operational Notes
+### Dataset configuration owns corpus framing
 
-### Streaming Ingest / Profiling
+- JSON/NDJSON field names, prompt/response labels, context placement, and canonical tags MUST come
+  from the adjacent `*.config.json` or an explicit override. Dataset-specific field assumptions
+  MUST NOT be hard-coded into the engine.
+- Training and evaluation MUST compose the same prompt framing, including the terminal response
+  label, so held-out probes test the distribution that was trained.
 
-- Enable `--profile-ingest` whenever you push `--json-chunk-size` above 500 rows. The profiler logs
-  per-corpus latency plus RSS deltas so you can note the tipping point in `NEXT_STEPS.md` (current
-  guidance: stay under ~2.5 GB RSS and <5 s per chunk on 16 GB laptops).
-- While testing queue drains or ad-hoc corpora on WSL/Windows hosts, force `--max-json-lines 500`
-  (the drain helper already does this) so every run exercises the same bounded chunk path and keeps
-  memory spikes predictable.
-- Let the held-out probes run with ROUGE/perplexity enabled so you can correlate throughput tweaks
-  with quantitative gains instead of relying on overlap logs only.
-- `datasets.md` now tracks basic stats for `emotion_data.json` (avg response 347 words, max 1,251) so
-  chunk sizes, eval thresholds, and paraphraser guard rails stay grounded in the actual corpora.
-- Dataset-specific schema is declared beside each corpus as `datasets/<name>.config.json`
-  (see `datasets/emotion_data.config.json`). The loader uses it to map prompt/response fields,
-  expose optional context tokens, and emit canonical headers such as `|CTX|:<token>:<value>` whenever a context field sets `canonical_tag`, so no code change is required when swapping corpora.
-- Prefer `make smoke-train` for regressions: it now iterates both baseline + penalty scenarios,
-  writes live stats to `var/smoke_train/benchmarks.json`, and exposes switches (see `SMOKE_*` vars in
-  the `Makefile`) so you can resume or subset the matrix without editing the script.
+### Stored state and wire formats are contracts
 
-### Queue-Drain Runs
+- Context hashes, quantized values, Cheetah namespaces, serialized fixed-size payloads, and metadata
+  keys are cross-process compatibility surfaces. Change them only with round-trip coverage and an
+  explicit compatibility/migration decision.
+- Caches are derived acceleration state. They MUST be invalidated or refreshed with the underlying
+  mutation; never make a warm-cache-only behavior the correctness path.
 
-- `scripts/drain_queue.py` automates the `Queue-Drain Retrain` preset from `studies/best_commands.md`.
-  It inspects `DBSLM_QUALITY_QUEUE_PATH`, skips execution until the line count exceeds the provided
-  `--threshold` (default 150), then shells out to `python3.14 src/train.py ...` with the documented
-  flags. The helper now forces `--max-json-lines 500` for every drain so we exercise the same chunk
-  boundaries during testing, exports metrics to
-  `var/eval_logs/train-queue-drain-*.json`, and trims the queue back to `--queue-cap` entries
-  (default 200) once a run succeeds.
-- The smoke-train harness watches queue depth too: passing `--queue-drain-threshold`/`--queue-drain-cooldown`
-  (defaults 175 / 900s) arms an automated drain worker that launches the helper as soon as telemetry
-  crosses the threshold, writes the resulting metrics file under `var/smoke_train/drains/`, and
-  appends a summary section (“Queue Drain (auto smoke harness) …”) to `studies/BENCHMARKS.md`.
-- `--dry-run` prints the exact command; `--queue /path/to/file` and `--python` let you point at
-  alternate queues/interpreters, and `--max-json-lines`/`--queue-cap` can be overridden when
-  load-testing different limits. Use the PowerShell helper pattern
-  `wsl.exe -d Ubuntu-24.04 -- PYTHONPATH=src ... scripts/drain_queue.py ...` whenever you need the
-  Linux toolchain but want to orchestrate runs from Windows.
+### Expensive work must be bounded and observable
 
-### Smoke-Train Matrix
+- Corpus staging, evaluation retry loops, reducer polling, queue drains, services, and benchmarks
+  MUST have caps, timeouts, progress signals, and recoverable state where supported.
+- Adapt concurrency to host load and preserve logs/metrics needed to explain stalls or regressions;
+  do not introduce unbounded worker, socket, cache, or file-handle growth.
 
-- `scripts/smoke_train.py` orchestrates sequential scenarios. Default entries (`baseline_profiled`
-  and `penalty_sweep_holdout`) can be overridden via `--matrix path/to/matrix.json` where the JSON
-  contains either `{"scenarios": [...]}` or a plain list.
-- The orchestrator tails trainer stdout and writes progress/last-log snapshots plus the most recent
-  metrics summaries into `var/smoke_train/benchmarks.json`. Agents looking for real-time signals
-  should watch this file instead of parsing console output.
-- Each scenario automatically exports `--metrics-export` data to
-  `var/smoke_train/metrics/<scenario>.json`, so downstream analysis can pull structured summaries as
-  soon as a scenario finishes. The benchmark file records those paths per scenario.
-- The telemetry thread now exposes `--queue-drain-threshold`, `--queue-drain-cooldown`,
-  `--queue-drain-{script,metrics-dir,benchmarks}`, and `--disable-auto-queue-drain`. Leaving the
-  automation enabled means queue overflows trigger `scripts/drain_queue.py` automatically and the
-  resulting metrics block is mirrored into `studies/BENCHMARKS.md` without manual editing.
-- Use `--scenarios a,b` or `SMOKE_SCENARIOS=a,b` to run a subset, `--resume-from name` to skip ahead,
-  and `--dry-run` to print the commands while still updating `benchmarks.json` for planning.
+## Critical Implementation Contracts
 
-- Use `engine.iter_hot_context_hashes()` for namespace sweeps and
-  `engine.context_relativism([...])` when you need probabilistic trie traversals with deterministic
-  ordering. Both use `PAIR_SCAN` under the hood so traversals never touch SQL.
+- **Prompt tags are atomic and banned from generated content.**
+  [`collect_prompt_tag_tokens`](src/train.py),
+  [`DatasetConfig.prompt_tag_tokens`](src/db_slm/dataset_config.py), and
+  [`DBSLMEngine.register_prompt_tags`](src/db_slm/pipeline.py) enumerate built-in and
+  dataset-specific tags before ingest/evaluation. `DBSLMEngine.respond` bans their token IDs,
+  performs case-normalized alias checks over each candidate, retries with fresh randomness, and
+  emits a scaffold-free backstop after retry exhaustion. Preserve this sequence and the formatter
+  regression in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
+- **Every decoder prompt ends in the selected response label.**
+  [`ensure_response_prompt_tag`](src/db_slm/prompt_tags.py) is called by the training evaluation
+  loader and both inference modes. Omitting the terminal `|RESPONSE|:` makes the model continue the
+  user frame. Staged responses end with `|END|`; user-visible output strips it through
+  [`src/db_slm/text_markers.py`](src/db_slm/text_markers.py).
+- **Internal Level 3 context never becomes visible scaffold.**
+  [`DBSLMEngine.respond`](src/db_slm/pipeline.py) may add `ContextSummary` text to the rolling
+  context and embedding input, but it MUST NOT prepend the internal `|CONTEXT|:` payload to the
+  response. [`TaggedResponseFormatter`](src/db_slm/pipeline.py) removes an already-terminal response
+  frame before wrapping to prevent nested `|USER|:`/`|RESPONSE|:` blocks.
+- **Cheetah reducer transport has two encoding layers.**
+  [`CheetahClient.pair_reduce`](src/db_slm/adapters/cheetah.py) uses canonical
+  `JOB submit command=<base64>` → `JOB status id=...` → `JOB fetch id=...`, falling back to legacy
+  `PAIR_REDUCE_ASYNC`/`PAIR_REDUCE_FETCH` only when the server rejects `JOB`.
+  [`CheetahClient.decode_reduced_payload`](src/db_slm/adapters/cheetah.py) removes the storage
+  base64 layer before [`CheetahSerializer`](src/db_slm/adapters/cheetah.py) decodes DB-SLM bytes.
+  Both paths are covered in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
+- **Cheetah pair registrations are verified and concurrency-safe.**
+  [`CheetahHotPathAdapter._register_pair`](src/db_slm/adapters/cheetah.py) retries `PAIR_SET` and
+  confirms with `PAIR_GET`. The submodule gitlink currently points to repair commit `6866be9`, whose
+  atomic high-water mark and serialized pair mutations prevent equal-size inserts and
+  shared-prefix writes from overwriting each other. Before advancing the gitlink, run the focused
+  Cheetah regression tests listed in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- **Cheetah visibility and reducer extension are server-owned.**
+  `PAIR_SET_HIDDEN` stores terminals excluded from default `PAIR_SCAN`/`PAIR_REDUCE`/`PAIR_SUMMARY`;
+  callers must request `include_hidden=1` to inspect cached joins. New reducer modes belong in the
+  registry in [`cheetah-db/src/reducers.go`](cheetah-db/src/reducers.go), not in Python command
+  dispatch. Follow the focused server tests in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- **Metadata keys have one canonical `meta:` prefix.**
+  [`ConversationMemory`](src/db_slm/level2.py), [`SessionCache`](src/db_slm/level2.py), and
+  [`BiasEngine`](src/db_slm/level2.py) write `meta:l2:*` values through the hot-path adapter.
+  Readers accept the historical `meta:meta:l2:*` form only for compatibility; new writes MUST NOT
+  recreate it.
+- **Context and merge settings persist across processes.**
+  [`DBSLMEngine._init_context_dimensions`](src/db_slm/pipeline.py) and
+  [`DBSLMEngine._init_token_merging`](src/db_slm/pipeline.py) read Cheetah metadata first, fall back
+  to SQLite metadata, and write the resolved values to both. Inference with CLI overrides may
+  intentionally differ, but do not silently reinterpret an existing model.
+- **`--reset` is destructive across both stores.**
+  [`resolve_db_path`](src/train.py) removes the selected SQLite database plus WAL/SHM artifacts, and
+  [`reset_cheetah_store`](src/train.py) attempts `RESET_DB` before progressively slower namespace
+  purge fallbacks. Always select and verify the intended `DBSLM_CHEETAH_DATABASE`; never run a reset
+  against an ambiguous shared namespace.
+- **A configured Cheetah backend currently fails closed at startup.**
+  [`build_cheetah_adapter`](src/db_slm/adapters/cheetah.py) raises `SystemExit` when the warm
+  connection fails. Consequently, the later `--backonsqlite` branch in [`src/train.py`](src/train.py)
+  is not reached for that failure path. Do not claim that the flag currently rescues an unreachable
+  configured backend; this active contradiction is tracked under [Known Gaps](#known-gaps).
+- **Long-running process ownership is explicit.**
+  [`scripts/start_cheetah_server.sh`](scripts/start_cheetah_server.sh) records the exact server PID,
+  refuses a live duplicate session, and attaches a timeout. Stop through
+  [`scripts/stop_cheetah_server.sh`](scripts/stop_cheetah_server.sh); do not use broad process kills
+  when the PID/session helpers can identify the target.
 
-### DB Adapters
+## Architecture and Data/Control Flow
+
+Training:
+
+`src/train.py` → settings/CLI validation → dataset config + parallel corpus/dependency staging →
+`DBSLMEngine.train_from_text` → tokenizer/vocabulary → `NGramStore.ingest` →
+`MKNSmoother.rebuild_all` → SQLite relational tables + Cheetah namespaces → periodic evaluation,
+quality queue, adversarial prediction updates, metrics, and resume state.
+
+Inference:
+
+`src/run.py` parent REPL → spawned `PromptWorker` → `issue_prompt` → `DBSLMEngine.respond` →
+Level 3 concept signal → Level 2 history/cache/bias → `Decoder.decode` →
+`TokenScoringPipeline.score` → Cheetah Top-K/prediction data with n-gram fallback → prompt-tag guard,
+response backstop, formatter, and Level 2 message log.
+
+External process boundary:
+
+`CheetahHotPathAdapter` → thread-local `CheetahClient` TCP connections → unauthenticated Cheetah text
+protocol → Cheetah pair tries, reducers, managed files, and prediction tables. The Go service and its
+storage are owned by the submodule; Python owns serialization, namespace conventions, retries, and
+DB-SLM orchestration.
+
+Persistence ownership:
+
+- SQLite owns the relational schema in [`DatabaseEnvironment`](src/db_slm/db.py), including
+  vocabulary, counts/probability staging, conversation history, biases, and concepts.
+- Cheetah owns its named on-disk database and serves Level 1 mirrors, metadata, reducers, and
+  prediction tables. Its internal file formats are governed exclusively by
+  [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- `var/` owns disposable local SQLite files, logs, metrics, queue data, PID files, and resume state.
+  These are runtime artifacts, not source.
+
+## Linked Source Tree and File Reference
+
+### [`LICENSE`](LICENSE)
+
+Apache License 2.0 terms for the repository.
+
+- **Boundary:** legal terms outrank all implementation and documentation guidance.
+
+### [`README.md`](README.md)
+
+User-facing overview, environment setup, trainer/inference argument guide, Cheetah operations, and
+smoke workflows. Update it for user-visible behavior; do not place internal ownership rules here.
+
+- **Depends on:** CLI parsers in [`src/train.py`](src/train.py) and [`src/run.py`](src/run.py),
+  [`.env.example`](.env.example), and helper scripts.
+- **Common mistake:** examples can become stale as parser defaults change; verify them against
+  `--help` and source before copying them into this handbook.
+
+### [`NEXT_STEPS.md`](NEXT_STEPS.md)
+
+Single active backlog plus a compact completed-work context. New defects, experiments, and
+optimizations belong here before they are summarized elsewhere.
+
+- **Current direction:** scale the repaired Cheetah-only validation, evaluate deep prediction
+  layers, diagnose punctuation collapse, and repair the ineffective unreachable-backend fallback.
+- **Common mistake:** completed bullets are historical evidence, not a replacement for feature
+  status or regression tests.
+
+### [`Makefile`](Makefile)
+
+Owns the `smoke-train` wrapper and destructive `clean-smoke` cleanup target.
+
+- **Key targets:** `smoke-train` forwards `SMOKE_SCENARIOS`, `SMOKE_DATASET`, `SMOKE_MATRIX`, and
+  `SMOKE_BENCH`; `clean-smoke` removes named SQLite files and `var/smoke_train`.
+- **Depends on:** [`scripts/smoke_train.py`](scripts/smoke_train.py).
+- **Common mistake:** `make smoke-train` is long-running and mutates runtime databases; launch it
+  through a bounded screen/tmux session.
+
+### [`requirements.txt`](requirements.txt)
+
+Declares runtime Python dependencies for embeddings, grammar scoring, tokenizers, dependency
+parsing, and resource metrics.
+
+- **Important boundary:** PyTorch and Transformers arrive transitively; source handles optional
+  accelerator/model availability, but `src/train.py` treats `language_tool_python` plus Java as
+  mandatory startup requirements.
+- **Common mistake:** installing this file does not install a spaCy language model or Java.
+
+### [`.env.example`](.env.example)
+
+Tracked configuration template for backend selection, SQLite scratch path, Cheetah connection and
+idle grace, reducer polling, dataset, embedder, sentence splitting, and SQLite flush thresholds.
+
+- **Loaded by:** [`load_settings`](src/db_slm/settings.py) reads `.env`, then lets real environment
+  variables override it.
+- **Common mistake:** copy to the ignored `.env`; never add real host credentials or local paths to
+  this template.
+
+### [`.gitmodules`](.gitmodules)
+
+Pins `cheetah-db/` to `https://github.com/cekkr/cheetah.git`.
+
+- **Change rule:** generic Cheetah changes are committed in the submodule first; the parent change
+  is only the resulting gitlink.
+
+### [`.gitignore`](.gitignore)
+
+Defines generated/runtime boundaries: Python caches and environments, `.env`, `var/`, raw dataset
+payloads except configs, Cheetah data, and the built server binary.
+
+- **Common mistake:** ignored state can still be essential to a local run; never clean it
+  destructively merely to obtain a tidy tree.
+
+### [`.vscode/settings.json`](.vscode/settings.json)
+
+Workspace-only editor defaults for the system Python environment and enlarged console/terminal
+scrollback.
+
+- **Boundary:** this file does not define runtime dependencies, a supported interpreter, or a test
+  command.
+
+### [`datasets/GPTeacher.config.json`](datasets/GPTeacher.config.json)
+
+Maps `input` to `|USER|`, `response` to `|RESPONSE|`, and prepends the `instruction` field under
+`|INSTRUCTION|`.
+
+- **Loaded by:** [`load_dataset_config`](src/db_slm/dataset_config.py) through adjacent filename
+  inference.
+- **Common mistake:** the raw `datasets/GPTeacher.json` corpus is intentionally untracked; do not
+  make the config depend on an absolute local path.
+
+### [`datasets/emotion_data.config.json`](datasets/emotion_data.config.json)
+
+Maps the emotion corpus's `prompt`/`response` fields and converts `emotion` into the opt-in
+canonical `|CTX|` context header.
+
+- **Loaded by:** training/evaluation corpus staging in [`src/train.py`](src/train.py).
+- **Common mistake:** `|CTX|` is emitted only because this config declares `canonical_tag`; the
+  engine MUST NOT add it to unrelated datasets.
+
+### [`datasets.md`](datasets.md)
+
+Records dataset provenance, shape, and practical length statistics used to choose chunk/evaluation
+limits.
+
+- **Authority:** descriptive dataset evidence only; executable mappings remain in the adjacent
+  configs.
+
+### [`src/train.py`](src/train.py)
+
+Canonical training CLI and the largest orchestration boundary. It owns argument parsing,
+requirements checks, reset/resume, auto n-gram selection, corpus staging, dependency annotations,
+ingest/evaluation scheduling, prediction-table training, adversarial updates, metrics, and shutdown.
+
+- **Key functions and subparts:** `build_parser` defines the public CLI; `reset_cheetah_store`
+  coordinates destructive reset; `collect_prompt_tag_tokens`, `iter_json_chunks`, and
+  `parallel_corpus_stream` stage data; `AdversarialTrainer`, `DecoderPenaltyTuner`,
+  `InferenceMonitor`, and `IngestProfiler` own post-ingest feedback and observability; `main` fixes
+  ordering across all phases.
+- **Depends on:** nearly every [`src/db_slm/`](src/db_slm/) subsystem plus dataset configs and
+  [`src/helpers/resource_monitor.py`](src/helpers/resource_monitor.py).
+- **Tests:** indirect adapter coverage in
+  [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py); no focused automated coverage
+  for resume, reset, chunking, or penalty tuning.
+- **Common mistakes:** register every dataset/evaluation tag before probes; keep stdin synchronous;
+  never run `--reset` without an isolated Cheetah database; escape literal `%` as `%%` in argparse
+  help strings or `--help` crashes during interpolation.
+
+### [`src/run.py`](src/run.py)
+
+Inference CLI and REPL. The parent process owns terminal I/O while `PromptWorker` starts a spawned
+decoder process and proxies prompt, history, status, and shutdown messages.
+
+- **Key functions and subparts:** `build_parser`; `build_prompt_formatter`; `PromptWorker`;
+  `_decoder_worker`; `respond_once_worker`; `interactive_loop`; `build_response_formatter`.
+- **Depends on:** [`issue_prompt`](src/db_slm/inference_shared.py), Cheetah inspection helpers,
+  prompt-tag normalization, and persisted SQLite conversation state.
+- **Tests:** no focused CLI/worker lifecycle test.
+- **Common mistakes:** preserve the spawn-safe module entry point; always call
+  `PromptWorker.close`; append the response tag after formatting and before dispatch.
+
+### [`src/log_helpers.py`](src/log_helpers.py)
+
+Central elapsed-time log prefix and verbosity gate used by trainer, inference, evaluation, and
+helpers.
+
+- **Key functions:** `log` emits `+[seconds]`; `log_verbose` gates `LMDB_LOG_LEVEL`; `reset_timestamp`
+  resets the process epoch.
+- **Common mistake:** bypassing this helper makes long-run logs impossible to correlate.
+
+### [`src/__init__.py`](src/__init__.py)
+
+Empty package marker for the top-level source tree.
+
+- **Boundary:** it exports no public behavior; the supported package façade is
+  [`src/db_slm/__init__.py`](src/db_slm/__init__.py).
+
+### [`src/db_slm/__init__.py`](src/db_slm/__init__.py)
+
+Public package façade re-exporting `DatabaseEnvironment` and `DBSLMEngine`.
+
+- **Depends on:** [`src/db_slm/db.py`](src/db_slm/db.py) and
+  [`src/db_slm/pipeline.py`](src/db_slm/pipeline.py).
+- **Common mistake:** do not grow this into a second orchestration layer.
+
+### [`src/db_slm/settings.py`](src/db_slm/settings.py)
+
+Owns `.env` parsing and the immutable `DBSLMSettings` configuration object.
+
+- **Key functions:** `_parse_env_file`; `load_settings`; `DBSLMSettings.sqlite_dsn`.
+- **Resolution order:** real environment → `.env` → code default.
+- **Common mistake:** new settings require updates here, [`.env.example`](.env.example),
+  [`README.md`](README.md), and this handbook.
+
+### [`src/db_slm/db.py`](src/db_slm/db.py)
+
+Owns SQLite connection lifecycle, schema bootstrap, dynamic n-gram order tables, metadata, query
+helpers, and transactions. It does not own Cheetah formats or protocol behavior.
+
+- **Key functions and subparts:** `DatabaseEnvironment._bootstrap_schema`; `ensure_order_tables`;
+  `_ensure_column`; `transaction`; `set_metadata`/`get_metadata`; `hash_tokens`.
+- **Called by:** all three DB-SLM levels, pipeline startup, trainer, and inference.
+- **Tests:** no dedicated schema/migration/transaction test.
+- **Common mistakes:** schema additions must remain idempotent for existing files; table names
+  derived from n-gram order must never contain unvalidated user text.
+
+### [`src/db_slm/hashing.py`](src/db_slm/hashing.py)
+
+Defines the shared deterministic hash of token ID sequences.
+
+- **Key function:** `hash_tokens` packs unsigned 32-bit IDs and returns a fixed digest.
+- **Called by:** SQLite context registry and Cheetah namespace mapping.
+- **Common mistake:** a hash encoding change invalidates both stored contexts and hot-path aliases.
+
+### [`src/db_slm/level1.py`](src/db_slm/level1.py)
+
+Owns tokenization, vocabulary, merge-token mechanics, quantization, n-gram ingest/read paths, and
+Modified Kneser–Ney (MKN) materialization.
+
+- **Key classes:** `RegexTokenizerBackend` and `HuggingFaceTokenizerBackend`; `Vocabulary`;
+  `Tokenizer` and `MergeStats`; `LogProbQuantizer`; `NGramStore`; `MKNSmoother`.
+- **Called by:** [`DBSLMEngine`](src/db_slm/pipeline.py), decoder, evaluation perplexity, and
+  prediction inheritance.
+- **Tests:** no focused tokenizer, merge, smoothing, or quantization suite.
+- **Common mistakes:** preserve registered structural tokens as atomic units; merging is disabled
+  below n-gram order 5; publish context/count/probability/Top-K changes through `HotPathAdapter`.
+
+### [`src/db_slm/level2.py`](src/db_slm/level2.py)
+
+Owns conversation messages and correction logs, the pointer-style session distribution, decode
+profiles, and contextual token bias.
+
+- **Key classes:** `ConversationMemory`; `SessionCache`; `BiasEngine`; `Message`; `Correction`.
+- **Persistence:** canonical SQLite rows plus Cheetah `meta:l2:*` mirrors and compatibility reads
+  for old double-prefixed metadata.
+- **Tests:** no focused conversation, correction, cache, expiration, or metadata restart tests.
+- **Common mistakes:** metadata mirrors accelerate cold start but do not authorize dropping the
+  relational message/correction records.
+
+### [`src/db_slm/level3.py`](src/db_slm/level3.py)
+
+Owns concept definitions, quantized concept probabilities, templates, transient conversation
+signals, payload providers, and verbalization.
+
+- **Key classes:** `ConceptRepository`; `Verbalizer`; `ConceptPredictor`; `ConceptEngine`;
+  `ConceptExecution`.
+- **Called by:** [`DBSLMEngine.respond`](src/db_slm/pipeline.py) before Level 1 decoding.
+- **Tests:** no focused concept-signal expiry/consumption or template test.
+- **Common mistakes:** rendered `ContextSummary` is internal bias/context input, not user-visible
+  response scaffolding.
+
+### [`src/db_slm/pipeline.py`](src/db_slm/pipeline.py)
+
+High-level façade wiring settings, SQLite, Cheetah, all three levels, embeddings, training,
+corrections, and guarded response generation.
+
+- **Key classes:** `DBSLMEngine`; `TokenMergeTracker`; `LowResourceHelper`; `SimpleParaphraser`;
+  `ResponseBackstop`; `TaggedResponseFormatter`.
+- **Key paths:** `train_from_text`; `register_prompt_tags`; `respond`; `context_relativism`;
+  `record_correction`.
+- **Tests:** response framing in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) and
+  paraphraser behavior in [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py).
+- **Common mistakes:** constructor order matters because metadata, tokenizer special tokens,
+  concepts, low-resource state, and prompt-tag bans depend on earlier components.
+
+### [`src/db_slm/decoder.py`](src/db_slm/decoder.py)
+
+Owns autoregressive candidate lookup/backoff, scoring delegation, top-p sampling, context-dimension
+tracking, prediction-table blending, EOS handling, and optional scoring observations.
+
+- **Key symbols:** `DecoderConfig`; `Decoder.decode`; `_resolve_candidates`; `_sample`;
+  `_prediction_distribution`; `_relativistic_fallback`.
+- **Depends on:** [`NGramStore`](src/db_slm/level1.py),
+  [`TokenScoringPipeline`](src/db_slm/scoring.py), Level 2 cache/bias, and the hot-path adapter.
+- **Tests:** no deterministic decoder/backoff/ban test.
+- **Common mistakes:** prompt bans must enter before scoring; only commit accepted generation tokens
+  to the session cache.
+
+### [`src/db_slm/scoring.py`](src/db_slm/scoring.py)
+
+Owns the composable candidate scoring order and optional per-step trace objects.
+
+- **Key symbols:** `TokenScoringPipeline.score`; `CandidateScore`; `ScoreResult`; `ScoreSnapshot`;
+  `ScoreObserver`.
+- **Order:** dequantized base log probability → temperature → Level 2 bias → repeat/dimension
+  penalties → cache mixture → normalization → optional prediction blend → trace.
+- **Tests:** no focused numeric/scoring-order test.
+- **Common mistake:** moving normalization or mixing steps changes semantics even when the same
+  inputs remain present.
+
+### [`src/db_slm/context_dimensions.py`](src/db_slm/context_dimensions.py)
+
+Defines context span presets, CLI parsing/serialization, and grouped repetition penalties.
+
+- **Key symbols:** `ContextDimension`; `ContextDimensionTracker`; `parse_context_dimensions_arg`;
+  `DEFAULT_CONTEXT_DIMENSIONS`; `DEEP_CONTEXT_DIMENSIONS`.
+- **Called by:** both CLIs, decoder, pipeline metadata, and context-window embeddings.
+- **Common mistake:** a bare sequence such as `4,8,4` means contiguous span lengths, while `1-2,3-5`
+  means explicit ranges.
+
+### [`src/db_slm/context_window_embeddings.py`](src/db_slm/context_window_embeddings.py)
+
+Owns tag-aware window extraction, running per-dimension embedding prototypes, adaptive sampling,
+similarity weights, fused context-matrix layers, and SQLite/Cheetah metadata persistence.
+
+- **Key classes:** `ContextWindowExtractor`; `ContextDimensionPrototype`;
+  `ContextWindowEmbeddingManager`.
+- **Key paths:** `observe_corpus`; `weights_for_text`; `context_matrix_payload_for_text`; `flush`;
+  `set_tag_enumerator`.
+- **Tests:** no focused extraction, prototype persistence, tag-weight, or fusion-depth test.
+- **Common mistakes:** keep the same embedder/model semantics between observe and inference; a
+  dimension tag index must come from `DBSLMEngine.register_prompt_tags`.
+
+### [`src/db_slm/sentence_parts.py`](src/db_slm/sentence_parts.py)
+
+Owns optional punctuation segmentation, external-or-hashed embeddings, contextual header lifting,
+and real-time split profiling before tokenization.
+
+- **Key classes:** `RealtimeTokenizerProfiler`; `SentenceSegmenter`; `ExternalEmbedder`;
+  `SentencePartEmbeddingPipeline`.
+- **Configuration:** `DBSLM_SENTENCE_SPLIT` is off by default;
+  `DBSLM_EMBEDDER_MODEL` selects a local/Hugging Face model;
+  `DBSLM_EMBEDDER_OFFLINE=1` forces hashed vectors.
+- **Common mistakes:** do not reintroduce dataset-specific word lists or unmanaged structural tags;
+  sentence splitting is opt-in because punctuation segmentation changed generation quality.
+
+### [`src/db_slm/dataset_config.py`](src/db_slm/dataset_config.py)
+
+Owns executable JSON/NDJSON schema mapping and prompt composition.
+
+- **Key classes/functions:** `DatasetConfig`; `DatasetFieldConfig`; `ContextFieldConfig`;
+  `load_dataset_config`; `infer_config_path`; `_normalize_context_placement`.
+- **Resolution order:** explicit override → `DBSLM_DATASET_CONFIG_PATH` → adjacent config → generic
+  `prompt`/`response` defaults.
+- **Tests:** no focused config parsing/composition test.
+- **Common mistake:** parsing errors currently fall through to another candidate/default; validate
+  configs directly when changing schema.
+
+### [`src/db_slm/prompt_tags.py`](src/db_slm/prompt_tags.py)
+
+Owns the terminal response-label invariant.
+
+- **Key symbol:** `ensure_response_prompt_tag` normalizes a label to `|TAG|:` form, avoids duplicate
+  terminal tags, and appends it when absent.
+- **Called by:** trainer evaluation paths and both inference modes.
+
+### [`src/db_slm/text_markers.py`](src/db_slm/text_markers.py)
+
+Owns the `|END|` training marker and extraction of complete user-visible response text.
+
+- **Key symbols:** `append_end_marker`; `strip_end_marker`; `extract_complete_sentence`.
+- **Common mistake:** the marker is corpus/control data and MUST NOT be returned to the user.
+
+### [`src/db_slm/inference_shared.py`](src/db_slm/inference_shared.py)
+
+Defines `issue_prompt`, the shared bridge used by training probes and the REPL to start/reuse a
+conversation and call `DBSLMEngine.respond`.
+
+- **Important options:** seeded vs seedless conversations, minimum response words, decoder config,
+  RNG seed, response scaffolding, and score observer.
+- **Common mistake:** evaluation uses `seed_history=False`; interactive low-resource sessions may
+  seed caretaker turns.
+
+### [`src/db_slm/evaluation.py`](src/db_slm/evaluation.py)
+
+Owns dependency-layer extraction, inference variants/retries, lexical/structural/dependency and
+perplexity metrics, repetition memory, prediction probes, metrics JSON, and quality gating.
+
+- **Key symbols:** `EvaluationRecord`; `DependencyLayer`; `build_dependency_layer`;
+  `VariantSeedPlanner`; `ResponseEvaluator`; `run_inference_records`; `EvalLogWriter`;
+  `QualityGate`; `ContextProbabilityProbe`.
+- **Depends on:** [`src/db_slm/quality.py`](src/db_slm/quality.py),
+  [`src/db_slm/metrics.py`](src/db_slm/metrics.py), and
+  [`src/helpers/char_tree_similarity.py`](src/helpers/char_tree_similarity.py).
+- **Tests:** no focused retry-budget, metric, log-schema, or queue test.
+- **Common mistakes:** prompt-tag retries share a bounded attempt budget; CPU-heavy quality scoring
+  is load-gated; missing dependency parsers degrade with a warning.
+
+### [`src/db_slm/quality.py`](src/db_slm/quality.py)
+
+Owns grammar, CoLA acceptability, embedding similarity/novelty, and combined quality scoring.
+
+- **Key classes:** `SentenceQualityScorer`; lazy `_LanguageToolProxy`; lazy `_CoLAClassifier`.
+- **Resource boundary:** heavy tools load only when `AdaptiveLoadController` permits; requested
+  `DEVICE=cuda|mps` falls back when unavailable.
+- **Common mistake:** a missing optional CoLA model produces `None`, while training startup still
+  requires LanguageTool and Java.
+
+### [`src/db_slm/metrics.py`](src/db_slm/metrics.py)
+
+Owns lightweight text metrics used throughout evaluation and response shaping.
+
+- **Key functions:** `lexical_overlap`; `rouge_l_score`; `keyword_summary`.
+- **Common mistake:** these surface metrics do not prove semantic correctness.
+
+### [`src/db_slm/system.py`](src/db_slm/system.py)
+
+Owns host-load estimation, adaptive worker suggestions, and the guard for heavy evaluation tasks.
+
+- **Key symbols:** `headroom_ratio`; `suggest_worker_count`; `AdaptiveLoadController`.
+- **Common mistake:** load average may be unavailable and uses a fallback; it is advisory, not a
+  hard resource quota.
+
+### [`src/db_slm/cheetah_types.py`](src/db_slm/cheetah_types.py)
+
+Defines immutable Python projections for Cheetah reducers, namespace summaries, system statistics,
+prediction queries, and adaptive reducer page sizing.
+
+- **Key symbols:** `Raw*Projection`; `PredictionQueryResult`; `NamespaceSummary`;
+  `CheetahSystemStats.derive_reduce_page_limit`.
+- **Common mistake:** parser/serializer changes must update these projections together.
+
+### [`src/db_slm/cheetah_vectors.py`](src/db_slm/cheetah_vectors.py)
+
+Defines `AbsoluteVectorOrder`, the canonical sorted byte encoding for nested token evidence used as
+Cheetah trie prefixes.
+
+- **Contracts:** version/type bytes, big-endian integers, sorted child payloads, 255-child and
+  64-KiB child limits.
+- **Tests:** no focused Python vector fixture; Cheetah-side semantics are documented in
+  [`cheetah-db/CONCEPTS.md`](cheetah-db/CONCEPTS.md).
+- **Common mistake:** changing ordering or depth truncation breaks existing aliases.
+
+### [`src/db_slm/adapters/base.py`](src/db_slm/adapters/base.py)
+
+Defines the complete `HotPathAdapter` protocol and `NullHotPathAdapter` SQLite-only implementation.
+
+- **Surface:** publish/fetch Level 1 state, metadata, scans/reducers, context relativism, summaries,
+  system stats, and prediction set/train/query/inherit operations.
+- **Called by:** Level 1, Level 2 metadata, context windows, decoder, trainer, and CLI diagnostics.
+- **Common mistake:** add a new capability to the protocol, null adapter, concrete adapter, and
+  callers in one change.
+
+### [`src/db_slm/adapters/__init__.py`](src/db_slm/adapters/__init__.py)
+
+Re-exports `HotPathAdapter` and `NullHotPathAdapter` as the adapter package's stable lightweight
+surface.
+
+- **Boundary:** the concrete Cheetah implementation is imported directly from
+  [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py).
+
+### [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py)
+
+Owns the Cheetah TCP client, text protocol parsing, DB-SLM fixed payload serialization,
+thread-local client pool, namespace/cache conventions, async publication, reducer pagination, and
+prediction commands.
+
+- **Key classes:** `CheetahClient`; `CheetahSerializer`; `_ThreadLocalCheetahClientPool`;
+  `CheetahHotPathAdapter`; `CheetahError`; `CheetahFatalError`.
+- **Key paths:** `pair_scan`; `pair_reduce`; `decode_reduced_payload`; `predict_*`;
+  `_register_pair`; `_edit_or_reinsert`; `build_cheetah_adapter`.
+- **Tests:** [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) covers serialization,
+  idempotent publish/fetch, response parsing, timeout recovery, canonical job flow, legacy fallback,
+  and storage transport decoding.
+- **Common mistakes:** `0.0.0.0` is a listen address, not a client destination; namespace values are
+  bytes; do not share one socket across worker threads; fatal adapter disable must remain visible.
+
+### [`src/helpers/char_tree_similarity.py`](src/helpers/char_tree_similarity.py)
+
+Owns character-tree substring repetition, edit-distance, token sequence, and composite similarity
+metrics used by evaluation.
+
+- **Key symbols:** `CharTree`; `substring_multiset_similarity`; `levenshtein_char`;
+  `token_sequence_similarity`; `similarity_score`.
+- **Tests:** no focused metric fixtures.
+- **Common mistake:** this module measures repetition/similarity, not semantic equivalence.
+
+### [`src/helpers/cheetah_cli.py`](src/helpers/cheetah_cli.py)
+
+Formats namespace summaries, system statistics, and prediction query results for trainer and
+inference diagnostics.
+
+- **Key functions:** `parse_summary_prefix`; `collect_namespace_summary_lines`;
+  `collect_system_stats_lines`; `format_prediction_query`.
+- **Common mistake:** keep parsing/formatting separate from protocol execution in the adapter.
+
+### [`src/helpers/resource_monitor.py`](src/helpers/resource_monitor.py)
+
+Owns portable resource snapshots and deltas for CPU, RSS, threads, disk I/O, and load.
+
+- **Key symbols:** `ResourceSample`; `ResourceDelta`; `ResourceMonitor.snapshot`;
+  `ResourceMonitor.delta`; `ResourceMonitor.to_event`.
+- **Called by:** ingest profiling and metrics export.
+- **Common mistake:** unsupported platform fields are optional; do not treat missing data as zero
+  usage.
+
+### [`src/helpers/torch_device.py`](src/helpers/torch_device.py)
+
+Centralizes `DEVICE` normalization, availability checks, and automatic CUDA/MPS/CPU choice for
+optional tensor-backed helpers.
+
+- **Key functions:** `requested_device`; `device_available`; `auto_device`.
+- **Common mistake:** the core DB-SLM decoder does not use this module.
+
+### [`src/helpers/__init__.py`](src/helpers/__init__.py)
+
+Empty package marker for operational helper modules.
+
+- **Boundary:** import concrete helpers from their owning modules; this file exports no façade.
+
+### [`scripts/start_cheetah_server.sh`](scripts/start_cheetah_server.sh)
+
+Starts the built Cheetah server headlessly in a bounded `screen` session, falling back to `tmux`,
+while recording an exact PID and log path.
+
+- **Configuration:** `CHEETAH_SERVER_BIN`, `CHEETAH_SERVER_SESSION`, `CHEETAH_SERVER_LOG`,
+  `CHEETAH_SERVER_PID_FILE`, `CHEETAH_SERVER_TIMEOUT`.
+- **Common mistake:** it refuses a live duplicate; stop the existing owned session instead of
+  overwriting it.
+
+### [`scripts/stop_cheetah_server.sh`](scripts/stop_cheetah_server.sh)
+
+Stops only the recorded server PID and matching screen/tmux session, escalating to `KILL` after a
+short graceful wait.
+
+- **Common mistake:** a custom start session/PID path requires the same variables at stop time.
+
+### [`scripts/run_cheetah_smoke.sh`](scripts/run_cheetah_smoke.sh)
+
+Runs a bounded Cheetah-backed emotion-corpus train with an isolated named Cheetah database, scratch
+SQLite path, log, and metrics file.
+
+- **Configuration:** `CHEETAH_SMOKE_*` variables define row/chunk/evaluation limits, timeout,
+  database, and artifact paths.
+- **Mutation:** deletes the selected scratch SQLite path and writes Cheetah/runtime state.
+- **Common mistake:** this script is the workload; launch it through
+  [`scripts/start_cheetah_smoke_session.sh`](scripts/start_cheetah_smoke_session.sh).
+
+### [`scripts/start_cheetah_smoke_session.sh`](scripts/start_cheetah_smoke_session.sh)
+
+Wraps the Cheetah smoke workload in a duplicate-safe `screen`/`tmux` session and supplies unique
+artifact paths and an explicit timeout.
+
+- **Common mistake:** it assumes the Cheetah server is already running and healthy.
+
+### [`scripts/smoke_train.py`](scripts/smoke_train.py)
+
+Orchestrates sequential training scenarios, tails progress, records active child PIDs and benchmark
+JSON, and optionally triggers queue drains.
+
+- **Key classes/functions:** `RunTracker`; `TelemetryMonitor`; `QueueDrainAutomation`;
+  `BenchmarkRecorder`; `Scenario`; `load_scenarios`; `run_subprocess`; `main`.
+- **Artifacts:** untracked `var/smoke_train/benchmarks.json`, per-scenario metrics/SQLite files, and
+  active-run tracking.
+- **Common mistake:** `--dry-run` still updates planning/benchmark state; real scenarios are
+  long-running and belong in a bounded session.
+
+### [`scripts/drain_queue.py`](scripts/drain_queue.py)
+
+Owns thresholded retraining of the quality queue, command construction, metrics parsing, and
+post-success queue capping.
+
+- **Key functions:** `build_command`; `_cap_queue`; `main`.
+- **Mutation:** invokes training and rewrites the queue after success.
+- **Common mistake:** use `--dry-run` to inspect the command; do not hand-trim the live queue while a
+  drain is running.
+
+### [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py)
+
+Runs data-driven guard/rewrite cases against `SimpleParaphraser`.
+
+- **Key functions:** `load_cases`; `run_case`; `main`.
+- **Fixture:** [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl).
+
+### [`run.sh`](run.sh)
+
+Legacy generic helper that starts a Go command and a Python command in detached `screen` sessions
+and waits indefinitely.
+
+- **Status:** not the supported Cheetah lifecycle path because it has no workload timeout, assumes
+  `go run ./src`, and relies on its parent shell trap for cleanup.
+- **Safe alternative:** use the bounded server/smoke helpers above.
+
+### [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py)
+
+Primary Python unit regression file.
+
+- **Test groups:** `CheetahSerializerTests`; `CheetahHotPathAdapterTests`;
+  `CheetahClientParsingTests`; `TaggedResponseFormatterTests`.
+- **Depends on:** fake in-memory client only; no live Cheetah server is required.
+- **Common mistake:** protocol parser changes need both success-response fixtures and transport
+  decoding coverage.
+
+### [`tests/__init__.py`](tests/__init__.py)
+
+Package marker enabling module-style `unittest` invocation.
+
+- **Boundary:** it contains no fixtures or test registration.
+
+### [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl)
+
+Data-driven cases distinguishing guarded structural/corrective/multi-turn prompts from ordinary
+prompts that may be paraphrased.
+
+- **Owner:** [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py).
+
+### [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md)
+
+Mandatory scoped handbook for the Go submodule. It owns Cheetah principles, command registry,
+source map, formats, tests, configuration, security, and release limitations.
+
+- **Scope rule:** read it before running the service, touching the submodule, changing Cheetah
+  namespaces/protocol assumptions, or editing `DBSLM_CHEETAH_*` interoperability.
+
+### [`cheetah-db/CONCEPTS.md`](cheetah-db/CONCEPTS.md)
+
+Defines Cheetah reducer and context-relativism concepts consumed by the Python adapter.
+
+- **Boundary:** source and Cheetah tests override prose if they diverge.
+
+### [`studies/DB_SLM_DATABASE_AND_ALGORITHMS.md`](studies/DB_SLM_DATABASE_AND_ALGORITHMS.md)
+
+Deep design reference for tokenization, relational tables, MKN smoothing, caches, Level 2/3,
+decoding, quantization, training, and evaluation.
+
+- **Common mistake:** its MariaDB migration and roadmap sections are not evidence that those
+  backends/features exist in this checkout.
+
+### [`studies/CONCEPT.md`](studies/CONCEPT.md)
+
+Original architectural feasibility study and conceptual three-level DB-SLM blueprint.
+
+- **Authority:** rationale only; current source and the v2 algorithm study own implementation facts.
+
+### [`studies/ALGORITHMS_FLOW.md`](studies/ALGORITHMS_FLOW.md)
+
+Compact training, inference, and Cheetah control-flow notes plus tracing knobs for performance work.
+
+- **Common mistake:** future concurrency hooks listed there are planned ideas, not shipped paths.
+
+### [`studies/BENCHMARKS.md`](studies/BENCHMARKS.md)
+
+Authoritative repository record of dated, reproducible validation and performance runs.
+
+- **Update rule:** include command, environment/scope, artifact paths, observed metrics, failures,
+  and whether Cheetah or SQLite actually served the run.
+
+### [`studies/best_commands.md`](studies/best_commands.md)
+
+Repeatable smoke, queue-drain, and throughput command presets.
+
+- **Common mistake:** validate presets against current CLI help before use and execute long variants
+  inside a bounded session.
+
+### [`studies/EvaluateSentenceQuality.md`](studies/EvaluateSentenceQuality.md)
+
+Research notes for grammar, semantic acceptability, and quality scoring, including the path adopted
+by the trainer.
+
+- **Authority:** background research; [`src/db_slm/quality.py`](src/db_slm/quality.py) owns current
+  scoring behavior.
+
+### [`studies/notes/`](studies/notes/)
+
+Historical author, TODO, platform, and command notes. `author.md` explains context-prototype intent;
+`todo.md` and `win_cmd.md` preserve prior investigations and WSL recipes.
+
+- **Status:** non-authoritative history. Promote active work to [`NEXT_STEPS.md`](NEXT_STEPS.md) and
+  verified commands to [`README.md`](README.md) or [`studies/best_commands.md`](studies/best_commands.md).
+
+### [`temp.txt`](temp.txt)
+
+Tracked legacy snapshot of an older training script despite its `.txt` name.
+
+- **Status:** not imported, executed, or authoritative. Do not implement changes here; use
+  [`src/train.py`](src/train.py). Removal requires an explicit cleanup task because it is tracked
+  user history.
+
+## Features and Recurring Development Pitfalls
+
+### Three-level database language model — Shipped, experimental quality
+
+- **Behavior:** Level 1 supplies n-gram distributions, Level 2 adds conversation/cache/bias state,
+  and Level 3 can select and verbalize a concept before decoding.
+- **Flow and owners:** [`DBSLMEngine`](src/db_slm/pipeline.py) →
+  [`level3.py`](src/db_slm/level3.py) → [`level2.py`](src/db_slm/level2.py) →
+  [`decoder.py`](src/db_slm/decoder.py) / [`level1.py`](src/db_slm/level1.py).
+- **Constraints:** core generation is database-native; optional embedding/quality models do not
+  replace it.
+- **Tests and gaps:** adapter and formatting paths have coverage; core statistical correctness and
+  end-to-end quality do not.
+
+### Streaming training, resume, and evaluation — Shipped
+
+- **Behavior:** plain text and JSON/NDJSON inputs stream in chunks; JSON staging can use spawned
+  workers; interrupted runs persist `var/train_resume.json`; periodic and chunk hold-out probes
+  generate metrics and quality-queue entries.
+- **Flow and owners:** [`src/train.py`](src/train.py) → dataset config/dependency layer →
+  `DBSLMEngine.train_from_text` → `InferenceMonitor`/`EvalLogWriter`.
+- **Constraints:** training startup requires `language_tool_python` and a working Java runtime;
+  stdin is not resumable; resume rejects changed input fingerprints; metrics and resume files are
+  runtime state.
+- **Tests and gaps:** no focused resume/chunk/evaluation scheduler suite.
+
+### Cheetah hot path, reducers, and prediction tables — Shipped
+
+- **Behavior:** per-thread clients publish/fetch Level 1 data, page namespace scans, execute reducers
+  through jobs, inspect system state, and train/query/inherit prediction entries.
+- **Flow and owners:** [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) → Cheetah
+  TCP command registry and reducers documented in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- **Constraints:** use a concrete client host, trusted network, named database isolation, bounded
+  idle grace, and current payload serializers.
+- **Tests and gaps:** Python adapter regressions plus extensive submodule tests; Python live-service
+  integration is manual/smoke-only.
+
+### Adaptive tokenization and context signals — Shipped mechanism, experimental tuning
+
+- **Behavior:** regex or Hugging Face tokenization, optional repeated-span merge tokens, grouped
+  context penalties, sentence/window embeddings, tag-aware prototypes, and deepened prediction
+  matrices influence training and sampling.
+- **Flow and owners:** [`level1.py`](src/db_slm/level1.py) →
+  [`context_dimensions.py`](src/db_slm/context_dimensions.py) →
+  [`context_window_embeddings.py`](src/db_slm/context_window_embeddings.py) →
+  [`decoder.py`](src/db_slm/decoder.py).
+- **Constraints:** merge tokens activate only at n-gram order 5+; auto/persisted settings must agree
+  across trainer and inference; offline embeddings use deterministic hashed guidance.
+- **Tests and gaps:** tuning against GPTeacher and punctuation repetition remains in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md).
+
+### Prompt framing and response guardrails — Shipped
+
+- **Behavior:** dataset tags are registered atomically, every prompt terminates in a response tag,
+  generated scaffold tokens are banned/retried, internal context stays hidden, short evaluations
+  receive a bounded backstop, and output is consistently framed.
+- **Flow and owners:** [`dataset_config.py`](src/db_slm/dataset_config.py) →
+  [`prompt_tags.py`](src/db_slm/prompt_tags.py) → [`pipeline.py`](src/db_slm/pipeline.py) →
+  [`text_markers.py`](src/db_slm/text_markers.py).
+- **Tests and gaps:** formatter nesting is covered; full tag-ban exhaustion and lowercase-tokenizer
+  behavior lack focused tests.
+
+### Quality feedback and adversarial prediction updates — Shipped
+
+- **Behavior:** evaluation combines overlap, ROUGE-L, perplexity, dependency alignment, structural
+  diversity, cross-sample repetition, grammar, acceptability, and semantic metrics. Flagged samples
+  enter a retraining queue; low-quality Cheetah contexts can reinforce reference tokens and
+  down-weight generated tokens.
+- **Flow and owners:** [`evaluation.py`](src/db_slm/evaluation.py) →
+  [`quality.py`](src/db_slm/quality.py) / similarity helpers →
+  `QualityGate` and [`AdversarialTrainer`](src/train.py).
+- **Constraints:** retries and negative counts are capped; heavy scorers are load-gated; queue files
+  may contain corpus text and remain local runtime data.
+- **Tests and gaps:** metric math, queue schema, and adversarial updates lack focused tests.
+
+### Smoke matrix and automatic queue drains — Shipped
+
+- **Behavior:** scenario runs publish live benchmark state and metrics; queue depth can trigger a
+  bounded drain that appends benchmark evidence and caps the queue after success.
+- **Flow and owners:** [`Makefile`](Makefile) → [`scripts/smoke_train.py`](scripts/smoke_train.py) →
+  [`scripts/drain_queue.py`](scripts/drain_queue.py).
+- **Constraints:** workloads mutate databases/queues and MUST run in bounded sessions.
+- **Tests and gaps:** script behavior has no automated test; use dry-run plus bounded smoke
+  validation.
+
+### Decoder scoring traces — Shipped library hook, CLI gap
+
+- **Behavior:** callers can pass a `ScoreObserver` through `issue_prompt`/`DBSLMEngine.respond` to
+  receive per-step base, penalty, cache, prediction, and final probabilities.
+- **Flow and owners:** [`inference_shared.py`](src/db_slm/inference_shared.py) →
+  [`pipeline.py`](src/db_slm/pipeline.py) → [`decoder.py`](src/db_slm/decoder.py) →
+  [`scoring.py`](src/db_slm/scoring.py).
+- **Known gap:** no supported `run.py` trace flag exists; the punctuation-collapse investigation in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md) must decide whether to add one.
+
+### Pitfall: treating `--backonsqlite` as a working startup fallback
+
+- **Symptom / wrong assumption:** documentation says an unreachable configured Cheetah backend can
+  be bypassed by adding `--backonsqlite`.
+- **Cause and invariant:** `build_cheetah_adapter` raises `SystemExit` before `train.main` can inspect
+  the resulting adapter and honor the flag.
+- **Risk area:** [`build_cheetah_adapter`](src/db_slm/adapters/cheetah.py) and engine construction in
+  [`src/train.py`](src/train.py).
+- **Safe pattern / regression check:** until fixed, choose `DBSLM_BACKEND=sqlite` explicitly for an
+  authorized SQLite-only run; add a subprocess/startup regression before documenting automatic
+  fallback.
+- **Status:** active known bug.
+
+### Pitfall: reintroducing prompt tags through retries or formatting
+
+- **Symptom / wrong assumption:** the final retry candidate or an already-framed prompt leaks nested
+  `|USER|:`, `|RESPONSE|:`, or aliases.
+- **Cause and invariant:** retry exhaustion must clear rejected IDs, and wrapping must strip the
+  terminal response tag before adding frames.
+- **Risk area:** `DBSLMEngine.respond`, `_contains_prompt_artifacts`, and
+  `TaggedResponseFormatter.wrap` in [`pipeline.py`](src/db_slm/pipeline.py).
+- **Safe pattern / regression check:** preserve case normalization and run
+  [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
+- **Status:** fixed regression risk.
+
+### Pitfall: decoding reducer rows without removing storage transport
+
+- **Symptom / wrong assumption:** count/probability/continuation payloads appear malformed even
+  though the Cheetah reducer succeeded.
+- **Cause and invariant:** reducer rows contain base64-wrapped stored bytes in addition to the
+  DB-SLM serializer format.
+- **Risk area:** `CheetahClient.decode_reduced_payload` and `CheetahHotPathAdapter.iter_*` in
+  [`adapters/cheetah.py`](src/db_slm/adapters/cheetah.py).
+- **Safe pattern / regression check:** decode transport first, serializer second; run the adapter
+  tests.
+- **Status:** fixed regression risk.
+
+### Pitfall: modifying generic Cheetah behavior in the parent repository
+
+- **Symptom / wrong assumption:** a server fix is copied into Python or a vendored Go file, leaving
+  the upstream submodule and gitlink inconsistent.
+- **Cause and invariant:** `cheetah-db/` is a separate Git repository and the owner of generic
+  storage/protocol behavior.
+- **Risk area:** [`.gitmodules`](.gitmodules), [`cheetah-db/`](cheetah-db/), and the Python adapter.
+- **Safe pattern / regression check:** follow [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md), commit
+  there, run its Go checks, then update the parent gitlink and Python compatibility tests.
+- **Status:** deliberate repository boundary.
+
+### Pitfall: relying on warm caches for correctness
+
+- **Symptom / wrong assumption:** ingest → reducer → decode works before restart but loses mappings
+  or reads stale payloads after restart/mutation.
+- **Cause and invariant:** caches are derived; inserts/edits must seed them, deletes must invalidate
+  them, and cold reads must reopen/reload canonical data.
+- **Risk area:** `CheetahHotPathAdapter` cache helpers and Cheetah managed file/payload caches.
+- **Safe pattern / regression check:** verify cold restart and round-trip behavior; prime performance
+  separately with bounded scans, never as a correctness fix.
+- **Status:** fixed regression risk with ongoing test responsibility.
+
+### Pitfall: using legacy `run.sh` for unattended workloads
+
+- **Symptom / wrong assumption:** sessions outlive the task indefinitely or cleanup depends on an
+  attached parent shell.
+- **Cause and invariant:** [`run.sh`](run.sh) has `sleep infinity` and no workload timeout.
+- **Safe pattern / regression check:** use the bounded start/stop/smoke helpers and verify session,
+  PID, timeout, and log ownership before launch.
+- **Status:** deliberate legacy limitation.
+
+## Interface Ownership Map
+
+| Surface | Owner |
+| --- | --- |
+| `python3 src/train.py ...` | [`build_parser` / `main`](src/train.py) |
+| `python3 src/run.py ...` and REPL commands | [`build_parser`, `PromptWorker`, `interactive_loop`](src/run.py) |
+| Python library `DBSLMEngine` | [`src/db_slm/pipeline.py`](src/db_slm/pipeline.py) |
+| Shared prompt API `issue_prompt` | [`src/db_slm/inference_shared.py`](src/db_slm/inference_shared.py) |
+| SQLite schema and metadata | [`DatabaseEnvironment`](src/db_slm/db.py) |
+| Dataset mapping/config surface | [`DatasetConfig`](src/db_slm/dataset_config.py) plus [`datasets/`](datasets/) |
+| Token candidate scoring and trace API | [`src/db_slm/scoring.py`](src/db_slm/scoring.py) |
+| Hot-path Python protocol | [`HotPathAdapter`](src/db_slm/adapters/base.py) |
+| Cheetah TCP client, codecs, namespaces | [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) |
+| Cheetah server command registry and on-disk formats | [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
+| Smoke matrix | [`Makefile`](Makefile) and [`scripts/smoke_train.py`](scripts/smoke_train.py) |
+| Quality queue drain | [`scripts/drain_queue.py`](scripts/drain_queue.py) |
+| Server/smoke lifecycle | [`scripts/start_cheetah_server.sh`](scripts/start_cheetah_server.sh), [`scripts/stop_cheetah_server.sh`](scripts/stop_cheetah_server.sh), [`scripts/start_cheetah_smoke_session.sh`](scripts/start_cheetah_smoke_session.sh) |
+
+There are no HTTP routes, GUI screens, plugin hooks, packaged release APIs, or migration CLI in this
+repository.
+
+## Build, Run, Test, Debug, and Release
+
+Prerequisites are Python 3.10+ (recommended in the README), pip, Java on `PATH` for LanguageTool, and
+the initialized Cheetah submodule. Cheetah itself requires Go 1.24+ according to its nested
+handbook. A spaCy English model is optional because dependency parsing can fall back to Stanza or
+continue without annotations, but trainer startup does not proceed without LanguageTool/Java.
+
+Bootstrap:
+
+```bash
+git submodule update --init --recursive
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+bash cheetah-db/build.sh
+```
+
+The `cp` creates an ignored local configuration file; review host, port, and database before use.
+Model-backed helpers may contact Hugging Face on first load. Set `DBSLM_EMBEDDER_OFFLINE=1` when
+downloads are not allowed.
+
+Start and stop the external service:
+
+```bash
+scripts/start_cheetah_server.sh
+scripts/stop_cheetah_server.sh
+```
+
+Inspect the configured session and log while it runs. The start helper defaults to a 1,800-second
+timeout and writes ignored PID/log state under `var/`.
+
+Safe CLI inspection:
+
+```bash
+PYTHONPATH=src python3 src/train.py --help
+PYTHONPATH=src python3 src/run.py --help
+python3 scripts/smoke_train.py --dry-run
+```
+
+Representative bounded training/inference commands are maintained in
+[`README.md`](README.md) and [`studies/best_commands.md`](studies/best_commands.md). Training writes
+SQLite/Cheetah state, metrics, quality queue entries, and resume state; `--reset` deletes the chosen
+SQLite and Cheetah database state.
+
+Focused and full available Python checks:
+
+```bash
+PYTHONPATH=src python3 -m unittest tests.test_cheetah_adapter -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 scripts/run_paraphraser_regression.py
+```
+
+Cheetah checks, run from the submodule after reading its handbook:
+
+```bash
+cd cheetah-db
+go build ./...
+go vet ./...
+go test ./src
+go test -race ./src
+gofmt -l .
+```
+
+Use `gofmt -w` only on Go files intentionally changed. Benchmarks and live smoke tests are gated,
+long-running, and MUST use the bounded-session discipline. The supported wrappers are:
+
+```bash
+scripts/start_cheetah_smoke_session.sh
+make smoke-train
+```
+
+`make clean-smoke` is destructive: it removes named smoke SQLite files and `var/smoke_train`.
+
+Debugging:
+
+- `LMDB_LOG_LEVEL=3` enables verbose Python traces through
+  [`src/log_helpers.py`](src/log_helpers.py).
+- `CHEETAH_LOG_LEVEL=3` enables Cheetah command/reducer/trie traces.
+- Trainer/run flags expose namespace summaries, `SYSTEM_STATS`, prediction probes, ingest
+  profiling, and metrics export; use the parser/README for current spellings.
+- Live benchmark status is written to `var/smoke_train/benchmarks.json`.
+
+No Python package build, lint/format/typecheck configuration, CI workflow, security scanner, release
+automation, database migration command, or deployment process is tracked. Do not invent a release
+checklist; distribution is currently source plus the separately built Cheetah binary.
+
+## Test Ownership Map
+
+| Contract/subsystem | Focused check |
+| --- | --- |
+| Fixed-size Cheetah context/Top-K/probability/continuation payloads | `CheetahSerializerTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Idempotent context publish and Top-K fetch | `CheetahHotPathAdapterTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Reducer storage-base64 removal | `test_iter_counts_decodes_reducer_storage_transport` and `test_decode_reduced_payload_removes_insert_transport_layer` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Cursored scan parsing and socket idle recovery | `CheetahClientParsingTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Canonical `JOB` reducer flow and legacy alias fallback | `test_pair_reduce_uses_canonical_job_status_then_fetch` / `test_pair_reduce_falls_back_to_legacy_alias_without_job_api` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Response frame de-nesting and scaffold stripping | `TaggedResponseFormatterTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Paraphraser guard vs rewrite policy | [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py) + [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl) |
+| Cheetah storage concurrency, trie, reducers, jobs, prediction tables, lifecycle, and formats | Test map in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
+
+Known Python test gaps: SQLite schema upgrades/transactions; tokenizer and merging; MKN math;
+context dimensions/windows; Level 2/3 persistence and restart; decoder scoring/sampling; prompt-tag
+retry exhaustion; dataset config parsing; trainer reset/resume/chunking; evaluation metrics/retries;
+quality queue/adversarial updates; multiprocessing REPL; shell lifecycle helpers; and live Python ↔
+Cheetah integration. Add focused tests with changes in these areas rather than relying only on a
+long smoke train.
+
+## Data, Security, Privacy, and Compatibility Boundaries
+
+- **Canonical vs derived:** source/config/studies are tracked. `.env`, raw corpora, SQLite/WAL/SHM,
+  quality queues, metrics/logs, PID/resume files, Cheetah databases, model caches, and binaries are
+  local runtime or derived data. Cheetah's named database is canonical for its own on-disk state;
+  SQLite remains canonical for relational Level 2/3 records unless a feature explicitly mirrors
+  metadata.
+- **Secrets:** `.env` is ignored. Do not put credentials, private dataset content, or personal data
+  into `.env.example`, logs committed to studies, test fixtures, or this handbook. No application
+  credential store exists.
+- **Network trust:** Cheetah's protocol is unauthenticated plaintext TCP and defaults to a broad
+  listen address. Bind/expose it only on loopback or a trusted network; the Python client must use a
+  connectable concrete address, never `0.0.0.0`.
+- **Dataset privacy:** raw datasets and quality queue entries may contain user/corpus text and are
+  ignored. Benchmark reports should aggregate or redact content unless a small fixture is explicitly
+  safe to commit.
+- **Destructive operations:** trainer `--reset`, `RESET_DB`, queue capping, `make clean-smoke`, and
+  deleting SQLite/Cheetah directories can destroy state. Resolve exact paths and database names
+  before execution; use isolated smoke namespaces.
+- **Compatibility:** SQLite schema bootstrapping is additive/idempotent but has no formal migration
+  or rollback framework. Token hashes, quantization, prompt tags, merge token strings, metadata
+  keys, Cheetah namespaces, payload codecs, and Absolute Vector Order are persisted compatibility
+  surfaces.
+- **Backups:** no backup/restore workflow is automated. Preserve required SQLite files and Cheetah
+  database directories before destructive format/schema work; do not treat the hot cache as a
+  backup.
+- **Limits:** dataset chunk sizes, maximum input lines, evaluation samples/variants/retries, response
+  words, prediction negatives, reducer pages, worker pools, idle grace, and process timeouts exist
+  to prevent resource runaway. New input paths and protocol payloads require equivalent validation.
+
+## Current Status and Known Gaps
+
+### Shipped
+
+- End-to-end experimental Level 1/2/3 Python stack with training and spawned-worker inference CLIs.
+- Regex and optional Hugging Face tokenization, auto n-gram order, merge tokens, grouped context
+  penalties, tag-aware context prototypes, and Cheetah prediction-table integration.
+- Dataset-configured prompt/response/context framing and prompt-tag leak guardrails.
+- Parallel JSON/NDJSON staging, dependency metadata, resume state, periodic/hold-out evaluation,
+  metrics export, quality queue, penalty tuning, and adversarial prediction updates.
+- Cheetah thread-local adapter with namespace pagination, canonical job reducers, legacy aliases,
+  fixed payloads, metadata mirrors, diagnostics, and verified concurrency repair in the pinned
+  submodule.
+- Screen-first bounded Cheetah service/smoke helpers, smoke scenario telemetry, and automated queue
+  drains.
+
+### Experimental / Scaffold
+
+- The repository as a whole remains experimental and explicitly lacks systematic human algorithm
+  optimization.
+- Generation quality, context-depth choices, merge significance, penalty tuning, and deep prediction
+  layers are research mechanisms rather than stable production defaults.
+- Optional transformer-backed embeddings and CoLA scoring may download large models and degrade to
+  unavailable/hashed behavior depending on host load and packages.
+- Cheetah's simulated GPU prediction path, in-memory jobs, and other server-specific limitations are
+  classified in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+
+<a id="known-gaps"></a>
+### Known Gaps
+
+- `--backonsqlite` does not recover from an unreachable configured Cheetah backend because adapter
+  construction exits first. The README and CLI help must remain explicit about this until a startup
+  regression proves a repaired flow.
+- Python automated coverage is concentrated in the adapter/formatter; core statistical,
+  persistence, evaluation, multiprocessing, and orchestration paths have the gaps listed in the
+  test map.
+- No tracked CI, linter, formatter, type checker, package/release pipeline, migration tool, or
+  backup/restore workflow exists.
+- [`run.sh`](run.sh) is a legacy unbounded launcher and is not compliant for unattended workloads.
+- `temp.txt` is a tracked stale training snapshot that can confuse ownership.
+
+### Near-Term Priorities
+
+1. Run the evaluation-enabled 250/1,000-record Cheetah-only emotion scale-up and record decoder
+   latency, Top-K hit ratio, and quality without SQLite fallback.
+2. Validate deepened prediction layers against GPTeacher probes and measure punctuation repetition.
+3. Use scoring traces to isolate punctuation collapse and decide whether the decoder needs a
+   punctuation stage or a supported `run.py` trace flag.
+4. Repair and test the explicit SQLite fallback contract, or remove the ineffective flag and stale
+   documentation.
+
+The authoritative, editable priority list is [`NEXT_STEPS.md`](NEXT_STEPS.md).
+
+## Task Start and Handoff Checklist
+
+Before editing:
+
+1. Read this handbook and any nested handbook governing the target; check branch, status, submodule
+   state, ignored/runtime boundaries, and recent relevant changes.
+2. Use the linked source reference and interface map to identify the owner, callers, persistence or
+   protocol boundary, and focused tests. Verify handbook claims against current code.
+3. Read the relevant principle, critical contract, dataset config, algorithm study, or backlog item.
+4. Decide which user docs, source-map entries, feature status, test map, data boundary, or roadmap
+   facts the task can change.
+
+Before handoff or commit:
+
+1. Run the narrowest focused checks, then the full available suite proportional to risk. Run
+   Cheetah build/vet/test/race checks inside the submodule for generic server changes.
+2. Review the diff for accidental runtime data, secrets, stale paths, whitespace errors, and
+   unrelated edits. Validate every local Markdown link touched.
+3. Synchronize [`AGENTS.md`](AGENTS.md), [`README.md`](README.md),
+   [`NEXT_STEPS.md`](NEXT_STEPS.md), dataset configs, studies, and benchmark evidence according to
+   their ownership; remove superseded claims rather than appending a changelog.
+4. Report commands run, commands not run, destructive/runtime effects, unresolved gaps, and any
+   required submodule commit/gitlink relationship accurately.
+
+### Handbook Update Triggers
+
+| Change | Required update |
+| --- | --- |
+| Add, move, rename, split, or delete a meaningful file/symbol | Update its linked source subsection, callers, tests, interface map, and pitfalls. |
+| Change a CLI, library API, dataset mapping, protocol, reducer, or prediction operation | Update critical contracts, interface ownership, README, and focused tests. |
+| Change settings, dependency, prerequisite, platform behavior, or defaults | Update `.env.example`/requirements, build/run guidance, README, and feature constraints. |
+| Change schema, metadata, namespace, payload, cache, reset, or compatibility behavior | Update persistence/data boundaries, migration/rollback note, restart/round-trip tests, and destructive warnings. |
+| Change concurrency, lifecycle, performance, or observability | Update principles/contracts, architecture flow, helper commands, and benchmark guidance. |
+| Fix/discover a reusable failure mode | Add or consolidate a pitfall; keep active defects under Known Gaps and active work in `NEXT_STEPS.md`. |
+| Complete roadmap or research work | Move it to Shipped only after code and verification; record reproducible evidence in `studies/`. |
+| Pure refactor or typo | Update only paths, owners, commands, or meaning that actually changed; do not manufacture handbook churn. |

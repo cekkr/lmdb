@@ -560,7 +560,7 @@ procedure MaintenanceTick(engine, now):
     decay_bias_cache(engine.bias_index, now)
 ```
 
-*`dirty_orders`* is fed by training jobs inserting into `tbl_l1_ng_counts_n_delta`. `RebuildProbabilities` and `RefreshTopK` reuse the ETL steps in §2.3 and §6, while the cache hydration mirrors the adaptive cache already described in `AI_REFERENCE.md`.
+*`dirty_orders`* is fed by training jobs inserting into `tbl_l1_ng_counts_n_delta`. `RebuildProbabilities` and `RefreshTopK` reuse the ETL steps in §2.3 and §6, while the cache hydration mirrors the adaptive cache indexed in [`AGENTS.md`](../AGENTS.md).
 
 ### 13.2 Training & ETL Loop
 
@@ -662,7 +662,7 @@ procedure DecodeLevel1(engine, conversation_id, ctx_tokens):
     return choice
 ```
 
-`RunSession` extends the earlier §5.1 loop with concrete hooks: Level‑3 concept arbitration (`MaybeSelectConcept`), Level‑2 corrections via `apply_biases`, pointer/cache mixture (§2.5), and quantized sampling. The same routines back the CLI/REPL flow mentioned in `AI_REFERENCE.md`, ensuring the documentation, concept study, and source all point to identical algorithms.
+`RunSession` extends the earlier §5.1 loop with concrete hooks: Level‑3 concept arbitration (`MaybeSelectConcept`), Level‑2 corrections via `apply_biases`, pointer/cache mixture (§2.5), and quantized sampling. The same routines back the CLI/REPL flow indexed in [`AGENTS.md`](../AGENTS.md), ensuring the documentation, concept study, and source all point to identical algorithms.
 
 ---
 
