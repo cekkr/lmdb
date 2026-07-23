@@ -3,6 +3,49 @@
 > The smoke harness now appends queue-drain snapshots automatically whenever the quality queue
 > crosses its threshold. Look for sections titled “Queue Drain (auto smoke harness)” for those runs.
 
+## 2026-07-23 - External Cheetah repair and emotion-data validation
+
+- Scope: validated the new `cheetah-db/` submodule boundary, repaired generic storage/concurrency
+  failures upstream in Cheetah commit `6866be9`, updated the DB-SLM adapter to Cheetah's canonical
+  job API, and exercised training plus inference without `--backonsqlite`.
+- Baseline reproduction on submodule commit `76a9786`: three equal-sized concurrent client inserts
+  all read back the last payload and allocated only one value slot. A 512-write shared-prefix
+  `PAIR_SET` run returned success for every request but retained only 57 keys (455 missing).
+- Fixed live-server regression: 512 concurrent inserts plus pair registrations completed with
+  `failures=0`, `missing=0`, `wrong_payload=0`; `PAIR_SCAN` and `PAIR_REDUCE` each saw all 512 rows.
+  The adapter also decoded live count, probability, and continuation reducer payloads through
+  `JOB submit` → `JOB status` → `JOB fetch`.
+- Go verification: `go build ./...`, `go vet ./...`, `go test -count=1 ./src`, and
+  `go test -race -count=1 ./src` all passed. The reduced adaptive benchmark
+  (`CHEETAHDB_ADAPTIVE_BENCH=1 CHEETAHDB_ADAPTIVE_BENCH_KEYS=2000 go test -run
+  TestAdaptivePairIndexBenchmark -count=1 -v ./src`) passed in 34.93 seconds. Stride 2 improved
+  fixed/adaptive insert time from 5.671 s to 3.489 s and walk time from 865 ms to 2 ms; reported
+  apparent storage fell from 305.8 MiB to 2.1 MiB (allocated storage 174 MiB to 1.8 MiB).
+- Training command (bounded `screen` session, 1,200-second timeout):
+  `DBSLM_BACKEND=cheetah-db DBSLM_CHEETAH_DATABASE=emotion_e2e_20260723 python3.11 src/train.py
+  datasets/emotion_data.json --db /tmp/lmdb-emotion-e2e-20260723.sqlite3 --ngram-order 3
+  --eval-interval 1000000 --json-chunk-size 20 --max-json-lines 20 --profile-ingest
+  --metrics-export /tmp/lmdb-emotion-train-e2e-20260723.json`.
+- Training result: 20 actual records / 824,988 staged bytes produced 380,200 tokens and 380,198
+  n-grams. Ingest took 141.49 seconds, total runtime was 206.82 seconds, and prediction-table
+  training completed 431 updates. The metrics file ended with `status=success`; neither adapter
+  disable, reducer timeout, legacy reducer fallback, nor SQLite fallback occurred.
+- Persisted Cheetah state: the named database occupied approximately 52 MiB. Post-training summaries
+  reported `ctx:` 9,175 rows / 140,404 bytes / depth 8 and `cont:` 1,596 rows / 19,152 bytes /
+  depth 4. The reducer payload cache reported 658 hits and zero misses during the inspection.
+- Inference command reused the same server/database:
+  `DBSLM_BACKEND=cheetah-db DBSLM_CHEETAH_DATABASE=emotion_e2e_20260723 python3.11 src/run.py
+  --db /tmp/lmdb-emotion-e2e-20260723.sqlite3 --ngram-order 3 --prompt
+  "How can curiosity help someone navigate an ethical dilemma?" --max-response-words 80`.
+  It completed in 9.68 seconds and returned exactly one `|USER|` / `|RESPONSE|` / `|TAGS|` frame
+  without nested or leaked internal scaffold tags. The answer remained generic, as expected from a
+  20-record validation slice; quality and Top-K latency measurement remain for the 250/1,000-record
+  evaluation-enabled follow-up in `NEXT_STEPS.md`.
+- Ephemeral artifacts from this run were written to
+  `/tmp/lmdb-emotion-{train,infer}-e2e-20260723.*`,
+  `/tmp/lmdb-emotion-e2e-20260723.sqlite3`, and
+  `/tmp/cheetah-emotion-e2e-20260723/emotion_e2e_20260723`.
+
 ## 2025-11-10 - Smoke Train (python3.11)
 
 - Command: `python3.11 src/train.py datasets/emotion_data.json --db var/smoke-train-run.sqlite3 --reset --json-chunk-size 120 --max-json-lines 400 --eval-interval 1500 --eval-samples 2 --eval-pool-size 40 --profile-ingest`, followed by `python3.11 src/run.py --db var/smoke-train-run.sqlite3 --prompt "Summarize how the DB-SLM handles short validation runs." --user smoke-test --agent db-slm`.
@@ -37,4 +80,4 @@
 - Logs/artifacts: trainer trace in `var/cheetah_smoke_train_20251112-205914.log`; cheetah server stdout in `var/cheetah-server-linux.log`. Metrics JSON did not flush because we stopped the run exactly at the 30-minute mark per policy.
 - Runtime/highlights: chunk `datasets/emotion_data.json#chunk1` finished (`543,747` tokens → `543,745` n-grams) around +297 s; the remaining time was spent on evaluation probes (6 prompts every 2k tokens) until the timeout cutoff at +1,794 s.
 - Probe snapshots (quality, lex, ROUGE-L, ppl(gen), ppl(ref), sim, len_ratio) steadily improved: `0.59 / 0.14 / 0.12 / 1.83k / 9.2 / 0.69 / 0.91` @20k tokens, `0.60 / 0.15 / 0.11 / 1.79k / 8.7 / 0.65 / 0.94` @128k tokens. The quality gate still flags most samples due to low structure variety, so probes keep retrying until the 2-attempt budget is exhausted.
-- Hot-path + latency: `Disabling cheetah hot-path adapter: pair_reduce counts failed` fired immediately, so the decoder fell back to SQLite and the observed cheetah Top-K hit ratio remained `0%`. Decoder latency percentiles are unavailable for this run; rerun after fixing `PAIR_REDUCE counts` so the metrics writer can flush `var/eval_logs/train-*.json`.
+- Hot-path + latency: `Disabling cheetah hot-path adapter: pair_reduce counts failed` fired immediately, so the decoder fell back to SQLite and the observed cheetah Top-K hit ratio remained `0%`. Decoder latency percentiles were unavailable for this historical run; the external Cheetah repair and successful rerun are recorded in the 2026-07-23 section above.

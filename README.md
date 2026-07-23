@@ -22,7 +22,8 @@ the spec end-to-end:
 - **Level 3 — Concept model:** Concept dictionaries, templates, and probability tables that can
   output multi-token spans before the Level 1 stitcher runs.
 
-Training, inference, cache mixtures, and bias application all happen through SQL updates and lookups.
+Training stages materialization in SQLite, while production Level 1 contexts, reducers, Top-K
+lookups, cache mixtures, and prediction signals are persisted and served through Cheetah.
 
 ## Quick Start
 
@@ -63,8 +64,9 @@ from the database.
 - Export `CHEETAH_HEADLESS=1` when launching the server (e.g.
   `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server'`)
   to disable the interactive CLI and keep the TCP listener running in the background. Use the helper
-  scripts (`scripts/start_cheetah_server.sh`, `scripts/stop_cheetah_server.sh`) when you want tmux to
-  manage the process and log file rotation for you.
+  scripts (`scripts/start_cheetah_server.sh`, `scripts/stop_cheetah_server.sh`) for bounded,
+  screen-first process management, exact PID tracking, and log rotation. They fall back to `tmux`
+  only when `screen` cannot run on the host.
 - Leave `DBSLM_BACKEND=cheetah-db` (the baked-in default) so the trainer, decoder, and helpers fetch
   everything from the Go engine. The only sanctioned downgrade is a short-lived SQLite export:
   set `DBSLM_BACKEND=sqlite` plus `python src/train.py ... --backonsqlite` **only** when cheetah is
@@ -76,9 +78,12 @@ from the database.
   `DBSLM_CHEETAH_TIMEOUT_SECONDS` is raised for slow disks. Override
   `DBSLM_CHEETAH_IDLE_GRACE_SECONDS` for an explicit window or set
   `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS` (defaults to `300`) to clamp the derived value; set the cap
-  to `0` to disable it. Heavy reducers now queue via `PAIR_REDUCE_ASYNC`, and the Python adapter
-  polls `PAIR_REDUCE_FETCH` every few seconds so sockets stay active. Tune `CHEETAH_REDUCE_ASYNC`
-  (set to `0` for the legacy synchronous call) and
+  to `0` to disable it. Heavy reducers now queue through the canonical `JOB submit
+  command=<base64>` API, poll `JOB status id=...`, and retrieve the result once with `JOB fetch
+  id=...`. The adapter uses `PAIR_REDUCE_ASYNC` / `PAIR_REDUCE_FETCH` only as compatibility aliases
+  when an older server rejects `JOB`; it also removes the storage-transport base64 layer from
+  reducer rows before decoding DB-SLM payloads. Tune `CHEETAH_REDUCE_ASYNC` (set to `0` for the
+  synchronous reducer call) and
   `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to change the cadence. While waiting, the adapter logs job
   state/percentage so stalled reducers are obvious in the trainer output.
 - During ingest the Python pipeline streams new context metadata and Top-K probability slices into
@@ -89,7 +94,9 @@ from the database.
   can stream through arbitrary volumes of contexts without manual pagination.
 - For deeper backend documentation, read `cheetah-db/README.md` (architecture and commands) alongside
   `cheetah-db/AGENTS.md` (operational checklists, cache budgets, and contributor rules). Generic
-  server fixes belong in the upstream submodule, not in a vendored copy here.
+  server fixes belong in the upstream submodule, not in a vendored copy here. The current local
+  gitlink includes upstream repair commit `6866be9`, which atomically reserves value slots and
+  serializes full pair mutations to preserve concurrent ingest data.
 
 #### Example `.env` block
 
@@ -115,17 +122,29 @@ server runs outside WSL; the adapter auto-detects that scenario via `/etc/resolv
 #### CLI + script knobs
 
 - `scripts/start_cheetah_server.sh` / `scripts/stop_cheetah_server.sh` respect `CHEETAH_SERVER_BIN`,
-  `CHEETAH_SERVER_SESSION`, and `CHEETAH_SERVER_LOG` so you can pin the binary, tmux name, and log
-  location. Example:\
+  `CHEETAH_SERVER_SESSION`, `CHEETAH_SERVER_LOG`, `CHEETAH_SERVER_PID_FILE`, and
+  `CHEETAH_SERVER_TIMEOUT` so you can pin the binary, session name, log/PID locations, and lifetime.
+  The stop helper kills only the recorded process. Example:\
   `CHEETAH_SERVER_BIN=$PWD/cheetah-db/cheetah-server CHEETAH_SERVER_SESSION=cheetah-dev scripts/start_cheetah_server.sh`
 - `scripts/run_cheetah_smoke.sh` spins up a short ingest/eval loop with cheetah as the backend; tune
-  `CHEETAH_SMOKE_DB`, `CHEETAH_SMOKE_TIMEOUT`, or `CHEETAH_SMOKE_METRICS` to redirect the scratch
-  SQLite file, timeout guard, and metrics export destination.
+  `CHEETAH_SMOKE_DATABASE`, `CHEETAH_SMOKE_MAX_JSON_LINES`,
+  `CHEETAH_SMOKE_JSON_CHUNK_SIZE`, `CHEETAH_SMOKE_EVAL_INTERVAL`, `CHEETAH_SMOKE_DB`,
+  `CHEETAH_SMOKE_TIMEOUT`, `CHEETAH_SMOKE_LOG`, or `CHEETAH_SMOKE_METRICS` to isolate the named
+  Cheetah database and bound the dataset, evaluation cadence, scratch file, lifetime, and artifacts.
 - `python src/train.py ... --reset` clears the SQLite scratch file **and** purges cheetah namespaces.
   The trainer now attempts `RESET_DB <DBSLM_CHEETAH_DATABASE>` first (instant file deletion), then
   falls back to `PAIR_PURGE` or the incremental scanner when connecting to older cheetah binaries.
   so cached Top-K slices never drift. Add `--backonsqlite` only if you accept a degraded run without
   cheetah (e.g., CI sandboxes where the service is intentionally offline).
+
+#### Verified emotion-data path
+
+The repaired external submodule and adapter were validated together on 2026-07-23 using a named
+Cheetah database and no SQLite fallback. A bounded 20-record run of
+`datasets/emotion_data.json` ingested 380,200 tokens / 380,198 n-grams, completed 431 prediction
+updates in 206.82 seconds, and a subsequent `run.py` process reused the same database for a correctly
+framed inference response. See `studies/BENCHMARKS.md` for the exact commands, concurrency
+regressions, storage summaries, and adaptive Go benchmark.
 
 ## Training CLI (`src/train.py`)
 
@@ -313,6 +332,12 @@ guaranteeing the sentence-level `|END|` marker is present even if a dataset omit
 treats `|END|` like the other structural markers, so appending it does not change semantic content
 but keeps segment boundaries unambiguous.
 
+Candidate decoding rejects prompt-tag aliases up to the bounded retry budget. If all attempts remain
+contaminated, the engine discards their token IDs and produces a scaffold-free response backstop
+instead of leaking the final invalid candidate into the response or cache. The tagged formatter also
+strips an existing terminal `|RESPONSE|:` before wrapping a prompt, preventing nested `|USER|:`
+frames in scripted inference.
+
 `db_slm.prompt_tags.ensure_response_prompt_tag()` is now called by both `train.py` and the
 evaluation stack immediately before decoding so prompts always terminate with the configured
 response label (default `|RESPONSE|:`). `run.py` exposes `--response-label` for interactive sessions
@@ -346,7 +371,7 @@ MKNS rebuilds mirror raw follower counts through the new `PAIR_REDUCE counts` RP
 reducers stream the context registry straight from Go and delete the last SQLite-only temporary
 tables. SQLite only keeps a scratch copy for bulk rebuilds, so there is no secondary database to
 drain—cheetah already holds the hot/archived copies in one place. For namespace triage, cache sizing
-tables, and tmux launch recipes, consult `cheetah-db/README.md` and `cheetah-db/AGENTS.md`.
+tables, and screen-first launch recipes, consult `cheetah-db/README.md` and `cheetah-db/AGENTS.md`.
 
 ### Training-Time Metrics
 

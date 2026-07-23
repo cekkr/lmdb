@@ -159,6 +159,15 @@ _DEFAULT_PROMPT_TAG_TOKENS: Tuple[str, ...] = (
     "|CORRECTION|:",
 )
 _PROMPT_TAG_SCAN_WINDOW = 160
+_PROMPT_TAG_PATTERN = re.compile(r"\|[a-z0-9_]+\|:\s*", re.IGNORECASE)
+_TERMINAL_RESPONSE_TAG_PATTERN = re.compile(
+    r"(?:\r?\n)?\|response\|:\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_prompt_scaffolding(text: str) -> str:
+    return " ".join(_PROMPT_TAG_PATTERN.sub(" ", text or "").split())
 
 
 class DBSLMEngine:
@@ -617,6 +626,7 @@ class DBSLMEngine:
         final_ids: List[int] = []
         response = ""
         decoded_text = ""
+        accepted_response = False
         for attempt in range(attempt_count):
             context_seed = list(base_context)
             attempt_rng = random.Random(rng.random())
@@ -640,13 +650,26 @@ class DBSLMEngine:
             final_ids = decoded_ids
             response = response_candidate
             if not self._contains_prompt_artifacts(response_candidate):
+                accepted_response = True
                 break
+        if not accepted_response:
+            # Every sampled candidate contained a prompt/frame tag. Do not let
+            # the final rejected attempt escape merely because the retry budget
+            # is exhausted, and do not seed it into the session cache.
+            final_ids = []
+            response = ""
         if final_ids:
             self.cache.update(conversation_id, final_ids)
         else:
             self.cache.update(conversation_id, [])
         response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
         if scaffold_response:
+            if not response and not accepted_response:
+                response = self._response_backstop.ensure_min_words(
+                    _strip_prompt_scaffolding(user_message),
+                    "",
+                    max(12, min_response_words),
+                )
             response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
             response = self._tag_formatter.wrap(user_message, response, rng=rng)
         response, _ = strip_end_marker(response)
@@ -1099,11 +1122,16 @@ class TaggedResponseFormatter:
         rng = rng or random
         prompt_clean = prompt.strip()
         response_clean = generated.strip()
-        keywords = keyword_summary(prompt, limit=4)
+        prompt_content = _strip_prompt_scaffolding(prompt_clean)
+        keywords = keyword_summary(prompt_content, limit=4)
         response_tagged = self._randomize_opening(response_clean, keywords, rng)
         lines: list[str] = []
         if prompt_clean:
-            lines.append(f"|USER|: {prompt_clean}")
+            prompt_frame = _TERMINAL_RESPONSE_TAG_PATTERN.sub("", prompt_clean).strip()
+            if prompt_frame.lower().startswith("|user|:"):
+                lines.append(prompt_frame)
+            else:
+                lines.append(f"|USER|: {prompt_frame}")
         if response_tagged:
             lines.append(f"|RESPONSE|: {response_tagged}")
         if keywords:

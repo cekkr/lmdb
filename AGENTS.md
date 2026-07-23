@@ -22,8 +22,17 @@ Cheetah is the `cheetah-db/` Git submodule, sourced from `https://github.com/cek
 
 Keep reusable database-server work upstream: make generic fixes, protocol improvements, and shared implementations in the `cheetah-db` submodule; follow its documentation and test requirements; then commit the change in the Cheetah repository itself. Update this repository's submodule gitlink to the resulting Cheetah commit. Keep only DB-SLM-specific adapter and orchestration changes in this repository—never re-vendor Cheetah sources here.
 
+- The current submodule repair commit is `6866be9`: `ValuesTable` reserves distinct append slots
+  with an atomic high-water mark, and the database serializes full pair mutations so equal-size
+  inserts and concurrent shared-prefix `PAIR_SET` traffic cannot overwrite one another. Keep the
+  associated Go regression tests green before advancing the gitlink.
 - Trainer `--reset` now shrinks the cheetah namespace scan page size whenever `PAIR_SCAN` stalls and bumps the TCP idle-grace window to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)` seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`, clamp via `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS`). Fresh databases therefore stop flooding the console with `cheetah response timed out after 30.0s of inactivity`, and slow disks can be accommodated by simply raising the timeout or idle-grace fields. When supported, `--reset` first issues `RESET_DB <DBSLM_CHEETAH_DATABASE>` to delete the entire cheetah namespace in one shot, then falls back to `PAIR_PURGE` (and finally the incremental scan loop) when older binaries lack the command.
-- The hot-path adapter now queues reducers via `PAIR_REDUCE_ASYNC` and polls `PAIR_REDUCE_FETCH`, so the TCP socket never sits idle for minutes while cheetah walks slow namespaces. Tweak `CHEETAH_REDUCE_ASYNC` (disable to fall back to synchronous reducers) plus `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to adjust the keep-alive cadence; synchronous fallbacks still honor the idle-grace clamp. Progress lines (state, % complete, and completed/total counts) are emitted roughly every 30s so long-running reducers remain visible in the trainer log.
+- The hot-path adapter now queues reducers through Cheetah's canonical `JOB submit command=<base64>`,
+  polls `JOB status id=...`, and retrieves completion once with `JOB fetch id=...`. It falls back to
+  `PAIR_REDUCE_ASYNC` / `PAIR_REDUCE_FETCH` only when an older server rejects `JOB`. Reducer rows
+  also remove Cheetah's storage-transport base64 layer before DB-SLM deserialization. Tweak
+  `CHEETAH_REDUCE_ASYNC` or `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to control async use and polling;
+  synchronous fallbacks still honor the idle-grace clamp.
 - cheetah-db now keeps a bounded number of open pair-table handles. Idle trie nodes close their file descriptors and re-open automatically when accessed so long ingest runs no longer trip `too many open files`. Override the cap via `CHEETAH_MAX_PAIR_TABLES` (defaults to the detected `RLIMIT_NOFILE` minus a safety margin) when running on hosts with larger limits or very dense namespaces.
 - Pair trie tables now ride on a managed I/O layer that caches 4 KiB sectors in RAM, queues dirty sectors through a background flusher, and only touches disk when necessary. Concurrent writers therefore hit in-memory buffers while the queue drains in the background, which both respects the descriptor cap and slashes SSD churn during heavy ingest.
 - The managed file cache now listens to `ResourceMonitor` memory pressure and aggressively flushes/evicts idle sectors. Dirty pages are forced to disk (default 30s after last access, hard cap 5 minutes), freed immediately after the write completes, and low-usage sectors are culled whenever RAM pressure crosses ~90% (tunable via `CHEETAH_CACHE_*`). Set `CHEETAH_CACHE_IDLE_SECONDS`, `CHEETAH_CACHE_FORCE_SECONDS`, `CHEETAH_CACHE_SWEEP_SECONDS`, `CHEETAH_CACHE_STATS_SECONDS`, `CHEETAH_CACHE_PRESSURE_HIGH/LOW`, or the read/write weight knobs to bias which sectors survive.
@@ -34,6 +43,10 @@ Keep reusable database-server work upstream: make generic fixes, protocol improv
 
 - `DBSLMEngine.register_prompt_tags()` (`src/db_slm/pipeline.py`) now seeds the built-in structural tokens (`|INSTRUCTION|:`, `|USER|:`, `|RESPONSE|:`, `|CONTEXT|:`, etc.), appends every dataset-specific tag in discovery order, and forwards that enumeration to both the tokenizer and `ContextWindowEmbeddingManager`. Always call `collect_prompt_tag_tokens()` before ingest/eval so the global enumerator stays authoritative.
 - Decoder sampling (`src/db_slm/pipeline.py` + `src/db_slm/decoder.py`) hard-bans those tokens and scans the first ~160 characters of every candidate for alias strings such as `user:` or `|instruction|:`. If any scaffold tag appears, the engine discards the text and re-runs decoding with a new RNG up to three times, mirroring how `|END|` retries work for too-short outputs.
+- If every decoder candidate still contains scaffold tags, `DBSLMEngine.respond()` clears the
+  rejected token IDs and emits a scaffold-free response backstop instead of returning the last
+  invalid candidate. `TaggedResponseFormatter` removes an already-framed terminal response tag
+  before wrapping so interactive inference never nests `|USER|:` frames.
 - Prompt-tag bans and evaluation detection now normalize case when `DBSLM_TOKENIZER_LOWERCASE=1`, preventing lowercased tags (e.g., `|response|:`) from leaking into generations or slipping past retry gates.
 - Context windows (`src/db_slm/context_window_embeddings.py`) now store the running mean/variance of each tag enumerator per dimension. These tag-aware weights flow into `ContextDimensionTracker`, so predicting a tag that belongs to a different prompt segment immediately increases the presence/frequency penalty even before the string-level guard activates.
 - Level 3 `ContextSummary` payloads now stay internal to decoding. `DBSLMEngine.respond()` still feeds the summary into the rolling context and context-window bias text, but the synthesized `|CONTEXT|:` line is never prepended to user-visible generations, keeping datasets in full control of which tags reach the prompt/response stream.
@@ -109,7 +122,7 @@ Keep reusable database-server work upstream: make generic fixes, protocol improv
 - Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
   large JSON chunks no longer look frozen; the logs include approximate line counts to show where
   the trainer is spending time.
-- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the tmux helpers are documented in `README.md` and `cheetah-db/AGENTS.md`.
+- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the screen-first helpers are documented in `README.md` and `cheetah-db/AGENTS.md`.
 - Realtime resource telemetry now flows through `src/helpers/resource_monitor.py`: during ingest profiles and every evaluation probe we record CPU %, RSS deltas, thread counts, and disk I/O (leveraging psutil with `resource` fallbacks) and push those samples both to the console and to the metrics export JSON.
 - `CheetahHotPathAdapter` now spins up a dedicated cheetah-db TCP client per thread (with a shared factory + warm connection) so ingest, evaluation, and background workers can exercise true multi-core concurrency without funneling through a single socket; custom clients can still be injected for tests, but the default path uses the thread-local pool.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware
@@ -233,6 +246,12 @@ Keep reusable database-server work upstream: make generic fixes, protocol improv
   `var/smoke_train/benchmarks.json`, while full evaluation payloads land in
   `var/smoke_train/metrics/<scenario>.json`. Monitor the 64% flagged rate—pool diversity or penalty
   tuning is still needed to push it below the new 0.55 `common_token_ceiling`.
+- Latest Cheetah-only validation (2026-07-23, python3.11) trained 20 actual
+  `datasets/emotion_data.json` records into a named Cheetah database: 380,200 tokens and 380,198
+  n-grams completed in 206.82 seconds, with 431 prediction updates and no hot-path disable or SQLite
+  fallback. A follow-up `run.py` prompt reused that database and returned one correctly framed
+  `|USER|` / `|RESPONSE|` / `|TAGS|` response. Commands and adaptive Go benchmark numbers are in
+  `studies/BENCHMARKS.md`.
 - Evaluation retries for flagged samples are now capped at two attempts per batch, with flagged rows
   re-queued into a random spot of the current probe before being eligible for up to three additional
   appearances in later random batches so probes cannot loop forever when the generator keeps

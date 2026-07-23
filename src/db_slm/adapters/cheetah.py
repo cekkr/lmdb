@@ -149,6 +149,7 @@ class CheetahClient:
         except ValueError:
             poll_interval = 5.0
         self._reduce_poll_interval = max(1.0, poll_interval)
+        self._job_api: bool | None = None
         async_inherit_raw = os.environ.get("CHEETAH_PREDICT_INHERIT_ASYNC", "1").strip().lower()
         self._async_inherit = async_inherit_raw not in {"0", "false", "no", "off"}
 
@@ -301,15 +302,38 @@ class CheetahClient:
         cursor: bytes | None,
         include_hidden: bool,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
-        command = self._format_pair_reduce_command(
-            "PAIR_REDUCE_ASYNC",
+        reduce_command = self._format_pair_reduce_command(
+            "PAIR_REDUCE",
             mode,
             prefix,
             limit,
             cursor,
             include_hidden=include_hidden,
         )
-        response = self._command(command)
+        response: str | None = None
+        canonical_job = False
+        if self._job_api is not False:
+            encoded = base64.b64encode(reduce_command.encode("utf-8")).decode("ascii")
+            response = self._command(f"JOB submit command={encoded}")
+            lowered = (response or "").lower()
+            if response and response.startswith("SUCCESS"):
+                self._job_api = True
+                canonical_job = True
+            elif lowered.startswith("error,unknown_command"):
+                self._job_api = False
+                response = None
+            else:
+                return None
+        if response is None:
+            legacy_command = self._format_pair_reduce_command(
+                "PAIR_REDUCE_ASYNC",
+                mode,
+                prefix,
+                limit,
+                cursor,
+                include_hidden=include_hidden,
+            )
+            response = self._command(legacy_command)
         if not response:
             return None
         lowered = response.lower()
@@ -330,10 +354,20 @@ class CheetahClient:
             limit or "default",
             "set" if cursor else "none",
         )
-        return self._await_reduce_job(job_id, mode, target)
+        return self._await_reduce_job(
+            job_id,
+            mode,
+            target,
+            canonical_job=canonical_job,
+        )
 
     def _await_reduce_job(
-        self, job_id: str, mode: str, target_label: str
+        self,
+        job_id: str,
+        mode: str,
+        target_label: str,
+        *,
+        canonical_job: bool = False,
     ) -> tuple[list[tuple[bytes, int, bytes | None]], bytes | None] | None:
         last_progress: float | None = None
         last_completed: int | None = None
@@ -341,18 +375,55 @@ class CheetahClient:
         last_log = 0.0
         log_interval = max(30.0, self._reduce_poll_interval * 6.0)
         while True:
-            response = self._command(f"PAIR_REDUCE_FETCH {job_id}")
+            if canonical_job:
+                response = self._command(f"JOB status id={job_id}")
+            else:
+                response = self._command(f"PAIR_REDUCE_FETCH {job_id}")
             if not response:
                 return None
             if response.startswith("SUCCESS"):
-                if last_state:
-                    logger.warning(
-                        "cheetah reducer job %s (%s %s) completed",
-                        job_id,
-                        mode,
-                        target_label,
-                    )
-                return self._parse_pair_reduce_response(response)
+                if canonical_job:
+                    state = (
+                        self._extract_response_field(response, "state") or "running"
+                    ).lower()
+                    if state == "completed":
+                        fetched = self._command(f"JOB fetch id={job_id}")
+                        if not fetched or not fetched.startswith("SUCCESS"):
+                            logger.warning(
+                                "cheetah reducer job %s (%s %s) fetch failed: %s",
+                                job_id,
+                                mode,
+                                target_label,
+                                fetched,
+                            )
+                            return None
+                        logger.warning(
+                            "cheetah reducer job %s (%s %s) completed",
+                            job_id,
+                            mode,
+                            target_label,
+                        )
+                        return self._parse_pair_reduce_response(fetched)
+                    if state == "failed":
+                        fetched = self._command(f"JOB fetch id={job_id}")
+                        logger.warning(
+                            "cheetah reducer job %s (%s %s) failed: %s",
+                            job_id,
+                            mode,
+                            target_label,
+                            fetched or response,
+                        )
+                        return None
+                    response = "PENDING," + response.split(",", 1)[1]
+                else:
+                    if last_state:
+                        logger.warning(
+                            "cheetah reducer job %s (%s %s) completed",
+                            job_id,
+                            mode,
+                            target_label,
+                        )
+                    return self._parse_pair_reduce_response(response)
             if response.startswith("PENDING"):
                 state = self._extract_response_field(response, "state") or "running"
                 reducer = self._extract_response_field(response, "reducer") or mode
@@ -687,6 +758,16 @@ class CheetahClient:
 
     def _decode_value(self, encoded: str) -> bytes:
         return base64.b64decode(encoded.encode("ascii"))
+
+    @staticmethod
+    def decode_reduced_payload(payload: bytes | None) -> bytes | None:
+        """Undo the transport encoding applied by ``insert`` after a reducer read."""
+        if payload is None:
+            return None
+        try:
+            return base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error):
+            return None
 
     def _command(self, text: str) -> str | None:
         line = (text.strip() + "\n").encode("utf-8")
@@ -1895,7 +1976,9 @@ class CheetahHotPathAdapter(HotPathAdapter):
                     continue
                 trimmed = raw_value[len(namespace_bytes) :]
                 blob = payload
-                if blob is None:
+                if blob is not None:
+                    blob = CheetahClient.decode_reduced_payload(blob)
+                else:
                     blob = self._client.read(key)
                 if not blob:
                     continue
@@ -1945,7 +2028,9 @@ class CheetahHotPathAdapter(HotPathAdapter):
                     continue
                 trimmed = raw_value[len(namespace_bytes) :]
                 blob = payload
-                if blob is None:
+                if blob is not None:
+                    blob = CheetahClient.decode_reduced_payload(blob)
+                else:
                     blob = self._client.read(key)
                 if not blob:
                     continue
@@ -1992,7 +2077,9 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 if not raw_value.startswith(namespace_bytes):
                     continue
                 blob = payload
-                if blob is None:
+                if blob is not None:
+                    blob = CheetahClient.decode_reduced_payload(blob)
+                else:
                     blob = self._client.read(key)
                 if not blob:
                     continue
