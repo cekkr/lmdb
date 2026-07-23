@@ -7,7 +7,7 @@ Documented command lines for repeatable, efficient DB-SLM training workflows. Ad
 Use when validating ingestion + evaluation together without wasting hours on probes.
 
 ```bash
-python3.11 src/train.py datasets/emotion_data.json \
+python3 src/train.py datasets/emotion_data.json \
   --ngram-order 5 \
   --recursive \
   --reset \
@@ -51,7 +51,7 @@ python3.11 src/train.py var/eval_logs/quality_retrain_queue.jsonl \
 Use after system or dataset changes to quickly verify ingestion speed without touching the primary database.
 
 ```bash
-python3.11 src/train.py datasets/emotion_data.json \
+python3 src/train.py datasets/emotion_data.json \
   --db var/smoke-train.sqlite3 \
   --ngram-order 5 \
   --json-chunk-size 600 \
