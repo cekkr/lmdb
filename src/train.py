@@ -2631,7 +2631,7 @@ def main() -> None:
         if not args.backonsqlite:
             engine.db.close()
             parser.error(
-                "cheetah-db backend unreachable. Start cheetah-db/cheetah-server or rerun with --backonsqlite "
+                "cheetah-db backend unreachable. Build and start the cheetah-db submodule's cheetah-server, or rerun with --backonsqlite "
                 "to allow the SQLite fallback."
             )
         log("[train] Warning: cheetah-db backend unreachable; proceeding on SQLite because --backonsqlite was set.")
@@ -3036,6 +3036,6 @@ if __name__ == "__main__":
     except CheetahFatalError as exc:
         log(
             "[train] Fatal cheetah failure: "
-            f"{exc}. Consult cheetah-db/AI_REFERENCE.md and ensure the server is healthy."
+            f"{exc}. Consult cheetah-db/AGENTS.md and ensure the server is healthy."
         )
         sys.exit(1)

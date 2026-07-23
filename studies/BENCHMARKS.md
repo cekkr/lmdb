@@ -12,21 +12,21 @@
 
 ## 2025-11-12 - cheetah-db benchmark (CHEETAHDB_BENCH)
 
-- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=30s go test -run TestCheetahDBBenchmark -count=1 -v`.
+- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=30s go test -run TestCheetahDBBenchmark -count=1 -v ./src`.
 - Log: `var/eval_logs/cheetah_db_benchmark_20251112-130623.log`.
 - Snapshot @ 25 s (24 workers, 256 B payloads): inserts=616, reads=509, pair_set=258, pair_get=158, pair_scan=62, errors=0 → ~64 total ops/s before the idle tail. Pair scans now show up explicitly so pagination stays covered.
 - Warmup now seeds 512 inserts + `4 * workers` pair registrations, so the benchmark no longer generates transient `pair_get`/`pair_scan` misses.
 
 ## 2025-11-12 - cheetah-db benchmark (45s / 32 workers)
 
-- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=45s CHEETAHDB_BENCH_WORKERS=32 go test -run TestCheetahDBBenchmark -count=1 -v`.
+- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=45s CHEETAHDB_BENCH_WORKERS=32 go test -run TestCheetahDBBenchmark -count=1 -v ./src`.
 - Log: `var/eval_logs/cheetah_db_benchmark_20251112-164324.log`.
 - Snapshot timeline (value size 256 B): total_qps=90.4 @5s, 84.0 @10s, 73.2 @15s, 67.4 @20s, 63.8 @25s, 60.9 @30s, 59.0 @35s, 56.0 @40s, 10.9 during the stop drain (220.8 s). Inserts=1002, reads=663, pair_set=346, pair_get=265, pair_scan=123, errors=0.
 - Higher concurrency kept pair scans saturated without introducing pagination errors; the tail slowdown is purely the graceful shutdown window.
 
 ## 2025-11-12 - cheetah-db benchmark (30s / 24 workers rerun)
 
-- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=30s CHEETAHDB_BENCH_WORKERS=24 go test -run TestCheetahDBBenchmark -count=1 -v`.
+- Command: `cd cheetah-db && CHEETAHDB_BENCH=1 CHEETAHDB_BENCH_DURATION=30s CHEETAHDB_BENCH_WORKERS=24 go test -run TestCheetahDBBenchmark -count=1 -v ./src`.
 - Log: `var/eval_logs/cheetah_db_benchmark_20251112-164803.log`.
 - Snapshot timeline: total_qps=95.6 @5s, 87.6 @10s, 78.7 @15s, 72.0 @20s, 66.7 @25s, 12.4 while draining at 148.5 s. Final counters: inserts=760, reads=528, pair_set=276, pair_get=186, pair_scan=94, errors=0.
 - Confirms the warmup/pagination fixes at the default worker count: each 5-second bucket included pair scans and no reducer/EOF errors surfaced.
@@ -38,4 +38,3 @@
 - Runtime/highlights: chunk `datasets/emotion_data.json#chunk1` finished (`543,747` tokens → `543,745` n-grams) around +297 s; the remaining time was spent on evaluation probes (6 prompts every 2k tokens) until the timeout cutoff at +1,794 s.
 - Probe snapshots (quality, lex, ROUGE-L, ppl(gen), ppl(ref), sim, len_ratio) steadily improved: `0.59 / 0.14 / 0.12 / 1.83k / 9.2 / 0.69 / 0.91` @20k tokens, `0.60 / 0.15 / 0.11 / 1.79k / 8.7 / 0.65 / 0.94` @128k tokens. The quality gate still flags most samples due to low structure variety, so probes keep retrying until the 2-attempt budget is exhausted.
 - Hot-path + latency: `Disabling cheetah hot-path adapter: pair_reduce counts failed` fired immediately, so the decoder fell back to SQLite and the observed cheetah Top-K hit ratio remained `0%`. Decoder latency percentiles are unavailable for this run; rerun after fixing `PAIR_REDUCE counts` so the metrics writer can flush `var/eval_logs/train-*.json`.
-

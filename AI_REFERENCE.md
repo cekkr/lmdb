@@ -20,10 +20,10 @@ NEXT_STEPS.md so new agents inherit the latest state.
 - Decoder scoring now flows through `TokenScoringPipeline` (`src/db_slm/scoring.py`) with optional
   `ScoreObserver` snapshots wired through `DBSLMEngine.respond()` and `issue_prompt()` for
   statistical debugging.
-- cheetah-db now resolves `PAIR_REDUCE` modes through a reducer registry (`cheetah-db/reducers.go`)
+- cheetah-db now resolves `PAIR_REDUCE` modes through a reducer registry (`cheetah-db/src/reducers.go`)
   so new reducer implementations can be added without editing command dispatch.
 
 ## Pointers
 
 - Full CLI examples and flag details live in `README.md`.
-- Cheetah-specific operational guidance is in `cheetah-db/AI_REFERENCE.md`.
+- Cheetah is maintained as the `cheetah-db/` submodule (`https://github.com/cekkr/cheetah`); read `cheetah-db/AGENTS.md` and keep generic database-server fixes committed upstream, updating this gitlink afterward.

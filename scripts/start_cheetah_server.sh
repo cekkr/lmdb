@@ -3,8 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION_NAME=${CHEETAH_SERVER_SESSION:-cheetahdb}
-LOG_PATH=${CHEETAH_SERVER_LOG:-$REPO_ROOT/var/cheetah-server-linux.log}
-BIN_PATH=${CHEETAH_SERVER_BIN:-$REPO_ROOT/cheetah-db/cheetah-server-linux}
+LOG_PATH=${CHEETAH_SERVER_LOG:-$REPO_ROOT/var/cheetah-server.log}
+BIN_PATH=${CHEETAH_SERVER_BIN:-$REPO_ROOT/cheetah-db/cheetah-server}
 
 if [[ ! -x "$BIN_PATH" ]]; then
   echo "cheetah-server binary not found at $BIN_PATH" >&2

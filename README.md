@@ -53,13 +53,15 @@ from the database.
   box. SQLite remains available for bulk ingest/experiments (`DBSLM_BACKEND=sqlite`), but there is no
   longer a secondary relational target to keep in sync.
 
-### cheetah-db runtime (required)
+### cheetah-db runtime (required submodule)
 
-- `cheetah-db/` hosts the Go service that now acts as the sole hot path for Level 1 contexts.
-  Build it with `bash cheetah-db/build.sh` and keep `./cheetah-db/cheetah-server` running before
-  invoking any Python tooling.
+- `cheetah-db/` is the [`cekkr/cheetah`](https://github.com/cekkr/cheetah) Git submodule and hosts
+  the Go service that acts as the sole hot path for Level 1 contexts. Clone with
+  `git clone --recurse-submodules https://github.com/cekkr/lmdb.git`, or initialize an existing clone with
+  `git submodule update --init --recursive`. Build it with `bash cheetah-db/build.sh` and keep
+  `./cheetah-db/cheetah-server` running before invoking any Python tooling.
 - Export `CHEETAH_HEADLESS=1` when launching the server (e.g.
-  `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server-linux'`)
+  `wsl.exe -d Ubuntu-24.04 -- screen -dmS cheetahdb bash -c 'cd /mnt/c/.../cheetah-db && env CHEETAH_HEADLESS=1 ./cheetah-server'`)
   to disable the interactive CLI and keep the TCP listener running in the background. Use the helper
   scripts (`scripts/start_cheetah_server.sh`, `scripts/stop_cheetah_server.sh`) when you want tmux to
   manage the process and log file rotation for you.
@@ -68,7 +70,7 @@ from the database.
   set `DBSLM_BACKEND=sqlite` plus `python src/train.py ... --backonsqlite` **only** when cheetah is
   temporarily unreachable and you accept a reduced feature set.
 - The `DBSLM_CHEETAH_HOST/PORT/DATABASE/TIMEOUT_SECONDS` variables (see `.env.example`) point the
-  adapter at the right instance; the default matches the server exposed by `cheetah-db/main.go`. Use
+  adapter at the right instance; the default matches the server exposed by `cheetah-db/src/main.go`. Use
   a real address (127.0.0.1, LAN IP, Windows bridge IP inside WSL) rather than `0.0.0.0`.
 - Idle responses are now capped at ~5 minutes on the Python side even when
   `DBSLM_CHEETAH_TIMEOUT_SECONDS` is raised for slow disks. Override
@@ -85,8 +87,9 @@ from the database.
 - `PAIR_SCAN`/`PAIR_REDUCE` accept cursors and return `next_cursor=x...` when more data is available.
   The Python adapter follows these cursors automatically, so namespace walks and reducer projections
   can stream through arbitrary volumes of contexts without manual pagination.
-- For deeper backend documentation, read `cheetah-db/README.md` (architecture, commands) alongside
-  `cheetah-db/AI_REFERENCE.md` (operational checklists, cache budgets, tmux helpers).
+- For deeper backend documentation, read `cheetah-db/README.md` (architecture and commands) alongside
+  `cheetah-db/AGENTS.md` (operational checklists, cache budgets, and contributor rules). Generic
+  server fixes belong in the upstream submodule, not in a vendored copy here.
 
 #### Example `.env` block
 
@@ -114,7 +117,7 @@ server runs outside WSL; the adapter auto-detects that scenario via `/etc/resolv
 - `scripts/start_cheetah_server.sh` / `scripts/stop_cheetah_server.sh` respect `CHEETAH_SERVER_BIN`,
   `CHEETAH_SERVER_SESSION`, and `CHEETAH_SERVER_LOG` so you can pin the binary, tmux name, and log
   location. Example:\
-  `CHEETAH_SERVER_BIN=$PWD/cheetah-db/cheetah-server-linux CHEETAH_SERVER_SESSION=cheetah-dev scripts/start_cheetah_server.sh`
+  `CHEETAH_SERVER_BIN=$PWD/cheetah-db/cheetah-server CHEETAH_SERVER_SESSION=cheetah-dev scripts/start_cheetah_server.sh`
 - `scripts/run_cheetah_smoke.sh` spins up a short ingest/eval loop with cheetah as the backend; tune
   `CHEETAH_SMOKE_DB`, `CHEETAH_SMOKE_TIMEOUT`, or `CHEETAH_SMOKE_METRICS` to redirect the scratch
   SQLite file, timeout guard, and metrics export destination.
@@ -343,7 +346,7 @@ MKNS rebuilds mirror raw follower counts through the new `PAIR_REDUCE counts` RP
 reducers stream the context registry straight from Go and delete the last SQLite-only temporary
 tables. SQLite only keeps a scratch copy for bulk rebuilds, so there is no secondary database to
 drain—cheetah already holds the hot/archived copies in one place. For namespace triage, cache sizing
-tables, and tmux launch recipes, consult `cheetah-db/AI_REFERENCE.md`.
+tables, and tmux launch recipes, consult `cheetah-db/README.md` and `cheetah-db/AGENTS.md`.
 
 ### Training-Time Metrics
 
@@ -413,7 +416,7 @@ previews the exact command (useful when orchestrating via
 ### Cheetah Prediction Tables & Context Probes
 
 The Python adapter now exposes cheetah's prediction-table commands, letting you exercise the context
-matrices defined in `cheetah-db/AI_REFERENCE.md` without leaving the CLI:
+matrices described in `cheetah-db/README.md` without leaving the CLI:
 
 - `ContextWindowEmbeddingManager.context_matrix_for_text()` now emits the per-window vectors plus
   dimension-level summary/fusion layers so prediction tables see a hidden-layer style context

@@ -1,0 +1,3 @@
+[submodule "cheetah-db"]
+	path = cheetah-db
+	url = https://github.com/cekkr/cheetah.git

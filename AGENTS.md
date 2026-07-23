@@ -10,7 +10,7 @@ change so the next agent inherits the latest context.
   investigations.
 - Work incrementally, document breaking changes, and run the available build/test commands before
   yielding control.
-- Always launch long-running services and workloads (smoke-train/benchmark runs, CI smoke tests, etc.) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent. When the WSL image cannot keep `screen` alive (missing setuid bit), fall back to `tmux` with the exact same discipline and log the substitution in your notes/runbook. Service-specific tmux/watcher notes live in `cheetah-db/AI_REFERENCE.md`.
+- Always launch long-running services and workloads (smoke-train/benchmark runs, CI smoke tests, etc.) inside `screen` sessions: verify at the start of every screen invocation that no previous sessions are lingering, monitor the session output in real time, and attach explicit timeouts (≤30 minutes by default, ≤1 hour only if justified ahead of time) so stuck/error loops do not block the next agent. When the WSL image cannot keep `screen` alive (missing setuid bit), fall back to `tmux` with the exact same discipline and log the substitution in your notes/runbook. Service-specific server guidance lives in `cheetah-db/AGENTS.md`.
 
 ### Next Steps
 
@@ -18,7 +18,9 @@ change so the next agent inherits the latest context.
 
 ### Working With cheetah-db
 
-Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REFERENCE.md`. Read that file before launching the Go service, touching cheetah namespaces, or editing env vars such as `DBSLM_CHEETAH_*`.
+Cheetah is the `cheetah-db/` Git submodule, sourced from `https://github.com/cekkr/cheetah`. Read `cheetah-db/AGENTS.md` before launching the Go service, touching cheetah namespaces, or editing env vars such as `DBSLM_CHEETAH_*`.
+
+Keep reusable database-server work upstream: make generic fixes, protocol improvements, and shared implementations in the `cheetah-db` submodule; follow its documentation and test requirements; then commit the change in the Cheetah repository itself. Update this repository's submodule gitlink to the resulting Cheetah commit. Keep only DB-SLM-specific adapter and orchestration changes in this repository—never re-vendor Cheetah sources here.
 
 - Trainer `--reset` now shrinks the cheetah namespace scan page size whenever `PAIR_SCAN` stalls and bumps the TCP idle-grace window to `max(DBSLM_CHEETAH_TIMEOUT_SECONDS * 180, 60)` seconds (override via `DBSLM_CHEETAH_IDLE_GRACE_SECONDS`, clamp via `DBSLM_CHEETAH_IDLE_GRACE_CAP_SECONDS`). Fresh databases therefore stop flooding the console with `cheetah response timed out after 30.0s of inactivity`, and slow disks can be accommodated by simply raising the timeout or idle-grace fields. When supported, `--reset` first issues `RESET_DB <DBSLM_CHEETAH_DATABASE>` to delete the entire cheetah namespace in one shot, then falls back to `PAIR_PURGE` (and finally the incremental scan loop) when older binaries lack the command.
 - The hot-path adapter now queues reducers via `PAIR_REDUCE_ASYNC` and polls `PAIR_REDUCE_FETCH`, so the TCP socket never sits idle for minutes while cheetah walks slow namespaces. Tweak `CHEETAH_REDUCE_ASYNC` (disable to fall back to synchronous reducers) plus `CHEETAH_REDUCE_POLL_INTERVAL_SECONDS` to adjust the keep-alive cadence; synchronous fallbacks still honor the idle-grace clamp. Progress lines (state, % complete, and completed/total counts) are emitted roughly every 30s so long-running reducers remain visible in the trainer log.
@@ -107,7 +109,7 @@ Cheetah-specific operational steps and directives now live in `cheetah-db/AI_REF
 - Long ingest phases now emit stage-aware progress lines (vocab, each n-gram order, smoothing) so
   large JSON chunks no longer look frozen; the logs include approximate line counts to show where
   the trainer is spending time.
-- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the tmux helpers are detailed inside `cheetah-db/AI_REFERENCE.md`.
+- Added `src/log_helpers.log`, wired it through `src/train.py`, `src/run.py`, and `src/db_slm` helpers, and now every trainer/decoder line (including telemetry emitted by `scripts/smoke_train.py`) is prefixed with `+[seconds_since_start]`; backend-specific latency mirrors plus the tmux helpers are documented in `README.md` and `cheetah-db/AGENTS.md`.
 - Realtime resource telemetry now flows through `src/helpers/resource_monitor.py`: during ingest profiles and every evaluation probe we record CPU %, RSS deltas, thread counts, and disk I/O (leveraging psutil with `resource` fallbacks) and push those samples both to the console and to the metrics export JSON.
 - `CheetahHotPathAdapter` now spins up a dedicated cheetah-db TCP client per thread (with a shared factory + warm connection) so ingest, evaluation, and background workers can exercise true multi-core concurrency without funneling through a single socket; custom clients can still be injected for tests, but the default path uses the thread-local pool.
 - `src/db_slm/sentence_parts.py` feeds `DBSLMEngine.train_from_text()` with punctuation-aware

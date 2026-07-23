@@ -115,7 +115,7 @@ trap cleanup SIGINT SIGTERM EXIT
 # We use 'bash -c' inside screen to reliably handle complex commands
 # and redirection.
 # The '&>' syntax redirects both stdout and stderr to the file.
-CMD1="go run ./cheetah-db &> \"$CHEETAH_LOG_FILE\""
+CMD1="cd \"$(pwd)/cheetah-db\" && go run ./src &> \"$CHEETAH_LOG_FILE\""
 CMD2="$SCRIPT_PYTHON $SCRIPT_COMMAND $SCRIPT_ARGUMENTS &> \"$PYTHON_LOG_FILE\""
 
 # --- Start Sessions ---
