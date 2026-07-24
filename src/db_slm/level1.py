@@ -1072,6 +1072,17 @@ class MKNSmoother:
         self, order: int
     ) -> tuple[Dict[str, List[Tuple[int, int]]], bool]:
         contexts: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        rows = self.store.iter_counts(order)
+        if rows:
+            for row in rows:
+                context_hash = row["context_hash"]
+                count = row["count"]
+                contexts[context_hash].append((row["next_token_id"], count))
+            # SQLite is the relational ingest workspace. Its rows include the
+            # active chunk and must be mirrored before Cheetah-backed smoothing;
+            # preferring an older Cheetah namespace here freezes training at
+            # whichever counts were mirrored first.
+            return contexts, True
         hot_counts = getattr(self.store.hot_path, "iter_counts", None)
         if hot_counts:
             projections = list(self.store.hot_path.iter_counts(order))  # type: ignore[attr-defined]
@@ -1079,14 +1090,7 @@ class MKNSmoother:
                 for projection in projections:
                     contexts[projection.context_hash] = list(projection.followers)
                 return contexts, False
-        rows = self.store.iter_counts(order)
-        if not rows:
-            return {}, True
-        for row in rows:
-            context_hash = row["context_hash"]
-            count = row["count"]
-            contexts[context_hash].append((row["next_token_id"], count))
-        return contexts, True
+        return {}, True
 
     @staticmethod
     def _counts_of_counts(contexts: Dict[str, List[Tuple[int, int]]]) -> Dict[int, int]:
@@ -1101,5 +1105,18 @@ class MKNSmoother:
         publisher = getattr(self.store.hot_path, "publish_counts", None)
         if not publisher:
             return
+        existing: dict[str, dict[int, int]] = {}
+        hot_counts = getattr(self.store.hot_path, "iter_counts", None)
+        if hot_counts:
+            for projection in self.store.hot_path.iter_counts(order):  # type: ignore[attr-defined]
+                existing[projection.context_hash] = dict(projection.followers)
+        changed = False
         for context_hash, followers in contexts.items():
+            if existing.get(context_hash) == dict(followers):
+                continue
             publisher(order, context_hash, followers)  # type: ignore[misc]
+            changed = True
+        if changed:
+            flusher = getattr(self.store.hot_path, "flush_pending", None)
+            if flusher:
+                flusher()

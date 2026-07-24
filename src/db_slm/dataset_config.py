@@ -110,7 +110,27 @@ class DatasetConfig:
         return tuple(labels)
 
     def prompt_tag_tokens(self) -> Tuple[str, ...]:
-        return tuple(f"{label}:" for label in self.prompt_tag_labels())
+        tokens: list[str] = []
+        seen: set[str] = set()
+        configured_labels = [
+            self.prompt.label,
+            self.response.label,
+            *(
+                label
+                for field in self.context_fields
+                for label in (field.label, field.canonical_tag)
+            ),
+        ]
+        for raw_label in configured_labels:
+            label = _stringify(raw_label).strip()
+            if not label:
+                continue
+            token = label if label.endswith(":") else f"{label}:"
+            if token in seen:
+                continue
+            tokens.append(token)
+            seen.add(token)
+        return tuple(tokens)
 
     def compose_prompt(
         self,
@@ -126,10 +146,20 @@ class DatasetConfig:
             if context_values is not None
             else list(self.iter_context_values(payload))
         )
+        preface_contexts, trailing_contexts = self.partition_context_values(ctx_values)
+        lines = self._compose_context_lines(preface_contexts)
+        if prompt_value:
+            prompt_line = f"{self.prompt.label}: {prompt_value}" if self.prompt.label else prompt_value
+            lines.append(prompt_line.strip())
+        lines.extend(self._compose_context_lines(trailing_contexts))
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _compose_context_lines(
+        context_values: Sequence[tuple[ContextFieldConfig, str]],
+    ) -> list[str]:
         lines: list[str] = []
-        for field, ctx_val in ctx_values:
-            if not field.should_prepend():
-                continue
+        for field, ctx_val in context_values:
             ctx_line = ctx_val.strip()
             if not ctx_line:
                 continue
@@ -137,10 +167,10 @@ class DatasetConfig:
                 lines.append(f"{field.label}: {ctx_line}")
             else:
                 lines.append(ctx_line)
-        if prompt_value:
-            prompt_line = f"{self.prompt.label}: {prompt_value}" if self.prompt.label else prompt_value
-            lines.append(prompt_line.strip())
-        return "\n".join(lines).strip()
+            if field.canonical_tag:
+                normalized = field.normalized_token(ctx_line)
+                lines.append(f"{field.canonical_tag}:{field.token}:{normalized}")
+        return lines
 
 
 def infer_config_path(dataset_path: Path) -> Path:

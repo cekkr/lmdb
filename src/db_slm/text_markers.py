@@ -4,6 +4,7 @@ import re
 from typing import Tuple
 
 END_OF_RESPONSE_TOKEN = "|END|"
+_END_OF_RESPONSE_PATTERN = re.compile(r"\|\s*end\s*\|", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 __all__ = [
@@ -26,12 +27,13 @@ def append_end_marker(text: str) -> str:
 
 def strip_end_marker(text: str) -> Tuple[str, bool]:
     """
-    Remove the first |END| tag (if present) and return the trimmed text plus a flag.
+    Remove the first |END| tag (including spaced/case variants) and return the
+    trimmed text plus a flag.
     """
-    marker_index = text.find(END_OF_RESPONSE_TOKEN)
-    if marker_index == -1:
+    marker = _END_OF_RESPONSE_PATTERN.search(text)
+    if marker is None:
         return text.strip(), False
-    before = text[:marker_index].rstrip()
+    before = text[: marker.start()].rstrip()
     return before, True
 
 

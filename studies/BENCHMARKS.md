@@ -3,6 +3,66 @@
 > The smoke harness now appends queue-drain snapshots automatically whenever the quality queue
 > crosses its threshold. Look for sections titled “Queue Drain (auto smoke harness)” for those runs.
 
+## 2026-07-24 - Eight-hour emotion-data repair validation
+
+- Scope and window: repaired empty/scaffolded evaluation responses while continuously supervising
+  emotion-data training from 2026-07-23 23:16:12 CEST through the hard deadline at
+  2026-07-24 07:16:12 CEST. The initial reproduction used the requested order-5 recursive/reset
+  command. After the initial reset, every repair restart reused
+  `var/train_resume.json` without `--reset`, retained the same metrics/log artifacts, and reduced
+  `--json-chunk-size` from 500 to 2 so each recoverable chunk and trainer segment could remain
+  bounded. Cheetah database `default` on port 4455 was never reset again.
+- Runtime ownership: the exact `screen` session was `dbslm_emotion_8h`; supervisor segments were
+  capped at one hour and the final segment was capped to the remaining 1,685 seconds. The
+  supervisor stopped at deadline epoch `1784870172`; afterward no trainer or screen session
+  remained, while the launch-owned Cheetah server (PID 43957) remained healthy and listening.
+- Repaired faults found by live probes: marker-only decodes no longer become empty user responses;
+  structural tag IDs are excluded from session-cache and prediction-table mixtures; training and
+  evaluation now share dataset-configured prompt framing; dependency annotations remain a
+  side-channel rather than serialized training text; malformed dependency artifacts are rejected;
+  MKN rebuilds prefer current SQLite ingest rows and explicitly flush changed Cheetah mirrors;
+  metrics append atomically across resumes; and spaced/case-variant end markers such as
+  `| end |` are stripped before exposure. The command also gained recoverable runtime-boundary
+  support used by the supervisor.
+- Restart disclosure: repairs caused at-least-once replay of chunks 5, 6, 7, 8, and 34. The hard
+  deadline arrived after chunk 45 ingest and its periodic evaluation but before its hold-out,
+  adversarial work, and resume commit. Consequently `var/train_resume.json` safely lists 44
+  completed chunks and chunk 45 as current; continuing from it would replay chunk 45. These
+  replays mean this run is repair evidence, **not** a clean throughput or quality benchmark. The
+  hard alarm bypassed trainer finalization, so both resume and metrics JSON retain a stale
+  `status=running`; post-deadline `screen`, process, and listener checks are the source of truth for
+  lifecycle state.
+- Final persisted observations: the last periodic probe reported 40,184 ingested tokens. The last
+  fully paused segment (through chunk 43) reported 39,404 tokens / 39,232 n-grams and a Cheetah
+  Top-K hit ratio of approximately 37.02%. Cheetah produced no transport, reducer, or availability
+  error during the monitored window.
+- Effective post-end-marker-fix evaluation (metrics events 128-169): 16 evaluations / 64 generated
+  samples, all quality-gated. Empty responses, complete prompt tags, `Emotion:` frame labels, and
+  exact or normalized end-marker leaks were each 0/64. Mean generated perplexity was 505.66
+  (median 75.43, range 4.17-1,861.87), mean reference perplexity 238.19, mean length ratio 0.0612,
+  and mean recorded quality score 0.5528. The quality score is not credible as a standalone
+  usability measure here: 21/64 samples (32.8%) were the identical visible safety backstop, 21/64
+  matched legacy dependency-field vocabulary, 4/64 retained partial `user|` scaffold fragments,
+  and 34/64 contained JSON-like punctuation fragments.
+- Held-out chunks 34-44 were similarly poor: 17/44 samples (38.6%) used the same safety backstop,
+  12/44 matched dependency-field residue, and every sample remained severely too short. Chunk 43
+  temporarily collapsed to 3/4 identical backstops (mean generated perplexity 1,233.85; length
+  ratio 0.0352); chunk 44 recovered to 1/4 backstops but remained incoherent. The final chunk-45
+  periodic probe used one backstop and reported generated perplexity 480.63, length ratio 0.0663,
+  and quality score 0.5423.
+- Artifacts: `var/eval_logs/train-8h-20260723-231612.log`,
+  `var/eval_logs/train-8h-20260723-231612.json`, `var/train_resume.json`, and
+  `var/db_slm.sqlite3`. Runtime artifacts are ignored and are not implementation owners.
+- Verification after deadline: `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`
+  passed 30 tests; `PYTHONPATH=src .venv/bin/python scripts/run_paraphraser_regression.py` passed
+  6/6 cases; `py_compile` passed for every changed Python source/test; and `git diff --check`
+  passed.
+- Unresolved quality gap: the original empty-response and full-tag/end-marker exposure defects are
+  fixed, but the accumulated model state still produces short, incoherent text, frequent
+  backstop collapse, and fragments learned during earlier dependency/scaffold contamination.
+  A clean isolated-database rerun is required before attributing any quality trend to the repaired
+  pipeline.
+
 ## 2026-07-23 - External Cheetah repair and emotion-data validation
 
 - Scope: validated the new `cheetah-db/` submodule boundary, repaired generic storage/concurrency

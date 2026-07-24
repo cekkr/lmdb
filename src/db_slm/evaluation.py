@@ -1086,7 +1086,13 @@ def run_inference_records(
 class EvalLogWriter:
     """Persists evaluation + profiling metrics as structured JSON."""
 
-    def __init__(self, path: Path, run_metadata: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        run_metadata: dict[str, Any],
+        *,
+        append_existing: bool = False,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.run_id = run_metadata.get("run_id") or f"train-{uuid.uuid4().hex}"
@@ -1094,6 +1100,29 @@ class EvalLogWriter:
         self.metadata = run_metadata
         self.events: list[dict[str, Any]] = []
         self._closed = False
+        if append_existing:
+            self._load_existing_snapshot()
+        self._persist_snapshot()
+
+    def _load_existing_snapshot(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(payload, dict):
+            return
+        run_id = payload.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            self.run_id = run_id
+        started_at = payload.get("started_at")
+        if isinstance(started_at, str) and started_at:
+            try:
+                self.started_at = dt.datetime.fromisoformat(started_at.rstrip("Z"))
+            except ValueError:
+                pass
+        events = payload.get("events")
+        if isinstance(events, list):
+            self.events = [event for event in events if isinstance(event, dict)]
 
     def log_eval_batch(
         self,
@@ -1124,14 +1153,11 @@ class EvalLogWriter:
             ],
         }
 
-        for sample in samples:
-            print("\nsample.prompt: ", sample.prompt)
-            print("sample.generated: ", sample.generated, "\n")
-
         cycle_reference = self._cycle_reference(samples)
         if cycle_reference:
             event["cycle_reference"] = cycle_reference
         self.events.append(event)
+        self._persist_snapshot()
 
     def log_profile(
         self,
@@ -1160,6 +1186,7 @@ class EvalLogWriter:
         if resources:
             event["resources"] = resources
         self.events.append(event)
+        self._persist_snapshot()
 
     def finalize(
         self,
@@ -1169,18 +1196,29 @@ class EvalLogWriter:
     ) -> None:
         if self._closed:
             return
+        self._persist_snapshot(totals=totals, status=status, completed=True)
+        self._closed = True
+
+    def _persist_snapshot(
+        self,
+        *,
+        totals: dict[str, Any] | None = None,
+        status: str = "running",
+        completed: bool = False,
+    ) -> None:
         payload = {
             "run_id": self.run_id,
             "status": status,
             "started_at": self.started_at.isoformat(timespec="seconds") + "Z",
-            "completed_at": self._timestamp(),
+            "completed_at": self._timestamp() if completed else None,
             "metadata": self.metadata,
-            "totals": totals,
+            "totals": totals or {},
             "events": self.events,
         }
-        with self.path.open("w", encoding="utf-8") as handle:
+        tmp_path = self.path.with_name(f"{self.path.name}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-        self._closed = True
+        tmp_path.replace(self.path)
 
     @staticmethod
     def _clean_number(value: Any) -> float | None:

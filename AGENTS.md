@@ -111,20 +111,36 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   [`collect_prompt_tag_tokens`](src/train.py),
   [`DatasetConfig.prompt_tag_tokens`](src/db_slm/dataset_config.py), and
   [`DBSLMEngine.register_prompt_tags`](src/db_slm/pipeline.py) enumerate built-in and
-  dataset-specific tags before ingest/evaluation. `DBSLMEngine.respond` bans their token IDs,
-  performs case-normalized alias checks over each candidate, retries with fresh randomness, and
-  emits a scaffold-free backstop after retry exhaustion. Preserve this sequence and the formatter
-  regression in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
+  dataset-specific tags and configured plain-text frame labels before ingest/evaluation.
+  `DBSLMEngine.respond` bans their token IDs,
+  [`TokenScoringPipeline.score`](src/db_slm/scoring.py) preserves those bans while mixing the session
+  cache and prediction distribution, and the engine performs case-normalized alias checks over each
+  candidate. Plain labels retain the delimiter in their alias check, so `Emotion:` is rejected
+  without banning ordinary prose containing `emotion`. Empty and marker-only candidates are also
+  rejected before `|END|` stripping. The engine
+  retries with fresh randomness, clears rejected token IDs, and emits a scaffold-free backstop after
+  retry exhaustion even when response framing is disabled for raw evaluation. Preserve this
+  sequence and the scoring/pipeline/formatter regressions.
 - **Every decoder prompt ends in the selected response label.**
   [`ensure_response_prompt_tag`](src/db_slm/prompt_tags.py) is called by the training evaluation
-  loader and both inference modes. Omitting the terminal `|RESPONSE|:` makes the model continue the
-  user frame. Staged responses end with `|END|`; user-visible output strips it through
-  [`src/db_slm/text_markers.py`](src/db_slm/text_markers.py).
+  loader and both inference modes. [`DatasetConfig.compose_prompt`](src/db_slm/dataset_config.py)
+  also emits before/after-prompt context and canonical tags identically for training and evaluation.
+  Omitting the terminal `|RESPONSE|:` or its preceding dataset context makes the model continue an
+  unseen frame. Staged responses end with `|END|`; user-visible output strips it through
+  [`src/db_slm/text_markers.py`](src/db_slm/text_markers.py), including case-insensitive variants
+  with whitespace inside the pipes that can survive from legacy fragmented counts.
 - **Internal Level 3 context never becomes visible scaffold.**
   [`DBSLMEngine.respond`](src/db_slm/pipeline.py) may add `ContextSummary` text to the rolling
   context and embedding input, but it MUST NOT prepend the internal `|CONTEXT|:` payload to the
   response. [`TaggedResponseFormatter`](src/db_slm/pipeline.py) removes an already-terminal response
   frame before wrapping to prevent nested `|USER|:`/`|RESPONSE|:` blocks.
+- **Dependency analysis is a side channel, not generation text.**
+  JSON/NDJSON staging stores `DependencyLayer` objects on `EvaluationRecord` for alignment metrics
+  and prediction training, but MUST NOT append serialized `token`/`lemma`/`head`/`dep`/`pos` fields
+  to the n-gram corpus. `DBSLMEngine.respond` rejects those field-shaped artifacts so models trained
+  before this repair cannot expose the internal record. Preserve the staging and response
+  regressions in [`tests/test_train_monitor.py`](tests/test_train_monitor.py) and
+  [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py).
 - **Cheetah reducer transport has two encoding layers.**
   [`CheetahClient.pair_reduce`](src/db_slm/adapters/cheetah.py) uses canonical
   `JOB submit command=<base64>` → `JOB status id=...` → `JOB fetch id=...`, falling back to legacy
@@ -138,6 +154,13 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   atomic high-water mark and serialized pair mutations prevent equal-size inserts and
   shared-prefix writes from overwriting each other. Before advancing the gitlink, run the focused
   Cheetah regression tests listed in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- **Relational ingest counts refresh Cheetah before smoothing.**
+  [`NGramStore.ingest`](src/db_slm/level1.py) writes the relational working counts, then
+  [`MKNSmoother._collect_context_followers`](src/db_slm/level1.py) selects those current rows and
+  [`MKNSmoother._mirror_counts`](src/db_slm/level1.py) publishes only changed follower sets.
+  `HotPathAdapter.flush_pending` makes those async writes visible before the MKN pass continues.
+  Never prefer an already-populated Cheetah count namespace over newer SQLite ingest rows; that
+  freezes training at the first mirrored seed corpus.
 - **Cheetah visibility and reducer extension are server-owned.**
   `PAIR_SET_HIDDEN` stores terminals excluded from default `PAIR_SCAN`/`PAIR_REDUCE`/`PAIR_SUMMARY`;
   callers must request `include_hidden=1` to inspect cached joins. New reducer modes belong in the
@@ -327,8 +350,13 @@ ingest/evaluation scheduling, prediction-table training, adversarial updates, me
   [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py); no focused automated coverage
   for resume, reset, chunking, or penalty tuning.
 - **Common mistakes:** register every dataset/evaluation tag before probes; keep stdin synchronous;
-  never run `--reset` without an isolated Cheetah database; escape literal `%` as `%%` in argparse
-  help strings or `--help` crashes during interpolation.
+  verbose staging lines are decoder-input/reference previews rather than generated responses; never
+  append serialized dependency records to generation text; never replay every crossed
+  `--eval-interval` after a large chunk; never run `--reset` without an isolated Cheetah database;
+  escape literal `%` as `%%` in argparse help strings or `--help` crashes during interpolation.
+- **Bounded resume:** `--max-runtime-seconds` finishes the active chunk, records `status=paused`, and
+  exits at a recoverable boundary; invoking `train.py` with no arguments resumes the saved command
+  and cumulative totals.
 
 ### [`src/run.py`](src/run.py)
 
@@ -405,9 +433,12 @@ Modified Kneser–Ney (MKN) materialization.
   `Tokenizer` and `MergeStats`; `LogProbQuantizer`; `NGramStore`; `MKNSmoother`.
 - **Called by:** [`DBSLMEngine`](src/db_slm/pipeline.py), decoder, evaluation perplexity, and
   prediction inheritance.
-- **Tests:** no focused tokenizer, merge, smoothing, or quantization suite.
+- **Tests:** [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) covers current
+  relational count selection plus delta-only Cheetah mirroring; tokenizer, merge math, MKN numeric
+  output, and quantization remain uncovered.
 - **Common mistakes:** preserve registered structural tokens as atomic units; merging is disabled
-  below n-gram order 5; publish context/count/probability/Top-K changes through `HotPathAdapter`.
+  below n-gram order 5; publish context/count/probability/Top-K changes through `HotPathAdapter`;
+  flush asynchronous count writes before a reducer can observe the namespace.
 
 ### [`src/db_slm/level2.py`](src/db_slm/level2.py)
 
@@ -443,9 +474,12 @@ corrections, and guarded response generation.
 - **Key paths:** `train_from_text`; `register_prompt_tags`; `respond`; `context_relativism`;
   `record_correction`.
 - **Tests:** response framing in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) and
-  paraphraser behavior in [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py).
+  marker-only/dependency-artifact raw-response fallback in
+  [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py); paraphraser behavior in
+  [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py).
 - **Common mistakes:** constructor order matters because metadata, tokenizer special tokens,
-  concepts, low-resource state, and prompt-tag bans depend on earlier components.
+  concepts, low-resource state, and prompt-tag bans depend on earlier components; validate visible
+  content before accepting a decode because `strip_end_marker("|END|")` is empty.
 
 ### [`src/db_slm/decoder.py`](src/db_slm/decoder.py)
 
@@ -468,9 +502,10 @@ Owns the composable candidate scoring order and optional per-step trace objects.
   `ScoreObserver`.
 - **Order:** dequantized base log probability → temperature → Level 2 bias → repeat/dimension
   penalties → cache mixture → normalization → optional prediction blend → trace.
-- **Tests:** no focused numeric/scoring-order test.
+- **Tests:** [`tests/test_scoring.py`](tests/test_scoring.py) covers prompt-tag bans across cache and
+  prediction mixing; numeric scoring order remains uncovered.
 - **Common mistake:** moving normalization or mixing steps changes semantics even when the same
-  inputs remain present.
+  inputs remain present; every source added to the distribution must preserve the decoder ban set.
 
 ### [`src/db_slm/context_dimensions.py`](src/db_slm/context_dimensions.py)
 
@@ -516,7 +551,8 @@ Owns executable JSON/NDJSON schema mapping and prompt composition.
   `load_dataset_config`; `infer_config_path`; `_normalize_context_placement`.
 - **Resolution order:** explicit override → `DBSLM_DATASET_CONFIG_PATH` → adjacent config → generic
   `prompt`/`response` defaults.
-- **Tests:** no focused config parsing/composition test.
+- **Tests:** [`tests/test_dataset_config.py`](tests/test_dataset_config.py) covers preface and trailing
+  context/canonical-tag prompt composition.
 - **Common mistake:** parsing errors currently fall through to another candidate/default; validate
   configs directly when changing schema.
 
@@ -533,7 +569,9 @@ Owns the terminal response-label invariant.
 Owns the `|END|` training marker and extraction of complete user-visible response text.
 
 - **Key symbols:** `append_end_marker`; `strip_end_marker`; `extract_complete_sentence`.
-- **Common mistake:** the marker is corpus/control data and MUST NOT be returned to the user.
+- **Common mistake:** the marker is corpus/control data and MUST NOT be returned to the user;
+  stripping must recognize legacy spaced/case variants while staging continues to emit canonical
+  `|END|`.
 
 ### [`src/db_slm/inference_shared.py`](src/db_slm/inference_shared.py)
 
@@ -553,6 +591,9 @@ perplexity metrics, repetition memory, prediction probes, metrics JSON, and qual
 - **Key symbols:** `EvaluationRecord`; `DependencyLayer`; `build_dependency_layer`;
   `VariantSeedPlanner`; `ResponseEvaluator`; `run_inference_records`; `EvalLogWriter`;
   `QualityGate`; `ContextProbabilityProbe`.
+- **Persistence:** `EvalLogWriter` atomically rewrites a `status=running` snapshot after every
+  evaluation/profile event, appends existing events during resume, then finalizes the same file with
+  terminal status and totals.
 - **Depends on:** [`src/db_slm/quality.py`](src/db_slm/quality.py),
   [`src/db_slm/metrics.py`](src/db_slm/metrics.py), and
   [`src/helpers/char_tree_similarity.py`](src/helpers/char_tree_similarity.py).
@@ -610,7 +651,7 @@ Cheetah trie prefixes.
 Defines the complete `HotPathAdapter` protocol and `NullHotPathAdapter` SQLite-only implementation.
 
 - **Surface:** publish/fetch Level 1 state, metadata, scans/reducers, context relativism, summaries,
-  system stats, and prediction set/train/query/inherit operations.
+  system stats, pending-write flush, and prediction set/train/query/inherit operations.
 - **Called by:** Level 1, Level 2 metadata, context windows, decoder, trainer, and CLI diagnostics.
 - **Common mistake:** add a new capability to the protocol, null adapter, concrete adapter, and
   callers in one change.
@@ -637,7 +678,8 @@ prediction commands.
   idempotent publish/fetch, response parsing, timeout recovery, canonical job flow, legacy fallback,
   and storage transport decoding.
 - **Common mistakes:** `0.0.0.0` is a listen address, not a client destination; namespace values are
-  bytes; do not share one socket across worker threads; fatal adapter disable must remain visible.
+  bytes; do not share one socket across worker threads; flush count mirrors before reducer reads;
+  fatal adapter disable must remain visible.
 
 ### [`src/helpers/char_tree_similarity.py`](src/helpers/char_tree_similarity.py)
 
@@ -771,6 +813,52 @@ Package marker enabling module-style `unittest` invocation.
 
 - **Boundary:** it contains no fixtures or test registration.
 
+### [`tests/test_dataset_config.py`](tests/test_dataset_config.py)
+
+Focused prompt-composition regressions using the executable GPTeacher and emotion mappings.
+
+- **Contracts:** preface fields stay before `|USER|`; default trailing fields and canonical `|CTX|`
+  tokens stay after it so training and evaluation end on the same context.
+
+### [`tests/test_scoring.py`](tests/test_scoring.py)
+
+Focused scoring-pipeline regressions with lightweight cache/prediction fixtures.
+
+- **Contracts:** a banned structural token cannot re-enter the distribution or score trace through
+  Level 2 cache mixture or prediction blending.
+
+### [`tests/test_evaluation.py`](tests/test_evaluation.py)
+
+Focused evaluation-log writer regression.
+
+- **Contract:** structured samples are retained in the metrics event without printing a second raw
+  `sample.prompt`/`sample.generated` pair that can be mistaken for the timestamped probe result; the
+  event is atomically visible in a running metrics snapshot before finalization.
+
+### [`tests/test_train_monitor.py`](tests/test_train_monitor.py)
+
+Focused periodic-evaluation scheduling regression.
+
+- **Contract:** a completed chunk crossing multiple token intervals triggers one current probe and
+  advances to the next future threshold instead of replaying the entire missed-threshold backlog;
+  the recoverable runtime-budget CLI remains parser-visible; dependency objects remain attached to
+  prediction/evaluation records without entering `CorpusChunk.train_text`.
+
+### [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py)
+
+Focused raw-response fallback regression using lightweight engine fixtures.
+
+- **Contract:** a marker-only decode is retried to the configured budget and then becomes visible,
+  scaffold-free backstop text instead of an empty evaluation response; serialized dependency-field
+  output is rejected through the same path.
+
+### [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py)
+
+Focused count-source and mirror regression using SQLite-like rows plus stale hot-path fixtures.
+
+- **Contract:** current relational ingest counts win over stale Cheetah rows; only changed/new
+  follower sets are published, and queued writes are flushed before smoothing proceeds.
+
 ### [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl)
 
 Data-driven cases distinguishing guarded structural/corrective/multi-turn prompts from ordinary
@@ -868,7 +956,9 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 
 - **Behavior:** plain text and JSON/NDJSON inputs stream in chunks; JSON staging can use spawned
   workers; interrupted runs persist `var/train_resume.json`; periodic and chunk hold-out probes
-  generate metrics and quality-queue entries.
+  generate metrics and quality-queue entries. Level-3 staging previews are explicitly labeled as
+  decoder input/reference pairs rather than generations. Periodic scheduling is bounded to one
+  current probe per completed chunk even when the chunk crosses multiple token intervals.
 - **Flow and owners:** [`src/train.py`](src/train.py) → dataset config/dependency layer →
   `DBSLMEngine.train_from_text` → `InferenceMonitor`/`EvalLogWriter`.
 - **Constraints:** training startup requires `language_tool_python` and a working Java runtime;
@@ -879,7 +969,9 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 ### Cheetah hot path, reducers, and prediction tables — Shipped
 
 - **Behavior:** per-thread clients publish/fetch Level 1 data, page namespace scans, execute reducers
-  through jobs, inspect system state, and train/query/inherit prediction entries.
+  through jobs, inspect system state, flush asynchronous mirror writes, and train/query/inherit
+  prediction entries. MKN rebuilds compare current relational ingest counts with Cheetah and publish
+  only changed follower sets before calculating probabilities.
 - **Flow and owners:** [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) → Cheetah
   TCP command registry and reducers documented in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
 - **Constraints:** use a concrete client host, trusted network, named database isolation, bounded
@@ -904,8 +996,11 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 ### Prompt framing and response guardrails — Shipped
 
 - **Behavior:** dataset tags are registered atomically, every prompt terminates in a response tag,
-  generated scaffold tokens are banned/retried, internal context stays hidden, short evaluations
-  receive a bounded backstop, and output is consistently framed.
+  training/evaluation share before/after-prompt context lines, generated scaffold tokens remain
+  banned through cache/prediction blending and retries, empty or `|END|`-only candidates are retried,
+  internal concept/dependency context stays hidden, and output is consistently framed. Evaluation
+  records the raw generation when one succeeds and a scaffold-free backstop only after every decoder
+  attempt fails.
 - **Flow and owners:** [`dataset_config.py`](src/db_slm/dataset_config.py) →
   [`prompt_tags.py`](src/db_slm/prompt_tags.py) → [`pipeline.py`](src/db_slm/pipeline.py) →
   [`text_markers.py`](src/db_slm/text_markers.py).
@@ -968,6 +1063,44 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
   `TaggedResponseFormatter.wrap` in [`pipeline.py`](src/db_slm/pipeline.py).
 - **Safe pattern / regression check:** preserve case normalization and run
   [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
+- **Status:** fixed regression risk.
+
+### Pitfall: reintroducing prompt tags through score mixtures
+
+- **Symptom / wrong assumption:** a training probe prints an empty generation even though its
+  n-gram candidates excluded `|USER|:`, `|RESPONSE|:`, or another structural tag.
+- **Cause and invariant:** the prompt is intentionally present in the Level 2 cache; cache union or
+  prediction blending can re-add a banned token unless the ban set is applied to every source. Three
+  rejected candidates then collapse to the empty safe response.
+- **Risk area:** `TokenScoringPipeline.score` in [`scoring.py`](src/db_slm/scoring.py).
+- **Safe pattern / regression check:** filter cache and prediction distributions with `banned`
+  before combining them; run [`tests/test_scoring.py`](tests/test_scoring.py).
+- **Status:** fixed regression risk.
+
+### Pitfall: accepting an end marker as a visible response
+
+- **Symptom / wrong assumption:** a held-out evaluation sample is empty even though prompt tags stay
+  banned and adjacent variants generate text.
+- **Cause and invariant:** `|END|` is a valid decoder control token but becomes empty after
+  `strip_end_marker`; candidate acceptance must validate the stripped visible text, retry an
+  empty/marker-only decode, and keep the exhausted fallback independent of response scaffolding.
+- **Risk area:** `DBSLMEngine.respond` in [`pipeline.py`](src/db_slm/pipeline.py).
+- **Safe pattern / regression check:** strip the marker before accepting a candidate and run
+  [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py).
+- **Status:** fixed regression risk.
+
+### Pitfall: training on serialized dependency records
+
+- **Symptom / wrong assumption:** generated responses contain JSON-like `"lemma"`, `"dep"`,
+  `"pos"`, `"head"`, or `"token"` fragments even though prompt tags remain banned.
+- **Cause and invariant:** dependency arcs are structured evaluation/prediction metadata. Appending
+  their JSON serialization after each response teaches the n-gram generator internal schema text;
+  keep the objects on `EvaluationRecord` instead.
+- **Risk area:** JSON/NDJSON staging in [`train.py`](src/train.py) and response acceptance in
+  [`pipeline.py`](src/db_slm/pipeline.py).
+- **Safe pattern / regression check:** keep dependency layers out of `CorpusChunk.train_text`,
+  reject field-shaped legacy artifacts, and run [`tests/test_train_monitor.py`](tests/test_train_monitor.py)
+  plus [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py).
 - **Status:** fixed regression risk.
 
 ### Pitfall: decoding reducer rows without removing storage transport
@@ -1131,12 +1264,21 @@ checklist; distribution is currently source plus the separately built Cheetah bi
 | Cursored scan parsing and socket idle recovery | `CheetahClientParsingTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
 | Canonical `JOB` reducer flow and legacy alias fallback | `test_pair_reduce_uses_canonical_job_status_then_fetch` / `test_pair_reduce_falls_back_to_legacy_alias_without_job_api` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
 | Response frame de-nesting and scaffold stripping | `TaggedResponseFormatterTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Training/evaluation prompt context parity | [`tests/test_dataset_config.py`](tests/test_dataset_config.py) |
+| Prompt-tag bans across cache/prediction mixing | [`tests/test_scoring.py`](tests/test_scoring.py) |
+| Evaluation writer avoids duplicate raw console samples | [`tests/test_evaluation.py`](tests/test_evaluation.py) |
+| Evaluation events persist atomically while the run is active | [`tests/test_evaluation.py`](tests/test_evaluation.py) |
+| Large-chunk periodic evaluation stays bounded | [`tests/test_train_monitor.py`](tests/test_train_monitor.py) |
+| Marker-only raw decode retries and visible fallback | [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py) |
+| Dependency records stay out of generation text and legacy artifacts are rejected | [`tests/test_train_monitor.py`](tests/test_train_monitor.py) + [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py) |
+| Current ingest counts replace stale Cheetah mirrors before smoothing | [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) |
 | Paraphraser guard vs rewrite policy | [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py) + [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl) |
 | Cheetah storage concurrency, trie, reducers, jobs, prediction tables, lifecycle, and formats | Test map in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
 
-Known Python test gaps: SQLite schema upgrades/transactions; tokenizer and merging; MKN math;
-context dimensions/windows; Level 2/3 persistence and restart; decoder scoring/sampling; prompt-tag
-retry exhaustion; dataset config parsing; trainer reset/resume/chunking; evaluation metrics/retries;
+Known Python test gaps: SQLite schema upgrades/transactions; tokenizer and merging; MKN math and
+quantization; context dimensions/windows; Level 2/3 persistence and restart; decoder sampling and numeric scoring
+order; prompt-tag contamination retry exhaustion; dataset config parsing; trainer
+reset/resume/chunking; evaluation metrics/retries;
 quality queue/adversarial updates; multiprocessing REPL; shell lifecycle helpers; and live Python ↔
 Cheetah integration. Add focused tests with changes in these areas rather than relying only on a
 long smoke train.

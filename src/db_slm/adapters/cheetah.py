@@ -1701,6 +1701,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
         except CheetahError as exc:
             self._disable(exc)
 
+    def flush_pending(self) -> None:
+        """Wait for asynchronous mirror writes without shutting down the adapter."""
+        with self._async_lock:
+            pending = list(self._async_futures)
+            self._async_futures.clear()
+        for future in pending:
+            self._await_future(future)
+
     def publish_probabilities(
         self,
         order: int,
@@ -2589,11 +2597,7 @@ class CheetahHotPathAdapter(HotPathAdapter):
         executor = getattr(self, "_async_executor", None)
         if executor is None:
             return
-        with self._async_lock:
-            pending = list(self._async_futures)
-            self._async_futures.clear()
-        for future in pending:
-            self._await_future(future)
+        self.flush_pending()
         executor.shutdown(wait=True)
         self._async_executor = None
 

@@ -236,24 +236,30 @@ python src/train.py datasets/emotion_data.json \
   - `--eval-pool-size <count>`: Maximum number of records kept in memory for the rolling evaluation pool (default 200, 0/None means unlimited).
 - **Profiling + logging**
   - `--profile-ingest`: Print per-corpus latency and RSS metrics while ingesting so you can raise chunk sizes confidently.
+  - `--max-runtime-seconds <seconds>`: After the budget is reached, finish the active chunk and
+    pause at its recoverable boundary. Run `python3 src/train.py` with no arguments to resume the
+    saved command without repeating completed chunks.
   - `--metrics-export <path>`: Write the rolling ROUGE/perplexity timeline plus profiling samples to JSON (`var/eval_logs/train-<timestamp>.json` by default). Use `--metrics-export -` to disable.
 - **Decoder penalty overrides (evaluation-only)**
   - `--decoder-presence-penalty <float>`: Adds a one-time penalty when a token/span has already appeared in the generation. Typical sweeps cover `0.0-0.4`.
   - `--decoder-frequency-penalty <float>`: Scales penalties by how often the token/span repeats. Values between `0.0` and `0.2` usually smooth repetition without collapsing the sampler.
 
 Every run reports per-file token counts, derived n-gram windows, and the evaluation log path. Inputs shorter than the configured order are skipped automatically and clearly labeled in the logs.
+During each MKN rebuild, the trainer treats the current SQLite n-gram rows as the relational ingest
+workspace, compares them with Cheetah's count namespaces, publishes only changed/new follower sets,
+and waits for those writes before continuing. This prevents a populated but stale Cheetah namespace
+from holding smoothing at the initial seed corpus while later chunks appear to ingest normally.
 Running `python src/train.py` with no arguments resumes the last interrupted training run using `var/train_resume.json`, skipping any completed chunks. Pass explicit inputs to start a fresh ingest.
 
 #### Dependency parsing layer & strong token groups
 
 - Every JSON/NDJSON row now runs through a dependency parser (spaCy first, Stanza as a fallback) when
-  preparing training/evaluation samples. The resulting arcs and categorical buckets are appended to
-  each segment as a `DependencyLayer: {...}` line so the downstream n-gram prep can treat those terms
-  as a strong reference set. This extra layer gives the hold-out sampler the "important tokens" with
-  far fewer n-gram windows than a naïve surface-form scan.
-- The serialized payload includes the backend (`spacy` or `stanza`), the flattened dependency arcs,
-  and a `strong_reference` map that classifies lemmas into buckets such as `subjects`, `objects`,
-  `actions`, and `modifiers`. Evaluations report two additional metrics derived from the same data:
+  preparing training/evaluation samples. The resulting arcs and categorical buckets stay on the
+  structured evaluation/prediction record; they are deliberately excluded from n-gram generation
+  text so internal `lemma`/`dep`/`pos` fields cannot leak into responses.
+- The side-channel layer includes the backend (`spacy` or `stanza`), dependency arcs, and strong
+  lemma groups such as `subjects`, `objects`, `actions`, and `modifiers`. Evaluations report two
+  additional metrics derived from the same data:
   `strong_token_overlap` (share of critical lemmas preserved) and `dependency_arc_overlap` (matching
   head/dependency triples). Both values surface in the probe summaries next to ROUGE/perplexity.
 - Configure the parsers via environment variables: `DBSLM_SPACY_MODEL` (default `en_core_web_sm`),
@@ -329,19 +335,27 @@ already expect. `train.py` prints whatever `prompt_label`/`response_label` the d
 provides, and any `context_fields` entry can opt into `"placement": "before_prompt"` so its label is
 inserted immediately ahead of the user prompt. `DatasetConfig.compose_prompt()` mirrors those
 preface lines when building held-out prompts, letting evaluation probes replay the exact
-`|INSTRUCTION|` + `|USER|` framing produced during staging. Interactive helpers (`run.py`, the
+`|INSTRUCTION|` + `|USER|` framing produced during staging. It also emits trailing context and
+canonical tags such as the emotion dataset's `|CTX|` line. Interactive helpers (`run.py`, the
 evaluation probes, and the paraphraser guards in `src/db_slm/pipeline.py`) wrap prompts with
 `|USER|:` and model outputs with `|RESPONSE|:` so downstream tooling can distinguish user turns from
 generations. Every response sent through the trainer also flows through `append_end_marker()`,
-guaranteeing the sentence-level `|END|` marker is present even if a dataset omits it. The tokenizer
-treats `|END|` like the other structural markers, so appending it does not change semantic content
-but keeps segment boundaries unambiguous.
+guaranteeing the sentence-level `|END|` marker is present even if a dataset omits it.
+User-visible extraction also removes case-insensitive marker variants with whitespace inside the
+pipes (for example `| end |`) so fragmented legacy counts cannot expose the control marker.
 
-Candidate decoding rejects prompt-tag aliases up to the bounded retry budget. If all attempts remain
-contaminated, the engine discards their token IDs and produces a scaffold-free response backstop
-instead of leaking the final invalid candidate into the response or cache. The tagged formatter also
+Candidate decoding rejects prompt-tag aliases, configured frame labels such as `Emotion:`, empty
+candidates, and `|END|`-only candidates—including spaced/case legacy variants—up to the bounded
+retry budget. Plain-text labels keep their
+colon during alias checks, so ordinary prose containing the word `emotion` remains valid. It also
+rejects serialized dependency-field artifacts left in models trained before the side-channel
+repair. If every attempt remains invalid, the engine discards the rejected token IDs and emits a
+scaffold-free response backstop instead of leaking the final candidate or returning an empty result.
+This guarantee also applies to raw evaluation with response framing disabled. The tagged formatter
 strips an existing terminal `|RESPONSE|:` before wrapping a prompt, preventing nested `|USER|:`
-frames in scripted inference.
+frames in scripted inference. Token bans apply after every scoring source is combined, so the Level
+2 session cache and Cheetah prediction bias cannot reintroduce a structural tag that the n-gram
+candidate filter already rejected.
 
 `db_slm.prompt_tags.ensure_response_prompt_tag()` is now called by both `train.py` and the
 evaluation stack immediately before decoding so prompts always terminate with the configured
@@ -359,7 +373,10 @@ with ``|INSTRUCTION|: ...`` followed by the actual ``|USER|: ...`` prompt. No co
 required when adding similar datasets—`load_dataset_config()` already respects arbitrary labels,
 tokens, and placements supplied by the config file.
 Evaluation datasets still require the real prompt column; optional instruction/context fields are
-only added when present in the source JSON.
+only added when present in the source JSON. Both `before_prompt` and default trailing context fields,
+including their canonical tags such as `|CTX|:emotion:envy`, are composed by the same helper used for
+training and held-out evaluation. This keeps the terminal context immediately before
+`|RESPONSE|:` identical on both paths.
 
 ### cheetah Streaming Archive
 
@@ -390,22 +407,33 @@ fresh conversation with the low-resource seeding helper disabled, so the reporte
 reflect the newly trained n-gram tables instead of the caretaker seed dialog you may see in
 interactive `run.py` sessions on tiny corpora.
 
+`--eval-interval` is checked at chunk boundaries. If one chunk crosses several token thresholds, the
+trainer runs one periodic probe at the completed chunk total and advances directly to the next future
+threshold instead of replaying a backlog of near-identical probes. Chunk hold-out evaluation remains
+separate and still runs once for that chunk.
+
 In addition to the per-sample logs, `train.py` now prints run-level averages (lexical overlap,
 ROUGE-L, generated/reference perplexity) after every probe and mirrors the raw samples into
 `var/eval_logs/*.json`. The feed includes hold-out probes, periodic evaluation sets, and optional
 profiling records so you can diff long runs or export the JSON into your own dashboards. Point
-`--metrics-export` at a custom path when you need to archive the file elsewhere.
+`--metrics-export` at a custom path when you need to archive the file elsewhere. Per-record staging
+previews are available only with `LMDB_LOG_LEVEL=3`; they label the decoder input and held-out
+reference separately. A decoder input ending in `|RESPONSE|:` is a prediction sentinel, not an empty
+generated response. Each evaluation/profile event atomically refreshes the JSON with
+`status=running`; finalization changes the status and adds totals, so external monitors do not have
+to wait for process exit. A bounded `--max-runtime-seconds` resume reopens the same file and appends
+new events instead of replacing the earlier timeline.
 
 Evaluation probes also call the new sentence-quality stack: LanguageTool for grammar deltas,
 `textattack/roberta-base-CoLA` for semantic acceptability, and the shared sentence-transformer
 embedder for similarity/novelty scores. Those numbers are appended to the JSON timeline alongside
 lexical/ROUGE/perplexity values, so you can catch regressions that only manifest as grammatical
-errors or semantic drift. Because `emotion_data.json` responses average ~347 words, the evaluator
-derives `min_response_words` from the reference length (capped at 512 words) to ensure the logged
-`|RESPONSE|` frame actually reaches the substantive part of the answer instead of truncating after
-128 words. Each prompt/variant now receives a dedicated RNG seed derived from `--eval-seed` (or a
-per-run random base when the flag is omitted), so repeated prompts explore different structures
-without manually juggling randomness. When a sample is flagged for retraining it now re-enters the
+errors or semantic drift. Probes record the raw database-native generation whenever decoding
+succeeds. Empty or marker-only candidates consume the engine's bounded retry budget; only exhausted
+attempts receive the same visible, scaffold-free backstop used by response safety. Each
+prompt/variant receives a dedicated RNG seed derived from `--eval-seed` (or a per-run random base
+when the flag is omitted), so repeated prompts explore different structures without manually
+juggling randomness. When a sample is flagged for retraining it re-enters the
 current batch at a random
 position (up to two total attempts) before being scheduled for future probes, so the decoder gets a
 fresh shot without holding up the rest of the evaluation.
@@ -565,9 +593,10 @@ paraphraser never rewrites structured guidance or follow-up directions.
 and plain prompts that should still be rewritten. Wire it into CI or run it locally whenever you
 tweak `SimpleParaphraser`.
 
-Training-time evaluations were further hardened so the decoder always produces at least 20 words,
-even when the probabilistic backoff is uncertain. The new response backstop adds transparent filler
-sentences referencing the prompt keywords so ROUGE/perplexity measurements never silently drop rows.
+The response backstop is independent of interactive scaffolding. Training-time evaluation still
+measures the raw generation on successful decodes, while an exhausted sequence of empty,
+marker-only, or prompt-contaminated candidates receives visible fallback text rather than silently
+dropping the sample.
 
 ## Smoke Testing
 

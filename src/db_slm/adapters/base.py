@@ -28,6 +28,9 @@ class HotPathAdapter(Protocol):
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
         """Mirror raw follower counts for a context hash."""
 
+    def flush_pending(self) -> None:
+        """Wait for queued mirror writes to become visible to subsequent reads."""
+
     def publish_probabilities(
         self,
         order: int,
@@ -164,6 +167,9 @@ class NullHotPathAdapter:
         return None
 
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
+        return None
+
+    def flush_pending(self) -> None:
         return None
 
     def publish_probabilities(

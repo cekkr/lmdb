@@ -265,6 +265,15 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Optional cap on the number of JSON/NDJSON lines to ingest per file (default: 0 = unlimited).",
     )
     parser.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        default=0,
+        help=(
+            "Pause after the first completed chunk once this runtime budget is reached "
+            "(default: 0 = unlimited). Resume by running train.py with no arguments."
+        ),
+    )
+    parser.add_argument(
         "--prep-workers",
         type=int,
         default=0,
@@ -1714,61 +1723,6 @@ class TrainingProgressPrinter:
         return labels.get(stage, stage)
 
 
-def _serialize_dependency_layer(layer: DependencyLayer | None) -> dict[str, Any] | None:
-    if layer is None:
-        return None
-    dependencies = [
-        {
-            "token": arc.token,
-            "lemma": arc.lemma,
-            "head": arc.head,
-            "dep": arc.dep,
-            "pos": arc.pos,
-        }
-        for arc in layer.arcs
-    ]
-    return {
-        "backend": layer.backend,
-        "token_count": layer.token_count,
-        "strong_tokens": layer.strong_token_groups,
-        "dependencies": dependencies,
-    }
-
-
-def _flatten_dependency_tokens(layer: DependencyLayer | None) -> list[str]:
-    if layer is None or not layer.strong_token_groups:
-        return []
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for bucket in sorted(layer.strong_token_groups):
-        for token in layer.strong_token_groups[bucket]:
-            if token in seen:
-                continue
-            ordered.append(token)
-            seen.add(token)
-    return ordered
-
-
-def _dependency_layer_annotation(
-    prompt_layer: DependencyLayer | None,
-    response_layer: DependencyLayer | None,
-) -> str | None:
-    prompt_payload = _serialize_dependency_layer(prompt_layer)
-    response_payload = _serialize_dependency_layer(response_layer)
-    if not prompt_payload and not response_payload:
-        return None
-    payload = {
-        "prompt": prompt_payload,
-        "response": response_payload,
-        "strong_reference": {
-            "prompt": _flatten_dependency_tokens(prompt_layer),
-            "response": _flatten_dependency_tokens(response_layer),
-        },
-    }   
-
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def iter_corpora(
     paths: Iterable[Path],
     encoding: str,
@@ -1987,36 +1941,15 @@ def iter_json_chunks(
         framed_prompt = dataset_cfg.compose_prompt(
             payload, raw_prompt=prompt_value, context_values=context_values
         )
-        preface_contexts, trailing_contexts = dataset_cfg.partition_context_values(context_values)
         if not response:
             continue
         prompt_layer = build_dependency_layer(framed_prompt or prompt_value or "")
         response_layer = build_dependency_layer(response)
-        segment_lines: list[str] = []
+        segment_lines = framed_prompt.splitlines() if framed_prompt else []
         prompt_tags = dataset_cfg.prompt_tag_labels()
-        canonical_tag_prefix = lambda field: f"{field.canonical_tag}:" if field.canonical_tag else None
-        for field, ctx_value in preface_contexts:
-            if field.label:
-                segment_lines.append(f"{field.label}: {ctx_value}")
-            normalized = field.normalized_token(ctx_value)
-            prefix = canonical_tag_prefix(field)
-            if prefix:
-                segment_lines.append(f"{prefix}{field.token}:{normalized}")
-        if prompt_value:
-            segment_lines.append(f"{dataset_cfg.prompt.label}: {prompt_value.strip()}")
-        for field, ctx_value in trailing_contexts:
-            if field.label:
-                segment_lines.append(f"{field.label}: {ctx_value}")
-            normalized = field.normalized_token(ctx_value)
-            prefix = canonical_tag_prefix(field)
-            if prefix:
-                segment_lines.append(f"{prefix}{field.token}:{normalized}")
         response_line = f"{dataset_cfg.response.label}: {response.strip()}"
         response_line = append_end_marker(response_line)
         segment_lines.append(response_line)
-        annotation = _dependency_layer_annotation(prompt_layer, response_layer)
-        if annotation:
-            segment_lines.append(f"DependencyLayer: {annotation}")
         segment = "\n".join(segment_lines)
         evaluation_prompt = ensure_response_prompt_tag(
             framed_prompt or prompt_value or "",
@@ -2032,10 +1965,17 @@ def iter_json_chunks(
             prompt_tags=prompt_tags,
         )
 
-        log_prompt = evaluation_prompt
+        log_prompt = framed_prompt or prompt_value or ""
         if len(log_prompt) > 160:
             log_prompt = f"{log_prompt[:157]}..."
-        log(f"[train] Staged line #{line_no} (Prompt: {log_prompt})")
+        log_reference = response
+        if len(log_reference) > 160:
+            log_reference = f"{log_reference[:157]}..."
+        log_verbose(
+            3,
+            f"[train:v3] Staged line #{line_no} "
+            f"(evaluation_input='{log_prompt}', reference='{log_reference}').",
+        )
 
         entries.append((segment, record))
         consumed += 1
@@ -2281,14 +2221,16 @@ class InferenceMonitor:
     def maybe_run(self, total_tokens: int) -> None:
         if not self.enabled() or total_tokens < self.next_threshold:
             return
-        while total_tokens >= self.next_threshold:
-            log_verbose(
-                3,
-                f"[eval:v3] Triggering evaluation cycle at threshold={self.next_threshold} "
-                f"with dataset_size={len(self.dataset)} (total_tokens={total_tokens}).",
-            )
-            self._run_cycle(self.next_threshold)
-            self.next_threshold += self.interval
+        first_crossed_threshold = self.next_threshold
+        crossed_intervals = ((total_tokens - first_crossed_threshold) // self.interval) + 1
+        self.next_threshold += crossed_intervals * self.interval
+        log_verbose(
+            3,
+            f"[eval:v3] Triggering one bounded evaluation cycle at total_tokens={total_tokens} "
+            f"after crossing {crossed_intervals} interval(s) from threshold={first_crossed_threshold}; "
+            f"next_threshold={self.next_threshold}, dataset_size={len(self.dataset)}.",
+        )
+        self._run_cycle(total_tokens)
 
     def _run_cycle(self, threshold: int) -> None:
         sample_size = min(len(self.dataset), self.samples)
@@ -2493,6 +2435,8 @@ def main() -> None:
         parser.error("--merge-significance-min-count must be >= 1")
     if args.merge_significance_cap is not None and args.merge_significance_cap < 1:
         parser.error("--merge-significance-cap must be >= 1")
+    if args.max_runtime_seconds < 0:
+        parser.error("--max-runtime-seconds must be >= 0")
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -2605,7 +2549,11 @@ def main() -> None:
             "pid": os.getpid(),
             "metrics_file": str(metrics_path),
         }
-        metrics_writer = EvalLogWriter(metrics_path, run_metadata)
+        metrics_writer = EvalLogWriter(
+            metrics_path,
+            run_metadata,
+            append_existing=resume_mode,
+        )
         log(f"[metrics] Exporting evaluation timeline to {metrics_writer.path}")
     quality_gate: QualityGate | None = None
     if getattr(settings, "quality_queue_path", None):
@@ -2870,11 +2818,14 @@ def main() -> None:
             )
 
     profiler = IngestProfiler(args.profile_ingest, metrics_writer)
-    total_tokens = 0
-    total_windows = 0
-    processed_corpora = 0
+    prior_totals = resume_state.get("totals", {}) if resume_mode and resume_state else {}
+    total_tokens = int(prior_totals.get("tokens", 0) or 0)
+    total_windows = int(prior_totals.get("windows", 0) or 0)
+    processed_corpora = int(prior_totals.get("processed_corpora", 0) or 0)
     skipped_corpora = 0
     success = False
+    paused = False
+    ingest_started = time.monotonic()
     try:
         log(f"[train] Starting ingest into {db_path_str} with order={engine.store.order}.")
         for chunk in corpora_iter:
@@ -2986,6 +2937,14 @@ def main() -> None:
                     resume_state["completed_chunks"] = resume_completed_list
                 resume_state["current_chunk"] = None
                 _persist_resume_state(resume_state)
+            runtime_budget = max(0, int(args.max_runtime_seconds or 0))
+            if runtime_budget and time.monotonic() - ingest_started >= runtime_budget:
+                paused = True
+                log(
+                    f"[train] Runtime budget reached after completing {label}; "
+                    "pausing at a recoverable chunk boundary."
+                )
+                break
         if processed_corpora == 0:
             if skipped_corpora > 0:
                 log("[resume] No remaining corpora to ingest; training already up to date.")
@@ -2999,15 +2958,22 @@ def main() -> None:
             )
 
         location = db_path if db_path is not None else db_path_str
-        log(
-            f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
-        )
+        if paused:
+            log(
+                f"[train] Paused ingest: {total_tokens} tokens / {total_windows} n-grams stored in "
+                f"{location}; run train.py with no arguments to resume."
+            )
+        else:
+            log(
+                f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
+            )
         ratio = engine.cheetah_topk_ratio()
         if ratio:
             log(f"[train] cheetah Top-K hit ratio ~ {ratio:.2%}")
-        success = True
+        success = not paused
     finally:
         engine.db.close()
+        final_status = "paused" if paused else ("success" if success else "aborted")
         if metrics_writer:
             metrics_writer.finalize(
                 totals={
@@ -3016,10 +2982,10 @@ def main() -> None:
                     "processed_corpora": processed_corpora,
                     "db_path": db_path_str if db_path is None else str(db_path),
                 },
-                status="success" if success else "aborted",
+                status=final_status,
             )
         if resume_state:
-            resume_state["status"] = "success" if success else "aborted"
+            resume_state["status"] = final_status
             resume_state["current_chunk"] = None
             resume_state["totals"] = {
                 "tokens": total_tokens,

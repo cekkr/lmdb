@@ -160,6 +160,10 @@ _DEFAULT_PROMPT_TAG_TOKENS: Tuple[str, ...] = (
 )
 _PROMPT_TAG_SCAN_WINDOW = 160
 _PROMPT_TAG_PATTERN = re.compile(r"\|[a-z0-9_]+\|:\s*", re.IGNORECASE)
+_DEPENDENCY_ARTIFACT_PATTERN = re.compile(
+    r"(?:dependencylayer\s*:|[\"']?\s*\b(?:token|lemma|head|dep|pos)\b\s*[\"']?\s*:)",
+    re.IGNORECASE,
+)
 _TERMINAL_RESPONSE_TAG_PATTERN = re.compile(
     r"(?:\r?\n)?\|response\|:\s*$",
     re.IGNORECASE,
@@ -360,10 +364,10 @@ class DBSLMEngine:
             return set()
         lowered = normalized.lower()
         variants = {lowered}
-        if lowered.endswith(":"):
-            variants.add(lowered[:-1])
         canonical = self._canonical_prompt_label(normalized)
         if canonical:
+            if lowered.endswith(":"):
+                variants.add(lowered[:-1])
             canonical_lower = canonical.lower()
             variants.add(canonical_lower)
             variants.add(f"{canonical_lower}:")
@@ -378,8 +382,13 @@ class DBSLMEngine:
         normalized = response.strip().lower()
         if not normalized:
             return False
-        scan_window = normalized[:_PROMPT_TAG_SCAN_WINDOW]
+        scan_window = re.sub(r"\s+:", ":", normalized[:_PROMPT_TAG_SCAN_WINDOW])
         return any(alias in scan_window for alias in self._prompt_tag_aliases)
+
+    @staticmethod
+    def _contains_dependency_artifacts(response: str) -> bool:
+        """Detect serialized dependency fields that are internal training metadata."""
+        return bool(response and _DEPENDENCY_ARTIFACT_PATTERN.search(response))
 
     def _init_context_dimensions(
         self, requested: Sequence[ContextDimension] | None
@@ -647,29 +656,38 @@ class DBSLMEngine:
             if decoded_text:
                 attempt_segments.append(decoded_text)
             response_candidate = " ".join(segment.strip() for segment in attempt_segments if segment.strip()).strip()
+            visible_candidate, _ = strip_end_marker(response_candidate)
             final_ids = decoded_ids
-            response = response_candidate
-            if not self._contains_prompt_artifacts(response_candidate):
+            response = visible_candidate
+            if (
+                visible_candidate
+                and not self._contains_prompt_artifacts(visible_candidate)
+                and not self._contains_dependency_artifacts(visible_candidate)
+            ):
                 accepted_response = True
                 break
         if not accepted_response:
-            # Every sampled candidate contained a prompt/frame tag. Do not let
-            # the final rejected attempt escape merely because the retry budget
-            # is exhausted, and do not seed it into the session cache.
+            # Every sampled candidate was empty/marker-only or contained
+            # prompt/frame/dependency metadata. Do not let the final rejected
+            # attempt escape merely because the retry budget is exhausted, and
+            # do not seed it into the session cache.
             final_ids = []
             response = ""
         if final_ids:
             self.cache.update(conversation_id, final_ids)
         else:
             self.cache.update(conversation_id, [])
+        if not response and not accepted_response:
+            # Raw evaluation disables response scaffolding, but it still needs
+            # visible text after exhausted decoder retries. Keep this fallback
+            # scaffold-free so metrics never receive prompt/frame tags.
+            response = self._response_backstop.ensure_min_words(
+                _strip_prompt_scaffolding(user_message),
+                "",
+                max(12, min_response_words),
+            )
         response = self._low_resource_helper.maybe_paraphrase(user_message, response, rng=rng)
         if scaffold_response:
-            if not response and not accepted_response:
-                response = self._response_backstop.ensure_min_words(
-                    _strip_prompt_scaffolding(user_message),
-                    "",
-                    max(12, min_response_words),
-                )
             response = self._response_backstop.ensure_min_words(user_message, response, min_response_words)
             response = self._tag_formatter.wrap(user_message, response, rng=rng)
         response, _ = strip_end_marker(response)

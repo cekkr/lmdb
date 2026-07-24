@@ -74,7 +74,17 @@ class TokenScoringPipeline:
         collect_trace: bool = False,
     ) -> ScoreResult:
         bias_map = self.bias.lookup(conversation_id, context_snippet)
-        cache_dist = self.cache.distribution(conversation_id)
+        cache_dist = {
+            token_id: probability
+            for token_id, probability in self.cache.distribution(conversation_id).items()
+            if token_id not in banned
+        }
+        if prediction_bias:
+            prediction_bias = {
+                token_id: probability
+                for token_id, probability in prediction_bias.items()
+                if token_id not in banned
+            }
         lambda_cache = max(0.0, min(float(lambda_cache), 0.95))
         prediction_weight = max(0.0, min(float(prediction_weight), 1.0))
         penalties: Dict[int, int] = {}
@@ -209,4 +219,3 @@ class TokenScoringPipeline:
     def _log_delta(self, q_bias: int) -> float:
         span = self.quantizer.Lmax - self.quantizer.Lmin
         return (q_bias / 255.0) * span
-

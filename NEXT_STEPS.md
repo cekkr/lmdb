@@ -27,6 +27,17 @@
   2026-07-23: 20 records produced 380,200 tokens and 380,198 n-grams in 206.82 seconds, kept the
   adapter active, and generated a correctly framed response from the persisted Cheetah database.
   Full commands and storage/benchmark details are recorded in `studies/BENCHMARKS.md`.
+- Repaired empty/misleading training evaluations: emotion context and canonical `|CTX|` lines now
+  use one training/evaluation prompt composer, prompt-tag bans survive Level 2 cache and prediction
+  blending, empty and `|END|`-only decodes (including spaced/case legacy variants) retry before a
+  scaffold-free fallback, verbose staging
+  logs distinguish decoder input from the held-out reference, and periodic probes no longer replay
+  every token threshold crossed inside one large chunk. Evaluation/profile events now refresh the
+  metrics JSON atomically while a run is active. MKN rebuilds now select the current relational
+  ingest counts, delta-mirror them into Cheetah, and flush queued writes instead of reusing the
+  first populated (seed-only) count namespace. Dependency layers remain side-channel
+  evaluation/prediction records rather than serialized n-gram text, and legacy dependency-field
+  generations are rejected before they reach evaluation output.
 
 ## Active tasks
 - Repair the `--backonsqlite` startup contract: `build_cheetah_adapter()` currently raises
