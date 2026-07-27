@@ -94,8 +94,8 @@ python3 src/train.py datasets/emotion_data.json \
 
 ```bash
 python3 src/train.py datasets/emotion_data.json \
-  --json-chunk-size 500 \
-  --chunk-eval-percent 1 \
+  --json-chunk-size 200 \
+  --chunk-eval-percent 10 \
   --eval-variants 1 \
   --ngram-order 5 \
   --context-dimensions 3,6,8,10,12
