@@ -3,6 +3,62 @@
 > The smoke harness now appends queue-drain snapshots automatically whenever the quality queue
 > crosses its threshold. Look for sections titled “Queue Drain (auto smoke harness)” for those runs.
 
+## 2026-07-27 - Graph context memory integration validation
+
+- **Scope:** functional validation that the new Cheetah graph context memory works end to end from
+  DB-SLM training and inference. This is an **integration** record, not a quality or throughput
+  benchmark: no A/B comparison of generation quality was run, and the corpus is far too small to
+  support one.
+- **Environment:** macOS (Darwin 25.5.0), Python 3.14 in `.venv`, Cheetah submodule at `8ecdf35`
+  ("Add complete sentence references to graph recall"), server launched headless in a bounded
+  `screen` session on `127.0.0.1:4455`. Isolated Cheetah database `graph_e2e`; scratch SQLite and
+  a 40-record NDJSON subset of `datasets/emotion_data.json` under a session scratch directory. The
+  server binary predates the run; no Go code was changed.
+- **Command (training):**
+
+  ```bash
+  DBSLM_CHEETAH_DATABASE=graph_e2e DBSLM_GRAPH_MEMORY=1 DBSLM_SQLITE_PATH=<scratch>/e2e.sqlite3 \
+  PYTHONPATH=src .venv/bin/python src/train.py <scratch>/emotion_data.json \
+    --db <scratch>/e2e.sqlite3 --reset --ngram-order 4 \
+    --json-chunk-size 20 --max-json-lines 40 --chunk-eval-percent 0.1 --eval-samples 2 \
+    --graph-memory --graph-term-index-rebuild --max-runtime-seconds 600
+  ```
+
+- **Training result:** completed ingest of 15,577 tokens / 15,571 n-grams in ~392 s with a Cheetah
+  Top-K hit ratio of ~54.53%. Graph observation reported, per chunk:
+
+  | Chunk | Records | Nodes | Edges applied/requested | Created | Updated | Failed | References | Graph time |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | chunk1 | 20 | 165 | 1067/1067 | 991 | 76 | 0 | 20 | 11.18 s |
+  | chunk2 | 20 | 94 | 1059/1059 | 846 | 213 | 0 | 20 | 12.96 s |
+
+  Zero failed edges across 2,126 upserts. The rising `updated` share between chunks is the expected
+  signal that the second chunk reused ids minted by the first. `GRAPH_TERM_INDEX action=rebuild`
+  then indexed 542 nodes / 2,264 terms. Graph ingest accounted for roughly 6% of wall-clock time at
+  this size; that ratio is untested at scale.
+- **Command (inference):**
+
+  ```bash
+  DBSLM_CHEETAH_DATABASE=graph_e2e DBSLM_GRAPH_MEMORY=1 DBSLM_SQLITE_PATH=<scratch>/e2e.sqlite3 \
+  PYTHONPATH=src .venv/bin/python src/run.py --db <scratch>/e2e.sqlite3 \
+    --graph-memory --graph-recall-log \
+    --prompt "How does envy shape the way a team works together?" --max-response-words 60
+  ```
+
+- **Inference result:** the turn recalled `seeds=6, associations=8, terms=4, truncated=0` and
+  produced a correctly framed response. No recalled reference sentence appeared in the visible
+  output, confirming the internal-context boundary. The same prompt with `--no-graph-memory` ran
+  without a recall and produced a comparable (equally low-quality) response; at 40 records neither
+  output carries information about generation quality.
+- **Protocol round-trip:** a separate scripted check against the live server exercised
+  `GRAPH_NODE_SET` with reference sentences, `GRAPH_NODE_GET` reference merging across runs,
+  `GRAPH_EDGE_SET_BATCH`, `GRAPH_RECALL` with exact-id / free-text / spaced (base64) seeds and
+  `min_sources=2`, `GRAPH_SIMILAR`, and `GRAPH_TERM_INDEX action=stats`. Reference hydration
+  required `include_seeds=1`, since a seed node is otherwise excluded from its own answer.
+- **Not measured:** quality deltas with graph bias on/off, decoder latency impact, behaviour at
+  250/1,000 records, and any tuning of `DBSLM_GRAPH_BIAS_WEIGHT` or
+  `DBSLM_GRAPH_RECALL_PRECISION`. These are tracked in [`NEXT_STEPS.md`](../NEXT_STEPS.md).
+
 ## 2026-07-24 - Eight-hour emotion-data repair validation
 
 - Scope and window: repaired empty/scaffolded evaluation responses while continuously supervising

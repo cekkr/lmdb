@@ -39,7 +39,28 @@
   evaluation/prediction records rather than serialized n-gram text, and legacy dependency-field
   generations are rejected before they reach evaluation output.
 
+- Aligned training and inference with the new Cheetah graph context memory (`GRAPH_NODE_SET`,
+  `GRAPH_NODE_GET`, `GRAPH_EDGE_SET_BATCH`, `GRAPH_RECALL`, `GRAPH_SIMILAR`, `GRAPH_TERM_INDEX`).
+  Training records staged prompt/response pairs as `ctx:`/`term:` nodes joined by
+  `evokes`/`precedes`/`dep_<label>` edges with the complete response sentence as a bounded node
+  reference; inference seeds `GRAPH_RECALL` from the turn's context values and content words, biases
+  decoding toward recalled terms, and widens the internal bias/embedding context with the hydrated
+  sentences without ever showing them. Opt-in via `DBSLM_GRAPH_MEMORY=1` / `--graph-memory`.
+
 ## Active tasks
+- Measure whether graph context memory actually helps: run the emotion corpus with `--graph-memory`
+  on and off at the same scale and record quality metrics, decoder latency, and per-chunk graph
+  ingest cost in `studies/BENCHMARKS.md`. Tune `DBSLM_GRAPH_BIAS_WEIGHT`,
+  `DBSLM_GRAPH_RECALL_PRECISION`, and `--graph-memory-terms` from that evidence before considering a
+  non-zero default.
+- Decide whether recall should consolidate. Cheetah's `GRAPH_RECALL` never writes back what it
+  found, so a recurring association is re-derived every turn at the same cost. Reinforcing a
+  frequently recalled edge's weight from the read path is the obvious follow-up, and is also an open
+  item upstream in `cheetah-db/NEXT_STEPS.md`.
+- `scripts/start_cheetah_server.sh` cannot enforce its timeout on hosts without `timeout`/`gtimeout`
+  (macOS default): the `perl -e 'alarm ...'` fallback is built as a string, so the quotes are not
+  re-parsed after expansion and the server dies immediately. Build the fallback as an array or
+  invoke `perl` directly.
 - Repair the `--backonsqlite` startup contract: `build_cheetah_adapter()` currently raises
   `SystemExit` before `train.py` can honor the flag when a configured Cheetah service is
   unreachable. Add a focused startup regression, then either make the explicit fallback work or

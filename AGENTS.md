@@ -161,6 +161,30 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   `HotPathAdapter.flush_pending` makes those async writes visible before the MKN pass continues.
   Never prefer an already-populated Cheetah count namespace over newer SQLite ingest rows; that
   freezes training at the first mirrored seed corpus.
+- **Graph context memory is a side channel, never corpus text.**
+  [`GraphContextMemory`](src/db_slm/graph_memory.py) writes `ctx:<field>:<value>` and `term:<lemma>`
+  nodes plus `evokes`/`precedes`/`dep_<label>` edges from staged
+  `EvaluationRecord`s, and hydrates them back through `GRAPH_RECALL`. Like the dependency layers it
+  reads, nothing it produces may enter `CorpusChunk.train_text`, and the recalled reference sentences
+  are internal bias/embedding context only — `DBSLMEngine.respond` extends `bias_context` with them
+  and MUST NOT prepend them to the response. Recalled terms reach the decoder as a transient
+  `extra_bias` map that [`TokenScoringPipeline.score`](src/db_slm/scoring.py) filters against the ban
+  set, and [`DBSLMEngine._graph_token_bias`](src/db_slm/pipeline.py) resolves them with
+  `Vocabulary.lookup` so recall can never mint vocabulary at inference time.
+- **Graph ids are slugged and encoded in the adapter, not the caller.**
+  Cheetah splits `GRAPH_*` arguments on whitespace, so
+  [`slugify`](src/db_slm/graph_memory.py) produces single-token ids and the `_graph_*` helpers in
+  [`adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) base64-encode props, references, batch
+  items, and any seed list containing spaces. `_graph_token` rejects a value that is not a single
+  token rather than emitting a silently truncated id. Recall bounds (`hops`, `branch_limit`,
+  `budget`, `reference_limit`) are clamped to the server maxima mirrored in
+  [`cheetah_types.py`](src/db_slm/cheetah_types.py).
+- **Node references are replaced, not merged, by `GRAPH_NODE_SET`.**
+  `GraphContextMemory._write_node` reads the stored list back with `GRAPH_NODE_GET` on the first
+  touch of a node in a process, then merges locally under the 64-reference server cap, so a second
+  training run extends provenance instead of erasing it. Recall requests `include_seeds=1` whenever
+  references are hydrated — a seed node is otherwise excluded from its own answer — and
+  `signal_from_result` drops seed terms from the bias while keeping their sentences.
 - **Cheetah visibility and reducer extension are server-owned.**
   `PAIR_SET_HIDDEN` stores terminals excluded from default `PAIR_SCAN`/`PAIR_REDUCE`/`PAIR_SUMMARY`;
   callers must request `include_hidden=1` to inspect cached joins. New reducer modes belong in the
@@ -199,14 +223,15 @@ Training:
 `src/train.py` → settings/CLI validation → dataset config + parallel corpus/dependency staging →
 `DBSLMEngine.train_from_text` → tokenizer/vocabulary → `NGramStore.ingest` →
 `MKNSmoother.rebuild_all` → SQLite relational tables + Cheetah namespaces → periodic evaluation,
-quality queue, adversarial prediction updates, metrics, and resume state.
+quality queue, adversarial prediction updates, optional graph context memory writes, metrics, and
+resume state.
 
 Inference:
 
 `src/run.py` parent REPL → spawned `PromptWorker` → `issue_prompt` → `DBSLMEngine.respond` →
-Level 3 concept signal → Level 2 history/cache/bias → `Decoder.decode` →
-`TokenScoringPipeline.score` → Cheetah Top-K/prediction data with n-gram fallback → prompt-tag guard,
-response backstop, formatter, and Level 2 message log.
+Level 3 concept signal → optional `GraphContextMemory.recall` → Level 2 history/cache/bias →
+`Decoder.decode` → `TokenScoringPipeline.score` → Cheetah Top-K/prediction data with n-gram fallback →
+prompt-tag guard, response backstop, formatter, and Level 2 message log.
 
 External process boundary:
 
@@ -276,10 +301,12 @@ parsing, and resource metrics.
 ### [`.env.example`](.env.example)
 
 Tracked configuration template for backend selection, SQLite scratch path, Cheetah connection and
-idle grace, reducer polling, dataset, embedder, sentence splitting, and SQLite flush thresholds.
+idle grace, reducer polling, dataset, embedder, sentence splitting, graph context memory, and SQLite
+flush thresholds.
 
 - **Loaded by:** [`load_settings`](src/db_slm/settings.py) reads `.env`, then lets real environment
-  variables override it.
+  variables override it. It also carries the graph context memory defaults (`DBSLM_GRAPH_MEMORY`,
+  `DBSLM_GRAPH_RECALL_*`, `DBSLM_GRAPH_BIAS_WEIGHT`).
 - **Common mistake:** copy to the ignored `.env`; never add real host credentials or local paths to
   this template.
 
@@ -342,8 +369,9 @@ ingest/evaluation scheduling, prediction-table training, adversarial updates, me
 - **Key functions and subparts:** `build_parser` defines the public CLI; `reset_cheetah_store`
   coordinates destructive reset; `collect_prompt_tag_tokens`, `iter_json_chunks`, and
   `parallel_corpus_stream` stage data; `AdversarialTrainer`, `DecoderPenaltyTuner`,
-  `InferenceMonitor`, and `IngestProfiler` own post-ingest feedback and observability; `main` fixes
-  ordering across all phases.
+  `InferenceMonitor`, and `IngestProfiler` own post-ingest feedback and observability;
+  `_configure_graph_memory`, `_observe_graph_memory`, and `_rebuild_graph_term_index` own the
+  optional graph context memory pass; `main` fixes ordering across all phases.
 - **Depends on:** nearly every [`src/db_slm/`](src/db_slm/) subsystem plus dataset configs and
   [`src/helpers/resource_monitor.py`](src/helpers/resource_monitor.py).
 - **Tests:** indirect adapter coverage in
@@ -365,6 +393,9 @@ decoder process and proxies prompt, history, status, and shutdown messages.
 
 - **Key functions and subparts:** `build_parser`; `build_prompt_formatter`; `PromptWorker`;
   `_decoder_worker`; `respond_once_worker`; `interactive_loop`; `build_response_formatter`.
+- **Graph options:** `--graph-memory`/`--no-graph-memory`, `--graph-bias-weight`, and
+  `--graph-recall-log` travel through `PromptWorker` into the spawned decoder process; every new
+  worker option must be added to both the constructor and the `_decoder_worker` positional list.
 - **Depends on:** [`issue_prompt`](src/db_slm/inference_shared.py), Cheetah inspection helpers,
   prompt-tag normalization, and persisted SQLite conversation state.
 - **Tests:** no focused CLI/worker lifecycle test.
@@ -464,6 +495,25 @@ signals, payload providers, and verbalization.
 - **Common mistakes:** rendered `ContextSummary` is internal bias/context input, not user-visible
   response scaffolding.
 
+### [`src/db_slm/graph_memory.py`](src/db_slm/graph_memory.py)
+
+Owns the DB-SLM conventions layered on Cheetah's graph store: id minting, corpus-to-graph
+observation, recall seed composition, and the projection of a recall answer onto decoder inputs.
+
+- **Key symbols:** `slugify`; `context_node_id`; `term_node_id`; `term_text_from_node_id`;
+  `strip_structural_tags`; `content_terms`; `dependency_terms`; `GraphIngestStats`;
+  `GraphContextSignal`; `GraphContextMemory.observe_records`/`build_seeds`/`recall`/
+  `signal_from_result`.
+- **Conventions:** `ctx:<field>:<value>` and `term:<lemma>` ids; `dbslm_context`/`dbslm_term` labels;
+  `evokes`/`precedes`/`dep_<label>` edge types; the response sentence as a bounded node reference.
+- **Depends on:** the `graph_*` surface of [`HotPathAdapter`](src/db_slm/adapters/base.py) only. It
+  deliberately does not import [`evaluation.py`](src/db_slm/evaluation.py); records are duck-typed to
+  keep the dependency one-way.
+- **Tests:** [`tests/test_graph_memory.py`](tests/test_graph_memory.py).
+- **Common mistakes:** graph output is never corpus or response text; ids must stay single protocol
+  tokens; per-record term/arc caps and the recall limit/branch/budget bounds exist to keep both the
+  command stream and the payload finite.
+
 ### [`src/db_slm/pipeline.py`](src/db_slm/pipeline.py)
 
 High-level façade wiring settings, SQLite, Cheetah, all three levels, embeddings, training,
@@ -472,7 +522,8 @@ corrections, and guarded response generation.
 - **Key classes:** `DBSLMEngine`; `TokenMergeTracker`; `LowResourceHelper`; `SimpleParaphraser`;
   `ResponseBackstop`; `TaggedResponseFormatter`.
 - **Key paths:** `train_from_text`; `register_prompt_tags`; `respond`; `context_relativism`;
-  `record_correction`.
+  `record_correction`; `observe_graph_records`; `consume_graph_signal`; `_run_graph_layer`;
+  `_graph_token_bias`.
 - **Tests:** response framing in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) and
   marker-only/dependency-artifact raw-response fallback in
   [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py); paraphraser behavior in
@@ -500,8 +551,9 @@ Owns the composable candidate scoring order and optional per-step trace objects.
 
 - **Key symbols:** `TokenScoringPipeline.score`; `CandidateScore`; `ScoreResult`; `ScoreSnapshot`;
   `ScoreObserver`.
-- **Order:** dequantized base log probability → temperature → Level 2 bias → repeat/dimension
-  penalties → cache mixture → normalization → optional prediction blend → trace.
+- **Order:** dequantized base log probability → temperature → Level 2 bias (plus the transient
+  `extra_bias` graph recall map) → repeat/dimension penalties → cache mixture → normalization →
+  optional prediction blend → trace.
 - **Tests:** [`tests/test_scoring.py`](tests/test_scoring.py) covers prompt-tag bans across cache and
   prediction mixing; numeric scoring order remains uncovered.
 - **Common mistake:** moving normalization or mixing steps changes semantics even when the same
@@ -579,7 +631,8 @@ Defines `issue_prompt`, the shared bridge used by training probes and the REPL t
 conversation and call `DBSLMEngine.respond`.
 
 - **Important options:** seeded vs seedless conversations, minimum response words, decoder config,
-  RNG seed, response scaffolding, and score observer.
+  RNG seed, response scaffolding, score observer, and dataset context tokens used as graph recall
+  seeds.
 - **Common mistake:** evaluation uses `seed_history=False`; interactive low-resource sessions may
   seed caretaker turns.
 
@@ -632,7 +685,10 @@ Defines immutable Python projections for Cheetah reducers, namespace summaries, 
 prediction queries, and adaptive reducer page sizing.
 
 - **Key symbols:** `Raw*Projection`; `PredictionQueryResult`; `NamespaceSummary`;
-  `CheetahSystemStats.derive_reduce_page_limit`.
+  `CheetahSystemStats.derive_reduce_page_limit`; the `Graph*` projections
+  (`GraphRecallResult`, `GraphAssociation`, `GraphReferenceSentence`, `GraphSimilarResult`,
+  `GraphNodeRecord`, `GraphEdgeBatchResult`, `GraphTermIndexStats`) and the `GRAPH_*` bound
+  constants mirrored from the server.
 - **Common mistake:** parser/serializer changes must update these projections together.
 
 ### [`src/db_slm/cheetah_vectors.py`](src/db_slm/cheetah_vectors.py)
@@ -651,7 +707,9 @@ Cheetah trie prefixes.
 Defines the complete `HotPathAdapter` protocol and `NullHotPathAdapter` SQLite-only implementation.
 
 - **Surface:** publish/fetch Level 1 state, metadata, scans/reducers, context relativism, summaries,
-  system stats, pending-write flush, and prediction set/train/query/inherit operations.
+  system stats, pending-write flush, prediction set/train/query/inherit operations, and the graph
+  context memory calls `graph_node_set`/`graph_node_get`/`graph_edge_set_batch`/`graph_recall`/
+  `graph_similar`/`graph_term_index`.
 - **Called by:** Level 1, Level 2 metadata, context windows, decoder, trainer, and CLI diagnostics.
 - **Common mistake:** add a new capability to the protocol, null adapter, concrete adapter, and
   callers in one change.
@@ -672,8 +730,10 @@ prediction commands.
 
 - **Key classes:** `CheetahClient`; `CheetahSerializer`; `_ThreadLocalCheetahClientPool`;
   `CheetahHotPathAdapter`; `CheetahError`; `CheetahFatalError`.
-- **Key paths:** `pair_scan`; `pair_reduce`; `decode_reduced_payload`; `predict_*`;
+- **Key paths:** `pair_scan`; `pair_reduce`; `decode_reduced_payload`; `predict_*`; `graph_*`;
   `_register_pair`; `_edit_or_reinsert`; `build_cheetah_adapter`.
+- **Graph encoding helpers:** `_graph_token`; `_graph_encode_json`; `_graph_encode_seeds`;
+  `_graph_format_precision`; `_graph_association_from_payload`; `_parse_graph_recall_response`.
 - **Tests:** [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) covers serialization,
   idempotent publish/fetch, response parsing, timeout recovery, canonical job flow, legacy fallback,
   and storage transport decoding.
@@ -825,7 +885,22 @@ Focused prompt-composition regressions using the executable GPTeacher and emotio
 Focused scoring-pipeline regressions with lightweight cache/prediction fixtures.
 
 - **Contracts:** a banned structural token cannot re-enter the distribution or score trace through
-  Level 2 cache mixture or prediction blending.
+  Level 2 cache mixture, prediction blending, or the transient graph `extra_bias` map; a graph bias
+  raises an allowed candidate's log probability.
+
+### [`tests/test_graph_memory.py`](tests/test_graph_memory.py)
+
+Focused graph context memory regressions using a scripted client transport and a recording adapter;
+no live Cheetah server is required.
+
+- **Test groups:** `GraphIdentityTests` (id slugging and structural-tag stripping);
+  `CheetahGraphProtocolTests` (argument encoding, clamped bounds, payload parsing, error and
+  disabled-adapter handling); `GraphContextMemoryIngestTests` (node/edge shape, reference merging,
+  per-record caps); `GraphContextMemoryRecallTests` (seed composition, `include_seeds`, term/sentence
+  projection).
+- **Contracts:** ids stay single protocol tokens; props/references/items/spaced seeds travel
+  base64-encoded; requested bounds never exceed the server maxima; stored references are merged
+  rather than overwritten; seed nodes contribute sentences but never bias.
 
 ### [`tests/test_evaluation.py`](tests/test_evaluation.py)
 
@@ -979,6 +1054,29 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 - **Tests and gaps:** Python adapter regressions plus extensive submodule tests; Python live-service
   integration is manual/smoke-only.
 
+### Graph context memory — Shipped, opt-in and unmeasured
+
+- **Behavior:** with `DBSLM_GRAPH_MEMORY=1` (or `--graph-memory`), training records each staged
+  prompt/response pair as `ctx:<field>:<value>` and `term:<lemma>` nodes joined by
+  `evokes`/`precedes`/`dep_<label>` edges, attaching the complete response sentence as a bounded node
+  reference. Inference seeds `GRAPH_RECALL` with the turn's context values and content words, biases
+  decoding toward the recalled terms, and widens the internal bias/embedding context with the
+  hydrated sentences. `--graph-term-index-rebuild` pages `GRAPH_TERM_INDEX action=rebuild` after
+  ingest so free-text seeds resolve.
+- **Flow and owners:** [`src/train.py`](src/train.py) (`_configure_graph_memory`,
+  `_observe_graph_memory`, `_rebuild_graph_term_index`) →
+  [`graph_memory.py`](src/db_slm/graph_memory.py) → the `graph_*` surface of
+  [`adapters/cheetah.py`](src/db_slm/adapters/cheetah.py); read path
+  [`pipeline.py`](src/db_slm/pipeline.py) → [`decoder.py`](src/db_slm/decoder.py) →
+  [`scoring.py`](src/db_slm/scoring.py).
+- **Constraints:** requires the Cheetah backend; off by default. Per-record term/arc caps, a
+  per-run node budget, and clamped recall `hops`/`branch_limit`/`budget`/`reference_limit` bound both
+  the command stream and the payload. Graph output never enters the corpus or a visible response.
+- **Tests and gaps:** protocol encoding, ingest shape, reference merging, and recall projection are
+  covered in [`tests/test_graph_memory.py`](tests/test_graph_memory.py). No measurement of whether
+  graph bias improves generation quality exists yet; that is an open item in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md).
+
 ### Adaptive tokenization and context signals — Shipped mechanism, experimental tuning
 
 - **Behavior:** regex or Hugging Face tokenization, optional repeated-span merge tokens, grouped
@@ -1103,6 +1201,46 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
   plus [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py).
 - **Status:** fixed regression risk.
 
+### Pitfall: building a `GRAPH_*` command by concatenating corpus text
+
+- **Symptom / wrong assumption:** a node silently loses part of its id, or `GRAPH_NODE_SET` answers
+  `ERROR,invalid_props`, even though the value looked fine in Python.
+- **Cause and invariant:** Cheetah splits `GRAPH_*` arguments on whitespace, so a space truncates an
+  id and breaks a JSON argument. Slugging and base64 encoding belong in the adapter.
+- **Risk area:** the `_graph_*` helpers and `graph_*` methods in
+  [`adapters/cheetah.py`](src/db_slm/adapters/cheetah.py), and `slugify`/`context_node_id`/
+  `term_node_id` in [`graph_memory.py`](src/db_slm/graph_memory.py).
+- **Safe pattern / regression check:** mint ids through `slugify`, let `_graph_token` reject a
+  non-token value instead of truncating it, and run
+  [`tests/test_graph_memory.py`](tests/test_graph_memory.py).
+- **Status:** deliberate protocol boundary.
+
+### Pitfall: erasing node references with a partial upsert
+
+- **Symptom / wrong assumption:** a second training run leaves each node holding only the sentences
+  from that run.
+- **Cause and invariant:** `GRAPH_NODE_SET references=` **replaces** the stored list; omitting the
+  argument preserves it, and `-` clears it. There is no server-side merge.
+- **Risk area:** `GraphContextMemory._write_node` in [`graph_memory.py`](src/db_slm/graph_memory.py).
+- **Safe pattern / regression check:** read the stored list back with `GRAPH_NODE_GET` on the first
+  touch of a node in a process, merge under the 64-reference cap, and write the complete list; run
+  `test_stored_references_are_merged_instead_of_overwritten`.
+- **Status:** fixed regression risk.
+
+### Pitfall: expecting a seed's own sentences back from recall
+
+- **Symptom / wrong assumption:** `references=1` hydrates nothing even though the seeded context node
+  demonstrably holds reference sentences.
+- **Cause and invariant:** `GRAPH_RECALL` excludes seed nodes from the answer unless
+  `include_seeds=1`, so the node the turn is *about* never returns its own provenance.
+- **Risk area:** `GraphContextMemory.recall`/`signal_from_result` in
+  [`graph_memory.py`](src/db_slm/graph_memory.py).
+- **Safe pattern / regression check:** request `include_seeds=1` whenever references are hydrated and
+  drop seed terms from the bias (they are the prompt, already in the Level 2 cache); run
+  `test_recall_asks_for_seed_nodes_so_their_sentences_hydrate` and
+  `test_seed_terms_contribute_sentences_but_never_bias`.
+- **Status:** fixed regression risk.
+
 ### Pitfall: decoding reducer rows without removing storage transport
 
 - **Symptom / wrong assumption:** count/probability/continuation payloads appear malformed even
@@ -1159,6 +1297,7 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 | Token candidate scoring and trace API | [`src/db_slm/scoring.py`](src/db_slm/scoring.py) |
 | Hot-path Python protocol | [`HotPathAdapter`](src/db_slm/adapters/base.py) |
 | Cheetah TCP client, codecs, namespaces | [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) |
+| Graph context memory conventions (ids, edges, seeds, recall projection) | [`src/db_slm/graph_memory.py`](src/db_slm/graph_memory.py) |
 | Cheetah server command registry and on-disk formats | [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
 | Smoke matrix | [`Makefile`](Makefile) and [`scripts/smoke_train.py`](scripts/smoke_train.py) |
 | Quality queue drain | [`scripts/drain_queue.py`](scripts/drain_queue.py) |
@@ -1265,7 +1404,9 @@ checklist; distribution is currently source plus the separately built Cheetah bi
 | Canonical `JOB` reducer flow and legacy alias fallback | `test_pair_reduce_uses_canonical_job_status_then_fetch` / `test_pair_reduce_falls_back_to_legacy_alias_without_job_api` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
 | Response frame de-nesting and scaffold stripping | `TaggedResponseFormatterTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
 | Training/evaluation prompt context parity | [`tests/test_dataset_config.py`](tests/test_dataset_config.py) |
-| Prompt-tag bans across cache/prediction mixing | [`tests/test_scoring.py`](tests/test_scoring.py) |
+| Prompt-tag bans across cache/prediction/graph-bias mixing | [`tests/test_scoring.py`](tests/test_scoring.py) |
+| Graph id slugging, protocol encoding, and clamped recall bounds | [`tests/test_graph_memory.py`](tests/test_graph_memory.py) |
+| Graph ingest shape, reference merging, and recall projection | [`tests/test_graph_memory.py`](tests/test_graph_memory.py) |
 | Evaluation writer avoids duplicate raw console samples | [`tests/test_evaluation.py`](tests/test_evaluation.py) |
 | Evaluation events persist atomically while the run is active | [`tests/test_evaluation.py`](tests/test_evaluation.py) |
 | Large-chunk periodic evaluation stays bounded | [`tests/test_train_monitor.py`](tests/test_train_monitor.py) |
@@ -1304,8 +1445,9 @@ long smoke train.
   before execution; use isolated smoke namespaces.
 - **Compatibility:** SQLite schema bootstrapping is additive/idempotent but has no formal migration
   or rollback framework. Token hashes, quantization, prompt tags, merge token strings, metadata
-  keys, Cheetah namespaces, payload codecs, and Absolute Vector Order are persisted compatibility
-  surfaces.
+  keys, Cheetah namespaces, payload codecs, Absolute Vector Order, and graph node/edge id
+  conventions are persisted compatibility surfaces. Changing `slugify` or the `ctx:`/`term:` id shape
+  orphans every node written by an earlier run.
 - **Backups:** no backup/restore workflow is automated. Preserve required SQLite files and Cheetah
   database directories before destructive format/schema work; do not treat the hot cache as a
   backup.
@@ -1326,6 +1468,9 @@ long smoke train.
 - Cheetah thread-local adapter with namespace pagination, canonical job reducers, legacy aliases,
   fixed payloads, metadata mirrors, diagnostics, and verified concurrency repair in the pinned
   submodule.
+- Opt-in graph context memory: corpus-to-graph observation during training, associative
+  `GRAPH_RECALL` before decoding, bounded reference-sentence hydration, and a lexical seed index
+  rebuild.
 - Screen-first bounded Cheetah service/smoke helpers, smoke scenario telemetry, and automated queue
   drains.
 
@@ -1333,8 +1478,9 @@ long smoke train.
 
 - The repository as a whole remains experimental and explicitly lacks systematic human algorithm
   optimization.
-- Generation quality, context-depth choices, merge significance, penalty tuning, and deep prediction
-  layers are research mechanisms rather than stable production defaults.
+- Generation quality, context-depth choices, merge significance, penalty tuning, deep prediction
+  layers, and graph context memory are research mechanisms rather than stable production defaults.
+  Graph memory has protocol and shape coverage but no measured effect on generation quality.
 - Optional transformer-backed embeddings and CoLA scoring may download large models and degrade to
   unavailable/hashed behavior depending on host load and packages.
 - Cheetah's simulated GPU prediction path, in-memory jobs, and other server-specific limitations are
@@ -1358,10 +1504,13 @@ long smoke train.
 
 1. Run the evaluation-enabled 250/1,000-record Cheetah-only emotion scale-up and record decoder
    latency, Top-K hit ratio, and quality without SQLite fallback.
-2. Validate deepened prediction layers against GPTeacher probes and measure punctuation repetition.
-3. Use scoring traces to isolate punctuation collapse and decide whether the decoder needs a
+2. Measure graph context memory: compare quality metrics and decoder latency with
+   `--graph-memory` on and off at the same scale, and record the ingest cost per chunk in
+   [`studies/BENCHMARKS.md`](studies/BENCHMARKS.md) before recommending a default.
+3. Validate deepened prediction layers against GPTeacher probes and measure punctuation repetition.
+4. Use scoring traces to isolate punctuation collapse and decide whether the decoder needs a
    punctuation stage or a supported `run.py` trace flag.
-4. Repair and test the explicit SQLite fallback contract, or remove the ineffective flag and stale
+5. Repair and test the explicit SQLite fallback contract, or remove the ineffective flag and stale
    documentation.
 
 The authoritative, editable priority list is [`NEXT_STEPS.md`](NEXT_STEPS.md).

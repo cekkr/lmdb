@@ -171,6 +171,33 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         default=0.25,
         help="Blending weight applied to cheetah prediction outputs during decoding (default: %(default)s).",
     )
+    parser.add_argument(
+        "--graph-memory",
+        dest="graph_memory",
+        action="store_true",
+        default=None,
+        help="Recall cheetah graph context memory before decoding (default: DBSLM_GRAPH_MEMORY).",
+    )
+    parser.add_argument(
+        "--no-graph-memory",
+        dest="graph_memory",
+        action="store_false",
+        help="Disable graph context recall for this session.",
+    )
+    parser.add_argument(
+        "--graph-bias-weight",
+        type=float,
+        default=None,
+        help=(
+            "How strongly recalled graph terms bias decoding, 0-1 "
+            "(default: DBSLM_GRAPH_BIAS_WEIGHT). 0 keeps the recalled context text without biasing."
+        ),
+    )
+    parser.add_argument(
+        "--graph-recall-log",
+        action="store_true",
+        help="Log the seeds, association count and truncation flag of each graph recall.",
+    )
     return parser
 
 
@@ -260,6 +287,9 @@ class PromptWorker:
         cheetah_token_table: str,
         cheetah_token_key: str,
         cheetah_token_weight: float,
+        graph_memory: bool | None,
+        graph_bias_weight: float | None,
+        graph_recall_log: bool,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
         self._requests = self._ctx.Queue()
@@ -289,6 +319,9 @@ class PromptWorker:
                 cheetah_token_table,
                 cheetah_token_key,
                 cheetah_token_weight,
+                graph_memory,
+                graph_bias_weight,
+                graph_recall_log,
             ),
         )
         self._process.start()
@@ -396,6 +429,9 @@ def _decoder_worker(
     cheetah_token_table: str,
     cheetah_token_key: str,
     cheetah_token_weight: float,
+    graph_memory: bool | None,
+    graph_bias_weight: float | None,
+    graph_recall_log: bool,
 ) -> None:
     engine: DBSLMEngine | None = None
     try:
@@ -407,6 +443,8 @@ def _decoder_worker(
             prediction_table=cheetah_token_table,
             prediction_key=cheetah_token_key,
             prediction_weight=cheetah_token_weight,
+            graph_memory=graph_memory,
+            graph_bias_weight=graph_bias_weight,
         )
         conv_id = conversation
         if conv_id:
@@ -474,6 +512,11 @@ def _decoder_worker(
                 msg_id = msg.get("id")
                 try:
                     conv_id, response = issue_prompt(engine, prompt, conv_id)
+                    graph_lines: list[str] = []
+                    if graph_recall_log:
+                        signal = engine.consume_graph_signal()
+                        if signal:
+                            graph_lines.append(f"[run] graph recall: {signal.describe()}")
                     prediction_lines: list[str] = []
                     if prediction_probe and prediction_source:
                         probe_text = _prediction_text_for_turn(
@@ -499,6 +542,8 @@ def _decoder_worker(
                         "conversation_id": conv_id,
                         "response": response,
                     }
+                    if graph_lines:
+                        prediction_lines = graph_lines + prediction_lines
                     if prediction_lines:
                         payload["prediction_lines"] = prediction_lines
                     response_q.put(payload)
@@ -667,6 +712,9 @@ def main() -> None:
             cheetah_token_table=args.cheetah_token_table,
             cheetah_token_key=args.cheetah_token_key,
             cheetah_token_weight=args.cheetah_token_weight,
+            graph_memory=args.graph_memory,
+            graph_bias_weight=args.graph_bias_weight,
+            graph_recall_log=args.graph_recall_log,
         )
         dims_label = worker.context_label or format_context_dimensions(context_dimensions)
         window_label = worker.window_label or "n/a"

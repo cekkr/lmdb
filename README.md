@@ -26,6 +26,10 @@ DB-SLM has three cooperating levels:
    contextual token biases.
 3. **Level 3 — concepts:** concept probabilities and templates that can guide the Level 1 decoder.
 
+An optional fourth signal, **graph context memory**, records the corpus as entities and relations in
+Cheetah's graph store and recalls them before decoding. It is off by default; see
+[Graph context memory](#graph-context-memory).
+
 Core generation always comes from the stored statistical model. Sentence Transformers, spaCy,
 Stanza, LanguageTool, and the optional CoLA classifier provide context or evaluation signals; they
 do not replace the database-native decoder.
@@ -298,12 +302,77 @@ The sibling `datasets/GPTeacher.config.json` is discovered automatically.
 | `--context-dimensions PRESET` | Select `default`, `deep`, `shallow`, explicit ranges, or `off`. |
 | `--sentence-splitting` | Opt into punctuation-based sentence segmentation; it is off by default. |
 | `--prep-workers N` | Control parallel dependency parsing and corpus staging. |
+| `--graph-memory` / `--no-graph-memory` | Record (or skip) graph context memory for this run. |
+| `--graph-term-index-rebuild` | Rebuild Cheetah's lexical seed index after ingest. |
 
 Run the live parser for the complete option reference:
 
 ```bash
 PYTHONPATH=src python3 src/train.py --help
 ```
+
+## Graph context memory
+
+Cheetah stores a property graph alongside the key/value tables, with associative recall
+(`GRAPH_RECALL`) that spreads activation from several seeds at once. DB-SLM can use it as an extra
+context signal. It requires the Cheetah backend and is **off by default** because it adds graph
+writes during training.
+
+Enable it in `.env` with `DBSLM_GRAPH_MEMORY=1`, or per run with `--graph-memory`.
+
+**During training**, each staged prompt/response pair is recorded as:
+
+- a node per dataset context value (`ctx:emotion:joy`), labelled `dbslm_context`;
+- a node per content term (`term:kindness`), labelled `dbslm_term`, preferring dependency lemmas
+  over surface words;
+- `evokes` edges from context to response terms, `precedes` edges from prompt to response terms, and
+  `dep_<label>` edges from the response dependency arcs;
+- the complete response sentence stored as a bounded node *reference* — readable provenance that
+  also feeds Cheetah's lexical seed index.
+
+Nothing written here enters the n-gram corpus. Like the dependency layers it reads, graph memory is
+a side channel.
+
+**During inference**, the turn's dataset context values and content words become recall seeds. The
+returned associations bias decoding toward recalled terms, and the hydrated reference sentences widen
+the internal bias/embedding context. As with the Level 3 concept summary, that recalled text is
+never shown in the response.
+
+```bash
+# train with graph memory and make free-text recall seeds resolvable
+DBSLM_GRAPH_MEMORY=1 PYTHONPATH=src python3 src/train.py datasets/emotion_data.json \
+  --graph-memory \
+  --graph-term-index-rebuild \
+  --max-json-lines 200 \
+  --max-runtime-seconds 900
+```
+
+```bash
+# recall it at inference and log what each turn recalled
+PYTHONPATH=src python3 src/run.py \
+  --graph-memory \
+  --graph-recall-log \
+  --prompt "Why does gratitude change how a difficult week feels?"
+```
+
+Configuration:
+
+| Setting | CLI | Purpose |
+| --- | --- | --- |
+| `DBSLM_GRAPH_MEMORY` | `--graph-memory` / `--no-graph-memory` | Enable graph writes and recall. |
+| `DBSLM_GRAPH_RECALL_HOPS` | — | Conceptual depth of a recall walk (1–6). |
+| `DBSLM_GRAPH_RECALL_PRECISION` | — | Belief threshold an association must pass (0–1). |
+| `DBSLM_GRAPH_RECALL_LIMIT` | — | Maximum associations returned per turn. |
+| `DBSLM_GRAPH_RECALL_REFERENCES` | — | Maximum reference sentences hydrated per turn; `0` disables hydration. |
+| `DBSLM_GRAPH_BIAS_WEIGHT` | `--graph-bias-weight` | How strongly recalled terms bias decoding; `0` keeps the context text only. |
+| — | `--graph-memory-terms N` | Terms minted as nodes per record side. |
+| — | `--graph-memory-dependency-arcs N` | Dependency arcs recorded as typed edges per record. |
+| — | `--graph-memory-max-records N` | Records per chunk observed into the graph; `0` for all. |
+| — | `--graph-recall-log` | Log seeds, association count, and truncation per turn. |
+
+A database trained before this feature — or with `CHEETAH_GRAPH_TERM_INDEX=0` — needs
+`--graph-term-index-rebuild` before free-text seeds resolve. Exact ids and declared synonym edges
+work regardless.
 
 ## Run inference
 
@@ -373,6 +442,9 @@ Useful inference options:
 | `--cheetah-system-stats` | Print Cheetah resource and cache statistics before prompting. |
 | `--cheetah-summary PREFIX` | Summarize a Cheetah namespace; repeat for more than one. |
 | `--cheetah-predict-log` | Log a prediction query after each response. |
+| `--graph-memory` / `--no-graph-memory` | Recall (or skip) graph context memory before decoding. |
+| `--graph-bias-weight W` | How strongly recalled graph terms bias decoding (0–1). |
+| `--graph-recall-log` | Log the seeds, association count, and truncation flag of each recall. |
 
 Run the complete inference reference with:
 

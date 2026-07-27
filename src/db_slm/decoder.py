@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Optional
+from typing import Dict, List, Mapping, Sequence, Optional
 import random
 
 from .db import DatabaseEnvironment
@@ -64,6 +64,7 @@ class Decoder:
         commit_cache: bool = True,
         prediction_matrix: Sequence[Sequence[float]] | dict[str, object] | None = None,
         score_observer: ScoreObserver | None = None,
+        extra_bias: Mapping[int, int] | None = None,
     ) -> List[int]:
         config = config or DecoderConfig()
         rng = rng or random
@@ -99,6 +100,7 @@ class Decoder:
                 dimension_tracker,
                 prediction_bias,
                 collect_trace=score_observer is not None,
+                extra_bias=extra_bias,
             )
             adjusted = score_result.distribution
             if not adjusted:
@@ -139,6 +141,7 @@ class Decoder:
         prediction_bias: Optional[Dict[int, float]],
         *,
         collect_trace: bool = False,
+        extra_bias: Mapping[int, int] | None = None,
     ) -> ScoreResult:
         temperature = float(profile.get("temp", 1.0))
         lambda_cache = float(profile.get("lambda_cache", 0.15))
@@ -156,6 +159,7 @@ class Decoder:
             prediction_bias=prediction_bias,
             prediction_weight=self.prediction_weight,
             collect_trace=collect_trace,
+            extra_bias=extra_bias,
         )
 
     def _resolve_candidates(

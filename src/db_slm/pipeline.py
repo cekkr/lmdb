@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .adapters.cheetah import build_cheetah_adapter
 from .context_dimensions import (
@@ -17,6 +17,7 @@ from .context_dimensions import (
 )
 from .context_window_embeddings import ContextWindowEmbeddingManager
 from .db import DatabaseEnvironment
+from .graph_memory import GraphContextMemory, GraphContextSignal, GraphIngestStats
 from .metrics import keyword_summary, lexical_overlap
 from .decoder import Decoder, DecoderConfig
 from .scoring import ScoreObserver
@@ -168,6 +169,9 @@ _TERMINAL_RESPONSE_TAG_PATTERN = re.compile(
     r"(?:\r?\n)?\|response\|:\s*$",
     re.IGNORECASE,
 )
+# Quantized bias delta applied by `record_correction`. It is the reference
+# magnitude for every weaker, ambient bias source; see `_graph_token_bias`.
+_CORRECTION_Q_BIAS = 40
 
 
 def _strip_prompt_scaffolding(text: str) -> str:
@@ -194,6 +198,8 @@ class DBSLMEngine:
         token_merge_significance_threshold: float | None = None,
         token_merge_significance_min_count: int = 2,
         token_merge_significance_cap: int = 128,
+        graph_memory: bool | None = None,
+        graph_bias_weight: float | None = None,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = DatabaseEnvironment(db_path, max_order=ngram_order)
@@ -274,6 +280,30 @@ class DBSLMEngine:
             prediction_weight=prediction_weight,
         )
         self.concepts = ConceptEngine(self.db, self.memory, self.quantizer)
+        graph_enabled = (
+            self.settings.graph_memory_enabled if graph_memory is None else bool(graph_memory)
+        )
+        self.graph_memory = GraphContextMemory(
+            self.hot_path,
+            enabled=graph_enabled,
+            recall_hops=self.settings.graph_recall_hops,
+            recall_precision=self.settings.graph_recall_precision,
+            recall_limit=self.settings.graph_recall_limit,
+            recall_references=self.settings.graph_recall_references > 0,
+            reference_limit=max(1, self.settings.graph_recall_references),
+        )
+        self.graph_bias_weight = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.settings.graph_bias_weight
+                    if graph_bias_weight is None
+                    else graph_bias_weight
+                ),
+            ),
+        )
+        self._last_graph_signal: GraphContextSignal | None = None
         self.level1 = self.store  # backwards compatibility for callers expecting this attr
         self.segment_embedder = SentencePartEmbeddingPipeline(self.settings)
         self.context_windows = ContextWindowEmbeddingManager(
@@ -595,6 +625,7 @@ class DBSLMEngine:
         *,
         scaffold_response: bool = True,
         score_observer: ScoreObserver | None = None,
+        graph_context_tokens: Mapping[str, str] | None = None,
     ) -> str:
         rng = random.Random(rng_seed) if rng_seed is not None else random.Random()
         self.memory.log_message(conversation_id, "user", user_message)
@@ -616,6 +647,14 @@ class DBSLMEngine:
                 if concept_ids:
                     self.cache.update(conversation_id, concept_ids)
                 bias_context = f"{history_text}\n{concept_text}".strip()
+
+        # Graph context memory is a Level 3-style internal signal: its recalled
+        # sentences widen the bias/embedding context and its terms bias decoding,
+        # but they are never prepended to the response.
+        graph_signal = self._run_graph_layer(user_message, graph_context_tokens)
+        graph_bias = self._graph_token_bias(graph_signal)
+        if graph_signal and graph_signal.context_text:
+            bias_context = f"{bias_context}\n{graph_signal.context_text}".strip()
 
         prefix_segments: tuple[str, ...] = tuple()
         rolling_context = history_ids[-(self.store.order - 1) :] if self.store.order > 1 else history_ids
@@ -650,6 +689,7 @@ class DBSLMEngine:
                 commit_cache=False,
                 prediction_matrix=prediction_matrix,
                 score_observer=score_observer,
+                extra_bias=graph_bias,
             )
             decoded_text = self.tokenizer.decode(decoded_ids)
             attempt_segments = [segment for segment in prefix_segments if segment]
@@ -739,6 +779,82 @@ class DBSLMEngine:
         return self.concepts.generate(conversation_id, context_tokens)
 
     # ------------------------------------------------------------------ #
+    # Graph context memory
+    # ------------------------------------------------------------------ #
+    def observe_graph_records(
+        self,
+        records: Sequence[object] | None,
+        *,
+        source_label: str = "",
+        max_records: int = 0,
+    ) -> GraphIngestStats:
+        """Record corpus context/term relations in the cheetah graph.
+
+        This is a side channel: nothing written here is fed back into the n-gram
+        corpus, exactly like the dependency layers it reads.
+        """
+        return self.graph_memory.observe_records(
+            records,
+            source_label=source_label,
+            max_records=max_records,
+        )
+
+    def consume_graph_signal(self) -> GraphContextSignal | None:
+        """Return (and clear) the graph signal used by the last `respond` call."""
+        signal = self._last_graph_signal
+        self._last_graph_signal = None
+        return signal
+
+    def _run_graph_layer(
+        self,
+        user_message: str,
+        context_tokens: Mapping[str, str] | None,
+    ) -> GraphContextSignal | None:
+        # Graph memory is optional: a SQLite-only run and the lightweight test
+        # engines simply have nothing to recall from.
+        memory = getattr(self, "graph_memory", None)
+        if memory is None or not memory.available():
+            self._last_graph_signal = None
+            return None
+        signal = memory.recall(user_message, context_tokens=context_tokens)
+        self._last_graph_signal = signal
+        return signal
+
+    def _graph_token_bias(self, signal: GraphContextSignal | None) -> Dict[int, int] | None:
+        """Map recalled terms onto quantized token biases for the scoring pipeline.
+
+        The magnitude is anchored to `_CORRECTION_Q_BIAS`, the delta a user
+        correction applies: recall is ambient evidence and must stay weaker than
+        something the user actually said, so a weight of 1.0 with a perfect score
+        only matches a correction and the default 0.25 is a nudge.
+
+        Only tokens already present in the vocabulary can be biased, and prompt
+        tags stay excluded so a recalled term can never reintroduce scaffolding.
+        """
+        if signal is None or not signal.term_weights or self.graph_bias_weight <= 0.0:
+            return None
+        bias: Dict[int, int] = {}
+        for term, weight in signal.term_weights.items():
+            delta = int(
+                round(_CORRECTION_Q_BIAS * self.graph_bias_weight * max(0.0, min(1.0, weight)))
+            )
+            if delta <= 0:
+                continue
+            tokens, _ = self.tokenizer.tokenize(
+                term,
+                add_special_tokens=False,
+                merge_mode="off",
+            )
+            for token_text in tokens:
+                # Recall must never mint vocabulary: an unknown term simply has
+                # nothing to bias, so look the id up instead of creating it.
+                token_id = self.vocab.lookup(token_text)
+                if token_id is None or token_id in self._prompt_tag_token_ids:
+                    continue
+                bias[token_id] = max(bias.get(token_id, 0), delta)
+        return bias or None
+
+    # ------------------------------------------------------------------ #
     # Corrections & bias
     # ------------------------------------------------------------------ #
     def record_correction(
@@ -759,7 +875,13 @@ class DBSLMEngine:
         self.concepts.push_signal(conversation_id, "CorrectionReplay", score=2.0, ttl_seconds=900)
         for key, value in corrected_fact.items():
             token_id = self.vocab.token_id(str(value))
-            self.bias.upsert_bias(conversation_id, key, token_id, q_bias=40, ttl_seconds=3600)
+            self.bias.upsert_bias(
+                conversation_id,
+                key,
+                token_id,
+                q_bias=_CORRECTION_Q_BIAS,
+                ttl_seconds=3600,
+            )
         return correction_id
 
     # ------------------------------------------------------------------ #

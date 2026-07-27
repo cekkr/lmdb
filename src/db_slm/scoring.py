@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence
+from typing import Callable, Dict, List, Mapping, Sequence
 
 from .context_dimensions import ContextDimensionTracker
 from .level1 import LogProbQuantizer, TokenCandidate, Tokenizer
@@ -72,8 +72,19 @@ class TokenScoringPipeline:
         prediction_bias: Dict[int, float] | None,
         prediction_weight: float,
         collect_trace: bool = False,
+        extra_bias: Mapping[int, int] | None = None,
     ) -> ScoreResult:
         bias_map = self.bias.lookup(conversation_id, context_snippet)
+        if extra_bias:
+            # Transient per-turn bias (graph recall today). It is additive on top
+            # of the stored Level 2 bias and, like every other source folded into
+            # the distribution, it may never reintroduce a banned token.
+            bias_map = dict(bias_map)
+            for token_id, delta in extra_bias.items():
+                token_id = int(token_id)
+                if token_id in banned:
+                    continue
+                bias_map[token_id] = bias_map.get(token_id, 0) + int(delta)
         cache_dist = {
             token_id: probability
             for token_id, probability in self.cache.distribution(conversation_id).items()

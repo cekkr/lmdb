@@ -46,6 +46,7 @@ class TokenScoringPipelineTests(unittest.TestCase):
         cache_distribution: dict[int, float],
         prediction_bias: dict[int, float] | None,
         prediction_weight: float,
+        extra_bias: dict[int, int] | None = None,
     ):
         pipeline = TokenScoringPipeline(
             _FakeQuantizer(),  # type: ignore[arg-type]
@@ -67,6 +68,7 @@ class TokenScoringPipelineTests(unittest.TestCase):
             prediction_bias=prediction_bias,
             prediction_weight=prediction_weight,
             collect_trace=True,
+            extra_bias=extra_bias,
         )
 
     def test_banned_token_cannot_reenter_through_session_cache(self) -> None:
@@ -88,6 +90,36 @@ class TokenScoringPipelineTests(unittest.TestCase):
 
         self.assertEqual(set(result.distribution), {1})
         self.assertNotIn(2, {entry.token_id for entry in result.trace or []})
+
+    def test_banned_token_cannot_reenter_through_graph_bias(self) -> None:
+        result = self._score(
+            cache_distribution={},
+            prediction_bias=None,
+            prediction_weight=0.0,
+            extra_bias={1: 40, 2: 200},
+        )
+
+        self.assertEqual(set(result.distribution), {1})
+        self.assertNotIn(2, {entry.token_id for entry in result.trace or []})
+
+    def test_graph_bias_raises_the_score_of_an_allowed_token(self) -> None:
+        baseline = self._score(
+            cache_distribution={},
+            prediction_bias=None,
+            prediction_weight=0.0,
+        )
+        biased = self._score(
+            cache_distribution={},
+            prediction_bias=None,
+            prediction_weight=0.0,
+            extra_bias={1: 64},
+        )
+
+        baseline_entry = next(entry for entry in baseline.trace or [] if entry.token_id == 1)
+        biased_entry = next(entry for entry in biased.trace or [] if entry.token_id == 1)
+        self.assertEqual(baseline_entry.bias_delta, 0)
+        self.assertEqual(biased_entry.bias_delta, 64)
+        self.assertGreater(biased_entry.base_log10, baseline_entry.base_log10)
 
 
 if __name__ == "__main__":

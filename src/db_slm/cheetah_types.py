@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple
 
 CHEETAH_DEFAULT_REDUCE_PAGE_SIZE = 1024
 CHEETAH_PAIR_SCAN_MIN_LIMIT = 256
 CHEETAH_PAIR_SCAN_MAX_LIMIT = 4096
+
+# Server-side bounds mirrored from cheetah-db/src/graph_recall.go and
+# cheetah-db/src/graph.go. Requests above these values are silently clamped by
+# the server; clamping here keeps the command line honest about what was asked.
+GRAPH_RECALL_MAX_SEEDS = 32
+GRAPH_RECALL_MAX_HOPS = 6
+GRAPH_RECALL_MAX_BRANCH = 1024
+GRAPH_RECALL_MAX_BUDGET = 262144
+GRAPH_RECALL_MAX_REFERENCES = 256
+GRAPH_NODE_MAX_REFERENCES = 64
+GRAPH_NODE_MAX_REFERENCE_CHARS = 4096
+GRAPH_NODE_MAX_REFERENCE_TOTAL_CHARS = 65536
 
 
 @dataclass(frozen=True)
@@ -63,6 +75,157 @@ class PredictionQueryResult:
     backend: str
     count: int
     entries: Tuple[PredictionValueResult, ...]
+
+
+@dataclass(frozen=True)
+class GraphReferenceSentence:
+    """A complete sentence stored as readable provenance on a graph node."""
+
+    reference_id: str
+    text: str
+    source: str = ""
+    ordinal: int = 0
+
+    def as_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {"text": self.text}
+        if self.reference_id:
+            payload["id"] = self.reference_id
+        if self.source:
+            payload["source"] = self.source
+        if self.ordinal:
+            payload["ordinal"] = int(self.ordinal)
+        return payload
+
+
+@dataclass(frozen=True)
+class GraphRecallEdge:
+    """One edge of the ``via`` evidence path returned by ``GRAPH_RECALL``."""
+
+    from_id: str
+    to_id: str
+    edge_type: str
+    weight: float
+    confidence: float
+    modality: str
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class GraphRecallSource:
+    """A seed that reached an association, with its own activation and hops."""
+
+    seed: str
+    activation: float
+    hops: int
+
+
+@dataclass(frozen=True)
+class GraphRecallSeedMatch:
+    """A node a free-text seed term resolved to."""
+
+    node_id: str
+    score: float
+    match: str
+
+
+@dataclass(frozen=True)
+class GraphRecallSeed:
+    """One requested seed term and the nodes it resolved to."""
+
+    term: str
+    matches: Tuple[GraphRecallSeedMatch, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphAssociation:
+    """A node reached by activation spreading, with the evidence that reached it."""
+
+    node_id: str
+    score: float
+    novelty: float
+    distance: int
+    source_count: int
+    bridge: bool = False
+    labels: Tuple[str, ...] = tuple()
+    references: Tuple[GraphReferenceSentence, ...] = tuple()
+    sources: Tuple[GraphRecallSource, ...] = tuple()
+    via: Tuple[GraphRecallEdge, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphRecallResult:
+    """Full ``GRAPH_RECALL`` answer: header counters plus the decoded payload."""
+
+    seeds: int
+    resolved: int
+    visited: int
+    expanded: int
+    hydrated: int
+    reference_count: int
+    count: int
+    bridges: int
+    truncated: bool
+    precision: float
+    seed_resolutions: Tuple[GraphRecallSeed, ...] = tuple()
+    unresolved: Tuple[str, ...] = tuple()
+    associations: Tuple[GraphAssociation, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphSimilarMatch:
+    """A node that behaves like the queried node (shared neighbours or words)."""
+
+    node_id: str
+    score: float
+    context: float = 0.0
+    lexical: float = 0.0
+    shared_count: int = 0
+    shared: Tuple[str, ...] = tuple()
+    labels: Tuple[str, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphSimilarResult:
+    """Full ``GRAPH_SIMILAR`` answer."""
+
+    node_id: str
+    count: int
+    truncated: bool
+    matches: Tuple[GraphSimilarMatch, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphNodeRecord:
+    """A node record read back through ``GRAPH_NODE_GET``."""
+
+    node_id: str
+    labels: Tuple[str, ...] = tuple()
+    props: dict[str, object] = field(default_factory=dict)
+    references: Tuple[GraphReferenceSentence, ...] = tuple()
+
+
+@dataclass(frozen=True)
+class GraphEdgeBatchResult:
+    """Counters reported by ``GRAPH_EDGE_SET_BATCH``."""
+
+    requested: int
+    applied: int
+    created: int
+    updated: int
+    failed: int
+
+
+@dataclass(frozen=True)
+class GraphTermIndexStats:
+    """Answer of ``GRAPH_TERM_INDEX action=stats|rebuild|drop``."""
+
+    action: str
+    enabled: bool = False
+    entries: int = 0
+    nodes: int = 0
+    terms: int = 0
+    removed: int = 0
+    next_cursor: str = ""
 
 
 @dataclass(frozen=True)
@@ -154,9 +317,29 @@ __all__ = [
     "RawContinuationProjection",
     "PredictionValueResult",
     "PredictionQueryResult",
+    "GraphReferenceSentence",
+    "GraphRecallEdge",
+    "GraphRecallSource",
+    "GraphRecallSeedMatch",
+    "GraphRecallSeed",
+    "GraphAssociation",
+    "GraphRecallResult",
+    "GraphSimilarMatch",
+    "GraphSimilarResult",
+    "GraphNodeRecord",
+    "GraphEdgeBatchResult",
+    "GraphTermIndexStats",
     "NamespaceSummary",
     "CheetahSystemStats",
     "CHEETAH_DEFAULT_REDUCE_PAGE_SIZE",
     "CHEETAH_PAIR_SCAN_MIN_LIMIT",
     "CHEETAH_PAIR_SCAN_MAX_LIMIT",
+    "GRAPH_RECALL_MAX_SEEDS",
+    "GRAPH_RECALL_MAX_HOPS",
+    "GRAPH_RECALL_MAX_BRANCH",
+    "GRAPH_RECALL_MAX_BUDGET",
+    "GRAPH_RECALL_MAX_REFERENCES",
+    "GRAPH_NODE_MAX_REFERENCES",
+    "GRAPH_NODE_MAX_REFERENCE_CHARS",
+    "GRAPH_NODE_MAX_REFERENCE_TOTAL_CHARS",
 ]

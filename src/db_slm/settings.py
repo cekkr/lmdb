@@ -40,6 +40,12 @@ class DBSLMSettings:
     tokenizer_backend: str
     tokenizer_json_path: str | None
     tokenizer_lowercase: bool
+    graph_memory_enabled: bool
+    graph_recall_hops: int
+    graph_recall_precision: float
+    graph_recall_limit: int
+    graph_recall_references: int
+    graph_bias_weight: float
 
     def sqlite_dsn(self) -> str:
         """Return the SQLite DSN currently used by the CLI utilities."""
@@ -89,6 +95,32 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
     tokenizer_json_path = tokenizer_json_raw or None
     tokenizer_lower_flag = read("DBSLM_TOKENIZER_LOWERCASE", "1").strip().lower()
     tokenizer_lowercase = tokenizer_lower_flag not in {"0", "false", "no", "off"}
+    graph_memory_flag = read("DBSLM_GRAPH_MEMORY", "0").strip().lower()
+    graph_memory_enabled = graph_memory_flag in {"1", "true", "yes", "on"}
+
+    def read_int(key: str, default: int, *, minimum: int, maximum: int) -> int:
+        try:
+            value = int(read(key, str(default)).strip() or default)
+        except ValueError:
+            value = default
+        return max(minimum, min(value, maximum))
+
+    def read_float(key: str, default: float, *, minimum: float, maximum: float) -> float:
+        try:
+            value = float(read(key, str(default)).strip() or default)
+        except ValueError:
+            value = default
+        return max(minimum, min(value, maximum))
+
+    graph_recall_hops = read_int("DBSLM_GRAPH_RECALL_HOPS", 2, minimum=1, maximum=6)
+    graph_recall_precision = read_float(
+        "DBSLM_GRAPH_RECALL_PRECISION", 0.2, minimum=0.0, maximum=1.0
+    )
+    graph_recall_limit = read_int("DBSLM_GRAPH_RECALL_LIMIT", 8, minimum=1, maximum=256)
+    graph_recall_references = read_int(
+        "DBSLM_GRAPH_RECALL_REFERENCES", 8, minimum=0, maximum=256
+    )
+    graph_bias_weight = read_float("DBSLM_GRAPH_BIAS_WEIGHT", 0.25, minimum=0.0, maximum=1.0)
 
     env_file_used = env_file if env_file.exists() else None
     return DBSLMSettings(
@@ -108,4 +140,10 @@ def load_settings(env_path: str | Path = ".env") -> DBSLMSettings:
         tokenizer_backend=tokenizer_backend,
         tokenizer_json_path=tokenizer_json_path,
         tokenizer_lowercase=tokenizer_lowercase,
+        graph_memory_enabled=graph_memory_enabled,
+        graph_recall_hops=graph_recall_hops,
+        graph_recall_precision=graph_recall_precision,
+        graph_recall_limit=graph_recall_limit,
+        graph_recall_references=graph_recall_references,
+        graph_bias_weight=graph_bias_weight,
     )

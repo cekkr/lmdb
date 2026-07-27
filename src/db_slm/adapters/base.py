@@ -4,6 +4,11 @@ from typing import Iterable, Protocol, Sequence, Tuple
 
 from ..cheetah_types import (
     CheetahSystemStats,
+    GraphEdgeBatchResult,
+    GraphNodeRecord,
+    GraphRecallResult,
+    GraphSimilarResult,
+    GraphTermIndexStats,
     NamespaceSummary,
     PredictionQueryResult,
     RawContinuationProjection,
@@ -153,6 +158,69 @@ class HotPathAdapter(Protocol):
     ) -> bool:
         """Batch inherit prediction weights (PREDICT_INHERIT_BATCH/ASYNC)."""
 
+    def graph_node_set(
+        self,
+        node_id: str,
+        *,
+        labels: Sequence[str] | None = None,
+        props: dict[str, object] | None = None,
+        references: Sequence[dict[str, object]] | None = None,
+        clear_references: bool = False,
+    ) -> bool:
+        """Upsert a graph context node (GRAPH_NODE_SET)."""
+
+    def graph_node_get(self, node_id: str) -> GraphNodeRecord | None:
+        """Read one graph node record (GRAPH_NODE_GET); None when not recorded."""
+
+    def graph_edge_set_batch(
+        self,
+        items: Sequence[dict[str, object]],
+        *,
+        continue_on_error: bool = True,
+        default_type: str | None = None,
+        default_props: dict[str, object] | None = None,
+    ) -> GraphEdgeBatchResult | None:
+        """Upsert many graph relations in one round-trip (GRAPH_EDGE_SET_BATCH)."""
+
+    def graph_recall(
+        self,
+        seeds: Sequence[str],
+        *,
+        precision: float | str | None = None,
+        hops: int | None = None,
+        min_sources: int | None = None,
+        direction: str | None = None,
+        edge_types: Sequence[str] | None = None,
+        decay: float | None = None,
+        expand: str | None = None,
+        references: bool = False,
+        reference_limit: int | None = None,
+        include_seeds: bool = False,
+        limit: int | None = None,
+        branch_limit: int | None = None,
+        budget: int | None = None,
+    ) -> GraphRecallResult | None:
+        """Spread activation from several seeds at once (GRAPH_RECALL)."""
+
+    def graph_similar(
+        self,
+        node_id: str,
+        *,
+        by: str | None = None,
+        limit: int | None = None,
+        precision: float | str | None = None,
+    ) -> GraphSimilarResult | None:
+        """Return nodes that behave like this one (GRAPH_SIMILAR)."""
+
+    def graph_term_index(
+        self,
+        action: str = "stats",
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> GraphTermIndexStats | None:
+        """Inspect or maintain the derived lexical seed index (GRAPH_TERM_INDEX)."""
+
 
 class NullHotPathAdapter:
     """Default adapter that keeps the SQLite-only behavior."""
@@ -293,6 +361,69 @@ class NullHotPathAdapter:
         merge_mode: str | None = None,
     ) -> bool:
         return False
+
+    def graph_node_set(
+        self,
+        node_id: str,
+        *,
+        labels: Sequence[str] | None = None,
+        props: dict[str, object] | None = None,
+        references: Sequence[dict[str, object]] | None = None,
+        clear_references: bool = False,
+    ) -> bool:
+        return False
+
+    def graph_node_get(self, node_id: str) -> GraphNodeRecord | None:
+        return None
+
+    def graph_edge_set_batch(
+        self,
+        items: Sequence[dict[str, object]],
+        *,
+        continue_on_error: bool = True,
+        default_type: str | None = None,
+        default_props: dict[str, object] | None = None,
+    ) -> GraphEdgeBatchResult | None:
+        return None
+
+    def graph_recall(
+        self,
+        seeds: Sequence[str],
+        *,
+        precision: float | str | None = None,
+        hops: int | None = None,
+        min_sources: int | None = None,
+        direction: str | None = None,
+        edge_types: Sequence[str] | None = None,
+        decay: float | None = None,
+        expand: str | None = None,
+        references: bool = False,
+        reference_limit: int | None = None,
+        include_seeds: bool = False,
+        limit: int | None = None,
+        branch_limit: int | None = None,
+        budget: int | None = None,
+    ) -> GraphRecallResult | None:
+        return None
+
+    def graph_similar(
+        self,
+        node_id: str,
+        *,
+        by: str | None = None,
+        limit: int | None = None,
+        precision: float | str | None = None,
+    ) -> GraphSimilarResult | None:
+        return None
+
+    def graph_term_index(
+        self,
+        action: str = "stats",
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> GraphTermIndexStats | None:
+        return None
 
 
 __all__ = ["HotPathAdapter", "NullHotPathAdapter"]

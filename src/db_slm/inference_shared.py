@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Mapping, Tuple
 
 from .decoder import DecoderConfig
 from .scoring import ScoreObserver
@@ -20,13 +20,15 @@ def issue_prompt(
     rng_seed: int | None = None,
     scaffold_response: bool = True,
     score_observer: ScoreObserver | None = None,
+    graph_context_tokens: Mapping[str, str] | None = None,
 ) -> Tuple[str, str]:
     """
     Send a prompt through DBSLMEngine, starting a conversation when needed.
 
     Returns (conversation_id, response_text) so callers can keep reusing the
     same conversation across turns. Provide score_observer to capture per-step
-    scoring snapshots while debugging decode output.
+    scoring snapshots while debugging decode output, and graph_context_tokens to
+    seed graph recall with the dataset context values the caller already knows.
     """
     convo_id = conversation_id or engine.start_conversation(
         user_id, agent_name, seed_history=seed_history
@@ -39,5 +41,6 @@ def issue_prompt(
         rng_seed=rng_seed,
         scaffold_response=scaffold_response,
         score_observer=score_observer,
+        graph_context_tokens=graph_context_tokens,
     )
     return convo_id, response

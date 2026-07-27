@@ -921,6 +921,7 @@ def run_inference_records(
             decoder_cfg=active_decoder_cfg,
             rng_seed=seed_planner.seed_for(idx, variant, attempts) if seed_planner else None,
             scaffold_response=False,
+            graph_context_tokens=getattr(record, "context_tokens", None),
         )
         prompt_tag = _detected_prompt_tag(generated, getattr(record, "prompt_tags", ()))
         if prompt_tag and attempts < _MAX_BATCH_ATTEMPTS:

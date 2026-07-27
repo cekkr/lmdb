@@ -20,7 +20,24 @@ from ..cheetah_types import (
     CHEETAH_DEFAULT_REDUCE_PAGE_SIZE,
     CHEETAH_PAIR_SCAN_MAX_LIMIT,
     CHEETAH_PAIR_SCAN_MIN_LIMIT,
+    GRAPH_RECALL_MAX_BRANCH,
+    GRAPH_RECALL_MAX_BUDGET,
+    GRAPH_RECALL_MAX_HOPS,
+    GRAPH_RECALL_MAX_REFERENCES,
+    GRAPH_RECALL_MAX_SEEDS,
     CheetahSystemStats,
+    GraphAssociation,
+    GraphEdgeBatchResult,
+    GraphNodeRecord,
+    GraphRecallEdge,
+    GraphRecallResult,
+    GraphRecallSeed,
+    GraphRecallSeedMatch,
+    GraphRecallSource,
+    GraphReferenceSentence,
+    GraphSimilarMatch,
+    GraphSimilarResult,
+    GraphTermIndexStats,
     NamespaceSummary,
     PredictionQueryResult,
     PredictionValueResult,
@@ -106,6 +123,131 @@ def _is_unspecified_host(host: str) -> bool:
 
 _RUNNING_IN_WSL = _detect_wsl()
 _WSL_HOST_IP = _detect_wsl_host_ip() if _RUNNING_IN_WSL else None
+
+
+# --------------------------------------------------------------------------- #
+# Graph protocol encoding helpers
+#
+# Cheetah splits `GRAPH_*` arguments on whitespace, so ids, labels and types are
+# single tokens and anything with a space (props, references, item lists, free
+# text seeds) travels base64-encoded. Slugging and encoding belong here, never in
+# the caller's string concatenation.
+# --------------------------------------------------------------------------- #
+def _graph_token(value: str | None) -> str:
+    """Return a whitespace/comma-free protocol token, or "" when unusable."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if any(char.isspace() for char in text) or "," in text:
+        return ""
+    return text
+
+
+def _graph_encode_json(payload: object) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _graph_encode_seeds(seeds: Sequence[str]) -> str:
+    """Encode seed terms, switching to `base64:` when any term is not a token."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for seed in seeds or ():
+        term = " ".join(str(seed or "").split()).replace(",", " ").strip()
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        cleaned.append(term)
+        if len(cleaned) >= GRAPH_RECALL_MAX_SEEDS:
+            break
+    if not cleaned:
+        return ""
+    joined = ",".join(cleaned)
+    if any(char.isspace() for char in joined):
+        return "base64:" + base64.b64encode(joined.encode("utf-8")).decode("ascii")
+    return joined
+
+
+def _graph_format_precision(value: float | str) -> str:
+    """`precision` accepts a number or a word from the modality scale."""
+    if isinstance(value, str):
+        return value.strip().lower()
+    return f"{float(value):.4f}"
+
+
+def _graph_float(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _graph_references_from_payload(entries: object) -> tuple[GraphReferenceSentence, ...]:
+    if not isinstance(entries, list):
+        return tuple()
+    references: list[GraphReferenceSentence] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            continue
+        references.append(
+            GraphReferenceSentence(
+                reference_id=str(entry.get("id") or ""),
+                text=text,
+                source=str(entry.get("source") or ""),
+                ordinal=int(_graph_float(entry.get("ordinal"))),
+            )
+        )
+    return tuple(references)
+
+
+def _graph_node_record_from_payload(payload: dict, *, fallback_id: str) -> GraphNodeRecord:
+    props = payload.get("props")
+    return GraphNodeRecord(
+        node_id=str(payload.get("id") or fallback_id),
+        labels=tuple(str(label) for label in payload.get("labels") or ()),
+        props=dict(props) if isinstance(props, dict) else {},
+        references=_graph_references_from_payload(payload.get("references")),
+    )
+
+
+def _graph_association_from_payload(entry: dict) -> GraphAssociation:
+    sources = tuple(
+        GraphRecallSource(
+            seed=str(source.get("seed") or ""),
+            activation=_graph_float(source.get("activation")),
+            hops=int(_graph_float(source.get("hops"))),
+        )
+        for source in entry.get("sources") or ()
+        if isinstance(source, dict)
+    )
+    via = tuple(
+        GraphRecallEdge(
+            from_id=str(edge.get("from") or ""),
+            to_id=str(edge.get("to") or ""),
+            edge_type=str(edge.get("type") or ""),
+            weight=_graph_float(edge.get("weight")),
+            confidence=_graph_float(edge.get("confidence")),
+            modality=str(edge.get("modality") or ""),
+            source=str(edge.get("source") or ""),
+        )
+        for edge in entry.get("via") or ()
+        if isinstance(edge, dict)
+    )
+    return GraphAssociation(
+        node_id=str(entry.get("id") or ""),
+        score=_graph_float(entry.get("score")),
+        novelty=_graph_float(entry.get("novelty")),
+        distance=int(_graph_float(entry.get("distance"))),
+        source_count=int(_graph_float(entry.get("source_count"))),
+        bridge=bool(entry.get("bridge")),
+        labels=tuple(str(label) for label in entry.get("labels") or ()),
+        references=_graph_references_from_payload(entry.get("references")),
+        sources=sources,
+        via=via,
+    )
 
 
 class CheetahError(RuntimeError):
@@ -717,6 +859,279 @@ class CheetahClient:
         if not response or not response.startswith("SUCCESS"):
             return None
         return self._parse_predict_query_response(response)
+
+    # ------------------------------------------------------------------ #
+    # Graph context memory (GRAPH_*)
+    # ------------------------------------------------------------------ #
+    def graph_node_set(
+        self,
+        node_id: str,
+        *,
+        labels: Sequence[str] | None = None,
+        props: dict[str, object] | None = None,
+        references: Sequence[dict[str, object]] | None = None,
+        clear_references: bool = False,
+    ) -> bool:
+        """Upsert a node. Omitted fields keep their stored value server-side."""
+        identifier = _graph_token(node_id)
+        if not identifier:
+            return False
+        args = [f"id={identifier}"]
+        label_tokens = [token for token in (_graph_token(label) for label in labels or ()) if token]
+        if label_tokens:
+            args.append(f"labels={','.join(label_tokens)}")
+        if props:
+            args.append(f"props={_graph_encode_json(props)}")
+        if clear_references:
+            args.append("references=-")
+        elif references:
+            args.append(f"references={_graph_encode_json(list(references))}")
+        response = self._command(f"GRAPH_NODE_SET {' '.join(args)}")
+        return bool(response and response.startswith("SUCCESS"))
+
+    def graph_node_get(self, node_id: str) -> GraphNodeRecord | None:
+        """Read one node record. A missing node answers ``ERROR,node_not_found``."""
+        identifier = _graph_token(node_id)
+        if not identifier:
+            return None
+        response = self._command(f"GRAPH_NODE_GET id={identifier}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        payload = self._decode_graph_payload(response)
+        if not isinstance(payload, dict):
+            return None
+        return _graph_node_record_from_payload(payload, fallback_id=identifier)
+
+    def graph_edge_set_batch(
+        self,
+        items: Sequence[dict[str, object]],
+        *,
+        continue_on_error: bool = True,
+        default_type: str | None = None,
+        default_props: dict[str, object] | None = None,
+    ) -> GraphEdgeBatchResult | None:
+        """Upsert many edges in one round-trip (``GRAPH_EDGE_SET_BATCH``)."""
+        payload_items = [item for item in items if item]
+        if not payload_items:
+            return None
+        args = [f"items={_graph_encode_json(payload_items)}"]
+        type_token = _graph_token(default_type or "")
+        if type_token:
+            args.append(f"type={type_token}")
+        if default_props:
+            args.append(f"props={_graph_encode_json(default_props)}")
+        if continue_on_error:
+            args.append("continue_on_error=1")
+        response = self._command(f"GRAPH_EDGE_SET_BATCH {' '.join(args)}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        fields = self._split_response_fields(response)
+        return GraphEdgeBatchResult(
+            requested=self._parse_int(fields.get("requested")),
+            applied=self._parse_int(fields.get("applied")),
+            created=self._parse_int(fields.get("created")),
+            updated=self._parse_int(fields.get("updated")),
+            failed=self._parse_int(fields.get("failed")),
+        )
+
+    def graph_recall(
+        self,
+        seeds: Sequence[str],
+        *,
+        precision: float | str | None = None,
+        hops: int | None = None,
+        min_sources: int | None = None,
+        direction: str | None = None,
+        edge_types: Sequence[str] | None = None,
+        decay: float | None = None,
+        expand: str | None = None,
+        references: bool = False,
+        reference_limit: int | None = None,
+        include_seeds: bool = False,
+        limit: int | None = None,
+        branch_limit: int | None = None,
+        budget: int | None = None,
+    ) -> GraphRecallResult | None:
+        """Spread activation from every seed at once (``GRAPH_RECALL``)."""
+        seed_arg = _graph_encode_seeds(seeds)
+        if not seed_arg:
+            return None
+        args = [f"seeds={seed_arg}"]
+        if precision is not None:
+            args.append(f"precision={_graph_format_precision(precision)}")
+        if hops is not None:
+            args.append(f"hops={max(1, min(int(hops), GRAPH_RECALL_MAX_HOPS))}")
+        if min_sources is not None and int(min_sources) > 1:
+            args.append(f"min_sources={int(min_sources)}")
+        direction_token = (direction or "").strip().lower()
+        if direction_token in {"out", "in", "both"}:
+            args.append(f"direction={direction_token}")
+        type_tokens = [token for token in (_graph_token(name) for name in edge_types or ()) if token]
+        if type_tokens:
+            args.append(f"type={','.join(type_tokens)}")
+        if decay is not None:
+            args.append(f"decay={float(decay):.4f}")
+        expand_token = (expand or "").strip().lower()
+        if expand_token:
+            args.append(f"expand={expand_token}")
+        if references:
+            args.append("references=1")
+            if reference_limit is not None:
+                bounded = max(1, min(int(reference_limit), GRAPH_RECALL_MAX_REFERENCES))
+                args.append(f"reference_limit={bounded}")
+        if include_seeds:
+            # Seed nodes are excluded from the answer by default. Their own
+            # recorded sentences are the closest grounding a turn has, so ask for
+            # them back whenever references are being hydrated.
+            args.append("include_seeds=1")
+        if limit is not None and int(limit) > 0:
+            args.append(f"limit={int(limit)}")
+        if branch_limit is not None and int(branch_limit) > 0:
+            args.append(f"branch_limit={min(int(branch_limit), GRAPH_RECALL_MAX_BRANCH)}")
+        if budget is not None and int(budget) > 0:
+            args.append(f"budget={min(int(budget), GRAPH_RECALL_MAX_BUDGET)}")
+        response = self._command(f"GRAPH_RECALL {' '.join(args)}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        return self._parse_graph_recall_response(response)
+
+    def graph_similar(
+        self,
+        node_id: str,
+        *,
+        by: str | None = None,
+        limit: int | None = None,
+        precision: float | str | None = None,
+    ) -> GraphSimilarResult | None:
+        """Answer "what else behaves like this?" (``GRAPH_SIMILAR``)."""
+        identifier = _graph_token(node_id)
+        if not identifier:
+            return None
+        args = [f"id={identifier}"]
+        by_token = (by or "").strip().lower()
+        if by_token:
+            args.append(f"by={by_token}")
+        if limit is not None and int(limit) > 0:
+            args.append(f"limit={int(limit)}")
+        if precision is not None:
+            args.append(f"precision={_graph_format_precision(precision)}")
+        response = self._command(f"GRAPH_SIMILAR {' '.join(args)}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        fields = self._split_response_fields(response)
+        payload = self._decode_graph_payload(response)
+        matches: list[GraphSimilarMatch] = []
+        if isinstance(payload, list):
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                matches.append(
+                    GraphSimilarMatch(
+                        node_id=str(entry.get("id") or ""),
+                        score=_graph_float(entry.get("score")),
+                        context=_graph_float(entry.get("context")),
+                        lexical=_graph_float(entry.get("lexical")),
+                        shared_count=int(_graph_float(entry.get("shared_count"))),
+                        shared=tuple(str(item) for item in entry.get("shared") or ()),
+                        labels=tuple(str(item) for item in entry.get("labels") or ()),
+                    )
+                )
+        return GraphSimilarResult(
+            node_id=fields.get("id", identifier),
+            count=self._parse_int(fields.get("count")),
+            truncated=self._parse_bool(fields.get("truncated")),
+            matches=tuple(matches),
+        )
+
+    def graph_term_index(
+        self,
+        action: str = "stats",
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> GraphTermIndexStats | None:
+        """Maintain the derived lexical index free-text seeds resolve through."""
+        action_token = (action or "stats").strip().lower()
+        if action_token not in {"stats", "status", "rebuild", "reindex", "drop", "clear"}:
+            return None
+        args = [f"action={action_token}"]
+        if limit is not None and int(limit) > 0:
+            args.append(f"limit={int(limit)}")
+        cursor_token = (cursor or "").strip()
+        if cursor_token:
+            args.append(f"cursor={cursor_token}")
+        response = self._command(f"GRAPH_TERM_INDEX {' '.join(args)}")
+        if not response or not response.startswith("SUCCESS"):
+            return None
+        fields = self._split_response_fields(response)
+        return GraphTermIndexStats(
+            action=fields.get("action", action_token),
+            enabled=self._parse_bool(fields.get("enabled")),
+            entries=self._parse_int(fields.get("entries")),
+            nodes=self._parse_int(fields.get("nodes")),
+            terms=self._parse_int(fields.get("terms")),
+            removed=self._parse_int(fields.get("removed")),
+            next_cursor=fields.get("next_cursor", ""),
+        )
+
+    @classmethod
+    def _decode_graph_payload(cls, response: str) -> object | None:
+        """Decode the base64 JSON carried by ``payload=`` on a graph response."""
+        encoded = cls._extract_response_field(response, "payload")
+        if not encoded:
+            return None
+        try:
+            raw = base64.b64decode(encoded.encode("ascii"))
+        except (ValueError, binascii.Error):
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def _parse_graph_recall_response(cls, response: str) -> GraphRecallResult:
+        fields = cls._split_response_fields(response)
+        payload = cls._decode_graph_payload(response)
+        seed_resolutions: list[GraphRecallSeed] = []
+        unresolved: list[str] = []
+        associations: list[GraphAssociation] = []
+        if isinstance(payload, dict):
+            for entry in payload.get("seeds") or ():
+                if not isinstance(entry, dict):
+                    continue
+                matches = tuple(
+                    GraphRecallSeedMatch(
+                        node_id=str(match.get("id") or ""),
+                        score=_graph_float(match.get("score")),
+                        match=str(match.get("match") or ""),
+                    )
+                    for match in entry.get("matches") or ()
+                    if isinstance(match, dict)
+                )
+                seed_resolutions.append(
+                    GraphRecallSeed(term=str(entry.get("term") or ""), matches=matches)
+                )
+            unresolved = [str(term) for term in payload.get("unresolved") or ()]
+            for entry in payload.get("associations") or ():
+                if not isinstance(entry, dict):
+                    continue
+                associations.append(_graph_association_from_payload(entry))
+        return GraphRecallResult(
+            seeds=cls._parse_int(fields.get("seeds")),
+            resolved=cls._parse_int(fields.get("resolved")),
+            visited=cls._parse_int(fields.get("visited")),
+            expanded=cls._parse_int(fields.get("expanded")),
+            hydrated=cls._parse_int(fields.get("hydrated")),
+            reference_count=cls._parse_int(fields.get("references")),
+            count=cls._parse_int(fields.get("count")),
+            bridges=cls._parse_int(fields.get("bridges")),
+            truncated=cls._parse_bool(fields.get("truncated")),
+            precision=cls._parse_float(fields.get("precision")) or 0.0,
+            seed_resolutions=tuple(seed_resolutions),
+            unresolved=tuple(unresolved),
+            associations=tuple(associations),
+        )
 
     def pair_summary(
         self,
@@ -2174,6 +2589,134 @@ class CheetahHotPathAdapter(HotPathAdapter):
             return None
         try:
             return self._client.system_stats()
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Graph context memory
+    # ------------------------------------------------------------------ #
+    def graph_node_set(
+        self,
+        node_id: str,
+        *,
+        labels: Sequence[str] | None = None,
+        props: dict[str, object] | None = None,
+        references: Sequence[dict[str, object]] | None = None,
+        clear_references: bool = False,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        try:
+            return self._client.graph_node_set(
+                node_id,
+                labels=labels,
+                props=props,
+                references=references,
+                clear_references=clear_references,
+            )
+        except CheetahError as exc:
+            self._disable(exc)
+            return False
+
+    def graph_node_get(self, node_id: str) -> GraphNodeRecord | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.graph_node_get(node_id)
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def graph_edge_set_batch(
+        self,
+        items: Sequence[dict[str, object]],
+        *,
+        continue_on_error: bool = True,
+        default_type: str | None = None,
+        default_props: dict[str, object] | None = None,
+    ) -> GraphEdgeBatchResult | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.graph_edge_set_batch(
+                items,
+                continue_on_error=continue_on_error,
+                default_type=default_type,
+                default_props=default_props,
+            )
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def graph_recall(
+        self,
+        seeds: Sequence[str],
+        *,
+        precision: float | str | None = None,
+        hops: int | None = None,
+        min_sources: int | None = None,
+        direction: str | None = None,
+        edge_types: Sequence[str] | None = None,
+        decay: float | None = None,
+        expand: str | None = None,
+        references: bool = False,
+        reference_limit: int | None = None,
+        include_seeds: bool = False,
+        limit: int | None = None,
+        branch_limit: int | None = None,
+        budget: int | None = None,
+    ) -> GraphRecallResult | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.graph_recall(
+                seeds,
+                precision=precision,
+                hops=hops,
+                min_sources=min_sources,
+                direction=direction,
+                edge_types=edge_types,
+                decay=decay,
+                expand=expand,
+                references=references,
+                reference_limit=reference_limit,
+                include_seeds=include_seeds,
+                limit=limit,
+                branch_limit=branch_limit,
+                budget=budget,
+            )
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def graph_similar(
+        self,
+        node_id: str,
+        *,
+        by: str | None = None,
+        limit: int | None = None,
+        precision: float | str | None = None,
+    ) -> GraphSimilarResult | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.graph_similar(node_id, by=by, limit=limit, precision=precision)
+        except CheetahError as exc:
+            self._disable(exc)
+            return None
+
+    def graph_term_index(
+        self,
+        action: str = "stats",
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> GraphTermIndexStats | None:
+        if not self._enabled:
+            return None
+        try:
+            return self._client.graph_term_index(action, limit=limit, cursor=cursor)
         except CheetahError as exc:
             self._disable(exc)
             return None

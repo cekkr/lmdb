@@ -435,6 +435,42 @@ def build_parser(default_db_path: str) -> argparse.ArgumentParser:
         help="Blending weight applied to cheetah prediction outputs during decoding (default: %(default)s).",
     )
     parser.add_argument(
+        "--graph-memory",
+        dest="graph_memory",
+        action="store_true",
+        default=None,
+        help="Record corpus context/term relations in the cheetah graph store (default: DBSLM_GRAPH_MEMORY).",
+    )
+    parser.add_argument(
+        "--no-graph-memory",
+        dest="graph_memory",
+        action="store_false",
+        help="Disable graph context memory writes for this run.",
+    )
+    parser.add_argument(
+        "--graph-memory-max-records",
+        type=int,
+        default=0,
+        help="Maximum staged records per chunk observed into the graph, 0 for all (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--graph-memory-terms",
+        type=int,
+        default=6,
+        help="Maximum prompt/response terms minted as graph nodes per record (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--graph-memory-dependency-arcs",
+        type=int,
+        default=12,
+        help="Maximum response dependency arcs recorded as typed graph edges per record (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--graph-term-index-rebuild",
+        action="store_true",
+        help="Rebuild the cheetah lexical seed index after ingest so free-text recall seeds resolve.",
+    )
+    parser.add_argument(
         "--disable-cheetah-adversarial-train",
         action="store_true",
         help="Skip adversarial prediction updates triggered by low-quality evaluation outputs (default: enabled).",
@@ -1273,6 +1309,108 @@ def _train_prediction_tables(
         )
     else:
         log(f"[train] cheetah prediction training: no eligible updates for table '{table}'.")
+
+
+_GRAPH_TERM_INDEX_PAGE_LIMIT = 4096
+_GRAPH_TERM_INDEX_MAX_PAGES = 64
+
+
+def _graph_source_label(chunk_label: str) -> str:
+    """Compact a chunk label for storage as node-reference provenance.
+
+    Chunk labels carry the full input path, and references are persisted inside
+    the Cheetah database. Keep the dataset name and chunk, drop the local path.
+    """
+    label = (chunk_label or "").strip()
+    if not label:
+        return ""
+    path_part, _, chunk_part = label.partition("#")
+    name = Path(path_part).name or path_part
+    return f"{name}#{chunk_part}" if chunk_part else name
+
+
+def _configure_graph_memory(engine: DBSLMEngine, args: argparse.Namespace) -> bool:
+    """Apply CLI bounds to the engine's graph memory and report whether it is live."""
+    memory = getattr(engine, "graph_memory", None)
+    if memory is None:
+        return False
+    requested = getattr(args, "graph_memory", None)
+    if requested is False:
+        memory.disable()
+        return False
+    if not memory.available():
+        if requested:
+            log(
+                "[graph] Graph context memory requested but unavailable "
+                "(cheetah hot-path adapter disabled)."
+            )
+        return False
+    memory.max_terms_per_side = max(1, int(getattr(args, "graph_memory_terms", 6)))
+    memory.max_dependency_arcs = max(0, int(getattr(args, "graph_memory_dependency_arcs", 12)))
+    log(
+        "[graph] Graph context memory enabled "
+        f"(terms_per_side={memory.max_terms_per_side}, "
+        f"dependency_arcs={memory.max_dependency_arcs}, "
+        f"max_records_per_chunk={getattr(args, 'graph_memory_max_records', 0) or 'all'})."
+    )
+    return True
+
+
+def _observe_graph_memory(
+    engine: DBSLMEngine,
+    records: Sequence[EvaluationRecord] | None,
+    args: argparse.Namespace,
+    *,
+    label: str,
+) -> None:
+    if not records:
+        return
+    memory = getattr(engine, "graph_memory", None)
+    if memory is None or not memory.available():
+        return
+    max_records = max(0, int(getattr(args, "graph_memory_max_records", 0)))
+    started = time.monotonic()
+    stats = engine.observe_graph_records(
+        records,
+        source_label=_graph_source_label(label),
+        max_records=max_records,
+    )
+    if stats.records == 0 and stats.skipped_records == 0:
+        return
+    elapsed = time.monotonic() - started
+    log(f"[graph] {label}: {stats.describe()} in {elapsed:.2f}s.")
+
+
+def _rebuild_graph_term_index(engine: DBSLMEngine, args: argparse.Namespace) -> None:
+    """Page through GRAPH_TERM_INDEX action=rebuild so free-text seeds resolve."""
+    if not getattr(args, "graph_term_index_rebuild", False):
+        return
+    memory = getattr(engine, "graph_memory", None)
+    if memory is None or not memory.available():
+        log("[graph] Term-index rebuild skipped: graph context memory unavailable.")
+        return
+    rebuild = getattr(engine.hot_path, "graph_term_index", None)
+    if not callable(rebuild):
+        log("[graph] Term-index rebuild skipped: adapter does not expose GRAPH_TERM_INDEX.")
+        return
+    cursor: str | None = None
+    nodes = 0
+    terms = 0
+    for _page in range(_GRAPH_TERM_INDEX_MAX_PAGES):
+        result = rebuild("rebuild", limit=_GRAPH_TERM_INDEX_PAGE_LIMIT, cursor=cursor)
+        if result is None:
+            log("[graph] Term-index rebuild aborted: no response from cheetah.")
+            return
+        nodes += result.nodes
+        terms += result.terms
+        cursor = result.next_cursor
+        if not cursor or cursor == "*":
+            log(f"[graph] Term index rebuilt: nodes={nodes}, terms={terms}.")
+            return
+    log(
+        f"[graph] Term-index rebuild stopped at the {_GRAPH_TERM_INDEX_MAX_PAGES}-page cap "
+        f"(nodes={nodes}, terms={terms}); rerun to continue from cursor {cursor}."
+    )
 
 
 def _safe_metric(metrics: dict[str, Any], key: str) -> float | None:
@@ -2573,6 +2711,7 @@ def main() -> None:
         token_merge_significance_threshold=merge_significance_threshold,
         token_merge_significance_min_count=merge_significance_min_count,
         token_merge_significance_cap=merge_significance_cap,
+        graph_memory=args.graph_memory,
     )
     cheetah_primary = settings.backend == "cheetah-db" and not settings.cheetah_mirror
     if cheetah_primary and isinstance(engine.hot_path, NullHotPathAdapter):
@@ -2588,6 +2727,7 @@ def main() -> None:
         log(f"[train] Hot-path adapter active -> {describe_adapter()}")
     dims_label = format_context_dimensions(engine.context_dimensions)
     log(f"[train] Context dimensions: {dims_label}")
+    _configure_graph_memory(engine, args)
     context_window_config = _configure_context_windows(engine, args)
     if context_window_config:
         auto_bits = []
@@ -2930,6 +3070,7 @@ def main() -> None:
             if chunk.prediction_records:
                 _train_prediction_tables(engine, chunk.prediction_records, args)
                 _inherit_merged_token_predictions(engine, args)
+                _observe_graph_memory(engine, chunk.prediction_records, args, label=label)
             if resume_state:
                 if label not in resume_completed:
                     resume_completed.add(label)
@@ -2967,6 +3108,7 @@ def main() -> None:
             log(
                 f"[train] Completed ingest: {total_tokens} tokens / {total_windows} n-grams stored in {location}"
             )
+        _rebuild_graph_term_index(engine, args)
         ratio = engine.cheetah_topk_ratio()
         if ratio:
             log(f"[train] cheetah Top-K hit ratio ~ {ratio:.2%}")
