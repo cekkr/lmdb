@@ -65,3 +65,11 @@ python3 src/train.py datasets/emotion_data.json \
 - `--max-json-lines` caps runtime (~5 chunks at 600 lines each) while still producing reliable RSS/latency data.
 - Run this immediately after dependency upgrades or schema tweaks; compare the tokens/s figures with
   the previous measured baseline in [`BENCHMARKS.md`](BENCHMARKS.md).
+
+
+---
+
+```bash
+python3 src/train.py datasets/emotion_data.json --json-chunk-size 500 --eval-pool-size 100 --chunk-eval-percent 0.25 --ngram-order 5 --
+reset
+```
