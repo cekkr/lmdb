@@ -67,9 +67,24 @@ python3 src/train.py datasets/emotion_data.json \
   the previous measured baseline in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 
----
+## Diverse Per-Chunk Emotion Evaluation
+
+Use when each 500-row chunk should produce a small, varied immediate hold-out rather than
+multiple variants of one prompt.
 
 ```bash
-python3 src/train.py datasets/emotion_data.json --json-chunk-size 500 --eval-pool-size 100 --chunk-eval-percent 0.25 --ngram-order 5 --
-reset
+python3 src/train.py datasets/emotion_data.json \
+  --json-chunk-size 500 \
+  --chunk-eval-percent 1 \
+  --eval-variants 1 \
+  --ngram-order 5 \
+  --reset
 ```
+
+- `--chunk-eval-percent` is a percentage, not a fraction: `1` holds out five rows from a
+  500-row chunk. The previous `0.25` held out one row, which the trainer duplicated to reach its
+  two-sample evaluation minimum.
+- `--eval-variants 1` reports one generation per held-out prompt. Omit it only when deliberately
+  comparing multiple decodes of each prompt.
+- `--eval-pool-size` applies to periodic `--eval-interval` probes, not the immediate per-chunk
+  hold-out, so it is intentionally absent from this preset.
