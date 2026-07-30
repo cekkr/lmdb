@@ -101,3 +101,7 @@ python3 src/train.py datasets/emotion_data.json \
   --context-dimensions 3,6,8,10,12
   --reset
 ```
+
+```bash
+PYTHONPATH=src python3 src/run.py --context-dimensions 3,6,8,10,12 --max-response-words 512 --prompt "my prompt"
+```
