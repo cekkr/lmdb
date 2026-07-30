@@ -103,5 +103,5 @@ python3 src/train.py datasets/emotion_data.json \
 ```
 
 ```bash
-PYTHONPATH=src python3 src/run.py --context-dimensions 3,6,8,10,12 --max-response-words 512 --prompt "my prompt"
+PYTHONPATH=src python3 src/run.py --context-dimensions 3,6,8,10,12 --max-response-words 512 --instruction-label "" --prompt "my prompt"
 ```
