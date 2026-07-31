@@ -68,6 +68,10 @@ If the repository was cloned without submodules:
 git submodule update --init --recursive
 ```
 
+The submodule is required to *run* with the Cheetah backend, not only to build the server: the
+Python client library the adapter extends ships with it, in `cheetah-db/binders/python`. Set
+`DBSLM_CHEETAH_BINDER_PATH` if your Cheetah checkout lives somewhere else.
+
 Create the Python environment and install the dependencies:
 
 ```bash
@@ -541,7 +545,13 @@ scripts/start_cheetah_smoke_session.sh
 
 Contributors should read [`AGENTS.md`](AGENTS.md). Generic Cheetah server changes belong in the
 [`cheetah-db`](cheetah-db/) submodule and follow
-[`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+[`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md); so does generic *client* work, which lives in the
+Python binder [`cheetah-db/binders/python/`](cheetah-db/binders/python/) and has its own test
+suite:
+
+```bash
+cd cheetah-db/binders/python && python3 -m unittest discover -s tests -t .
+```
 
 ## Further reading
 

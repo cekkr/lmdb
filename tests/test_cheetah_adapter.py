@@ -21,9 +21,11 @@ class FakeCheetahClient:
         self.storage[key] = payload
         return key, None
 
-    def edit(self, key: int, payload: bytes) -> bool:
+    def edit(self, key: int, payload: bytes) -> tuple[bool, str | None]:
+        # The real client answers `(success, response)`; a bare bool made every
+        # edit look like a transport failure to `_edit_or_reinsert`.
         self.storage[key] = payload
-        return True
+        return True, None
 
     def read(self, key: int) -> bytes | None:
         return self.storage.get(key)
@@ -34,6 +36,34 @@ class FakeCheetahClient:
 
     def pair_get(self, value: bytes) -> int | None:
         return self.pairs.get(value)
+
+
+class BatchingFakeCheetahClient(FakeCheetahClient):
+    """A fake that also spells `PAIR_PUT_BATCH`, as a current server does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[tuple[bytes, bytes]]] = []
+        self.fail_next_batch = False
+
+    def pair_put_batch(
+        self,
+        entries: list[tuple[bytes, bytes]],
+        *,
+        hidden: bool = False,
+        want_keys: bool = False,
+        continue_on_error: bool = False,
+    ) -> list[int | None] | None:
+        self.batches.append(list(entries))
+        if self.fail_next_batch:
+            self.fail_next_batch = False
+            return None
+        assigned: list[int | None] = []
+        for value, payload in entries:
+            key, _ = self.insert(payload)
+            self.pairs[value] = key
+            assigned.append(key)
+        return assigned if want_keys else []
 
 
 class CheetahSerializerTests(unittest.TestCase):
@@ -125,6 +155,62 @@ class CheetahHotPathAdapterTests(unittest.TestCase):
         self.assertEqual(projections[0].context_hash, "__root__")
         self.assertEqual(projections[0].totals, 5)
         self.assertEqual(projections[0].followers, ((7, 3), (8, 2)))
+
+
+class CheetahContinuationBatchTests(unittest.TestCase):
+    """New continuation rows go out as one request per page, verifiably."""
+
+    def setUp(self) -> None:
+        self.client = BatchingFakeCheetahClient()
+        self.adapter = CheetahHotPathAdapter(self.client)
+        self.adapter._pair_batch_size = 3
+
+    def _publish(self, entries: list[tuple[int, int]]) -> None:
+        self.adapter.publish_continuations(entries)
+        self.adapter.flush_pending()
+
+    @staticmethod
+    def _pair_value(token_id: int) -> bytes:
+        return b"cont:" + bytes.fromhex(f"{token_id:08x}")
+
+    def test_new_rows_are_written_in_pages_and_stay_readable(self) -> None:
+        entries = [(token_id, token_id * 10) for token_id in range(1, 8)]
+        self._publish(entries)
+        # Pages are written concurrently, so only their sizes are ordered.
+        self.assertEqual(sorted(len(batch) for batch in self.client.batches), [1, 3, 3])
+        serializer = CheetahSerializer()
+        for token_id, num_contexts in entries:
+            payload = self.client.read(self.client.pairs[self._pair_value(token_id)])
+            record = serializer.decode_continuation(payload)
+            assert record is not None
+            self.assertEqual((record.token_id, record.num_contexts), (token_id, num_contexts))
+
+    def test_assigned_keys_prime_the_cache_so_a_rewrite_edits(self) -> None:
+        self._publish([(1, 10), (2, 20)])
+        before = dict(self.client.pairs)
+        self._publish([(1, 11), (2, 21)])
+        # The second pass found both rows: no new batch, and no rebinding.
+        self.assertEqual(len(self.client.batches), 1)
+        self.assertEqual(self.client.pairs, before)
+        record = CheetahSerializer().decode_continuation(
+            self.client.read(self.client.pairs[self._pair_value(1)])
+        )
+        assert record is not None
+        self.assertEqual(record.num_contexts, 11)
+
+    def test_a_batch_that_did_not_apply_falls_back_to_verified_single_writes(self) -> None:
+        self.client.fail_next_batch = True
+        self._publish([(1, 10), (2, 20)])
+        for token_id in (1, 2):
+            self.assertIn(self._pair_value(token_id), self.client.pairs)
+
+    def test_a_client_without_the_batch_command_still_publishes(self) -> None:
+        client = FakeCheetahClient()
+        adapter = CheetahHotPathAdapter(client)
+        adapter.publish_continuations([(1, 10), (2, 20)])
+        adapter.flush_pending()
+        self.assertIn(self._pair_value(1), client.pairs)
+        self.assertIn(self._pair_value(2), client.pairs)
 
 
 class CheetahClientParsingTests(unittest.TestCase):

@@ -47,7 +47,27 @@
   decoding toward recalled terms, and widens the internal bias/embedding context with the hydrated
   sentences without ever showing them. Opt-in via `DBSLM_GRAPH_MEMORY=1` / `--graph-memory`.
 
+- Moved the generic half of the Cheetah client into the submodule as a Python binder
+  (`cheetah-db/binders/python/`, package `cheetah_db`): protocol codec, destination resolution,
+  socket client and thread-local pool, and the `kv`/`graph`/`jobs`/`predict`/`admin` call layers,
+  plus key primitives, a token vocabulary and a subclassable `CheetahDatabase`. `CheetahClient` in
+  `src/db_slm/adapters/cheetah.py` now extends the binder's client through
+  `src/db_slm/adapters/cheetah_binder.py`, and the commands DB-SLM previously could not speak are
+  available: `PAIR_PUT_BATCH`, `DEL pairs/graph`, `GRAPH_EDGE_GET`/`NEIGHBORS`/`DEGREE`/
+  `NEIGHBOR_TYPES`/`QUERY`, `PREDICT_BACKEND`/`PREDICT_BENCH`, `LOG_FLUSH`, `FILE_CHECKPOINT`,
+  `CLUSTER_STATUS`, `FORK_ASSIGN`. New continuation mirror rows now go out in `PAIR_PUT_BATCH`
+  pages (`CHEETAH_PAIR_BATCH_SIZE`, default 256) with a verified per-row fallback.
+
 ## Active tasks
+- Advance the submodule gitlink: the binder and its documentation are committed in the Cheetah
+  repository first (`cheetah-db/binders/python/`, `AGENTS.md`, `README.md`, `.gitignore`), then this
+  repository records the new commit. Until then a fresh clone of this repository at the recorded
+  gitlink (`8ecdf35`) cannot import `cheetah_db` and the Cheetah adapter will refuse to start.
+- Measure whether the batched continuation write is worth its complexity at scale: record ingest
+  wall time and request counts with `CHEETAH_PAIR_BATCH_SIZE=1` (per-row) against the default on the
+  same corpus, in `studies/BENCHMARKS.md`. Upstream measured 0.94× on 2,000 rows against 256-way
+  concurrent single writes, so the win here is expected to come from request/parse overhead rather
+  than server throughput — and it may be nil.
 - Measure whether graph context memory actually helps: run the emotion corpus with `--graph-memory`
   on and off at the same scale and record quality metrics, decoder latency, and per-chunk graph
   ingest cost in `studies/BENCHMARKS.md`. Tune `DBSLM_GRAPH_BIAS_WEIGHT`,

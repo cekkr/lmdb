@@ -56,7 +56,10 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   become implementation owners or be committed.
 - Keep generic database-server work in the [`cheetah-db`](cheetah-db/) submodule. Commit and test
   the change in the Cheetah repository, then advance this repository's gitlink. Keep only DB-SLM
-  adapters and orchestration in this repository; never re-vendor Cheetah source.
+  adapters and orchestration in this repository; never re-vendor Cheetah source. Generic *client*
+  work belongs there too, in [`cheetah-db/binders/python/`](cheetah-db/binders/python/): a command
+  spelling, a response parser, or a connection concern that is not about DB-SLM goes into the
+  binder, and this repository extends it.
 - Launch every long-running service, smoke train, benchmark, or CI-style workload in `screen`.
   Before launch, inspect `screen -ls` for a lingering session, use an explicit timeout of at most
   30 minutes by default (at most one hour only when justified before launch), and monitor its log
@@ -150,10 +153,21 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   Both paths are covered in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
 - **Cheetah pair registrations are verified and concurrency-safe.**
   [`CheetahHotPathAdapter._register_pair`](src/db_slm/adapters/cheetah.py) retries `PAIR_SET` and
-  confirms with `PAIR_GET`. The submodule gitlink currently points to repair commit `6866be9`, whose
-  atomic high-water mark and serialized pair mutations prevent equal-size inserts and
-  shared-prefix writes from overwriting each other. Before advancing the gitlink, run the focused
+  confirms with `PAIR_GET`. The committed gitlink points to `8ecdf35`, a descendant of repair commit
+  `6866be9`, whose atomic high-water mark and serialized pair mutations prevent equal-size inserts
+  and shared-prefix writes from overwriting each other. Before advancing the gitlink, run the focused
   Cheetah regression tests listed in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+- **The batched pair write is not a transaction.**
+  [`CheetahClient.pair_put_batch`](src/db_slm/adapters/cheetah.py) sends `PAIR_PUT_BATCH`, which
+  stores and binds a whole page in one request instead of two per row, and reports its own
+  `requested`/`applied`/`failed` accounting. Items are independent and applied in order, so a page
+  that did not fully apply leaves the earlier rows written:
+  [`CheetahHotPathAdapter._insert_batch`](src/db_slm/adapters/cheetah.py) must fall back to the
+  verified single-row `_insert` path rather than assume the namespace is complete, and it primes the
+  key cache from the returned absolute keys so the next publish edits instead of rebinding. Payloads
+  keep the same base64 transport as `insert`, so a batched row reads back through `read` and
+  `decode_reduced_payload` like any other. A client or server without the command falls back to the
+  per-row path; `CHEETAH_PAIR_BATCH_SIZE` pages the request under the server's 10,000-item cap.
 - **Relational ingest counts refresh Cheetah before smoothing.**
   [`NGramStore.ingest`](src/db_slm/level1.py) writes the relational working counts, then
   [`MKNSmoother._collect_context_followers`](src/db_slm/level1.py) selects those current rows and
@@ -722,22 +736,49 @@ surface.
 - **Boundary:** the concrete Cheetah implementation is imported directly from
   [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py).
 
+### [`src/db_slm/adapters/cheetah_binder.py`](src/db_slm/adapters/cheetah_binder.py)
+
+Import bridge to the generic Cheetah client in
+[`cheetah-db/binders/python`](cheetah-db/binders/python/). It puts the submodule directory on
+`sys.path` once and re-exports the binder's client, error types, thread-local pool, codec and the
+`kv`/`graph`/`jobs`/`predict`/`admin` call layers.
+
+- **Boundary:** the protocol half — command encoding, response parsing, socket lifecycle, generic
+  command spellings — is generic Cheetah work and is owned by the submodule. Never re-vendor it
+  here; extend the binder in the Cheetah repository and advance the gitlink.
+- **Configuration:** `DBSLM_CHEETAH_BINDER_PATH` overrides the location for a checkout that keeps
+  the Cheetah repository elsewhere. A missing submodule raises an `ImportError` naming
+  `git submodule update --init --recursive`.
+
 ### [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py)
 
-Owns the Cheetah TCP client, text protocol parsing, DB-SLM fixed payload serialization,
-thread-local client pool, namespace/cache conventions, async publication, reducer pagination, and
-prediction commands.
+Owns the DB-SLM dialect on top of the binder: fixed payload serialization, namespace/cache
+conventions, async publication, reducer pagination with its legacy fallback, prediction commands,
+and the graph projections in [`cheetah_types.py`](src/db_slm/cheetah_types.py).
 
-- **Key classes:** `CheetahClient`; `CheetahSerializer`; `_ThreadLocalCheetahClientPool`;
-  `CheetahHotPathAdapter`; `CheetahError`; `CheetahFatalError`.
+- **Key classes:** `CheetahClient` (extends the binder's `CheetahClient`); `CheetahSerializer`;
+  `_ThreadLocalCheetahClientPool` (extends the binder's `ThreadLocalClientPool`);
+  `CheetahHotPathAdapter`; `CheetahFatalError`. `CheetahError` is the binder's class, re-exported so
+  `except CheetahError` still spans both layers.
 - **Key paths:** `pair_scan`; `pair_reduce`; `decode_reduced_payload`; `predict_*`; `graph_*`;
-  `_register_pair`; `_edit_or_reinsert`; `build_cheetah_adapter`.
+  `pair_put_batch`; `_register_pair`; `_publish_new_rows`/`_insert_batch`; `_edit_or_reinsert`;
+  `build_cheetah_adapter`.
+- **Delegated commands:** `pair_put_batch`, `pair_purge_prefix` (`DEL pairs`, with `payloads=0`),
+  `graph_node_delete`/`graph_edge_delete`/`graph_edge_get`/`graph_degree`/`graph_neighbors`/
+  `graph_neighbor_types`/`graph_query`, `predict_backend`/`predict_bench`, `log_flush`,
+  `file_checkpoint`, `cluster_status`, `fork_assign`, `supports_job_api`. They spell the command
+  through the binder and keep this file's house style: a failure is `None`/empty plus a log line,
+  not an exception through a hot path. The binder's `execute`/`execute_kv`/`send` remain available
+  for one-off commands that do not deserve a method.
 - **Graph encoding helpers:** `_graph_token`; `_graph_encode_json`; `_graph_encode_seeds`;
   `_graph_format_precision`; `_graph_association_from_payload`; `_parse_graph_recall_response`.
 - **Tests:** [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) covers serialization,
   idempotent publish/fetch, response parsing, timeout recovery, canonical job flow, legacy fallback,
-  and storage transport decoding.
-- **Common mistakes:** `0.0.0.0` is a listen address, not a client destination; namespace values are
+  storage transport decoding, and the batched continuation write with its fallbacks. The binder's
+  own suite ([`cheetah-db/binders/python/tests/`](cheetah-db/binders/python/tests/)) covers the
+  generic codec and call shapes, including a live server behind `CHEETAH_INTEGRATION=1`.
+- **Common mistakes:** `0.0.0.0` is a listen address, not a client destination (the binder's `hosts`
+  module resolves it, so do not reimplement the WSL/loopback candidates here); namespace values are
   bytes; do not share one socket across worker threads; flush count mirrors before reducer reads;
   fatal adapter disable must remain visible.
 
@@ -1046,13 +1087,19 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 - **Behavior:** per-thread clients publish/fetch Level 1 data, page namespace scans, execute reducers
   through jobs, inspect system state, flush asynchronous mirror writes, and train/query/inherit
   prediction entries. MKN rebuilds compare current relational ingest counts with Cheetah and publish
-  only changed follower sets before calculating probabilities.
-- **Flow and owners:** [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) → Cheetah
-  TCP command registry and reducers documented in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
+  only changed follower sets before calculating probabilities. New continuation rows go out through
+  `PAIR_PUT_BATCH` — one request per page instead of two per token — with a verified per-row
+  fallback.
+- **Flow and owners:** [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) on top of
+  the generic binder [`cheetah-db/binders/python/`](cheetah-db/binders/python/) (imported through
+  [`adapters/cheetah_binder.py`](src/db_slm/adapters/cheetah_binder.py)) → Cheetah TCP command
+  registry and reducers documented in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
 - **Constraints:** use a concrete client host, trusted network, named database isolation, bounded
-  idle grace, and current payload serializers.
-- **Tests and gaps:** Python adapter regressions plus extensive submodule tests; Python live-service
-  integration is manual/smoke-only.
+  idle grace, and current payload serializers. The initialized submodule is now an import-time
+  requirement of the Cheetah adapter, not only a build-time one.
+- **Tests and gaps:** Python adapter regressions, the binder's own suite (unit plus a gated live
+  round-trip), and extensive submodule tests; DB-SLM-level live-service integration is still
+  manual/smoke-only.
 
 ### Graph context memory — Shipped, opt-in and unmeasured
 
@@ -1256,9 +1303,11 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 ### Pitfall: modifying generic Cheetah behavior in the parent repository
 
 - **Symptom / wrong assumption:** a server fix is copied into Python or a vendored Go file, leaving
-  the upstream submodule and gitlink inconsistent.
+  the upstream submodule and gitlink inconsistent. The client-side version of the same mistake is
+  spelling a new command inside [`adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) when it has
+  no DB-SLM content, which leaves the Node and Python binders describing different protocols.
 - **Cause and invariant:** `cheetah-db/` is a separate Git repository and the owner of generic
-  storage/protocol behavior.
+  storage/protocol behavior — including the client binders that spell it.
 - **Risk area:** [`.gitmodules`](.gitmodules), [`cheetah-db/`](cheetah-db/), and the Python adapter.
 - **Safe pattern / regression check:** follow [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md), commit
   there, run its Go checks, then update the parent gitlink and Python compatibility tests.
@@ -1296,7 +1345,8 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 | Dataset mapping/config surface | [`DatasetConfig`](src/db_slm/dataset_config.py) plus [`datasets/`](datasets/) |
 | Token candidate scoring and trace API | [`src/db_slm/scoring.py`](src/db_slm/scoring.py) |
 | Hot-path Python protocol | [`HotPathAdapter`](src/db_slm/adapters/base.py) |
-| Cheetah TCP client, codecs, namespaces | [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) |
+| Generic Cheetah protocol client (codec, socket, KV/graph/job/predict/admin calls) | [`cheetah-db/binders/python/cheetah_db/`](cheetah-db/binders/python/cheetah_db/) via [`adapters/cheetah_binder.py`](src/db_slm/adapters/cheetah_binder.py) |
+| DB-SLM Cheetah dialect: payload codecs, namespaces, projections | [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) |
 | Graph context memory conventions (ids, edges, seeds, recall projection) | [`src/db_slm/graph_memory.py`](src/db_slm/graph_memory.py) |
 | Cheetah server command registry and on-disk formats | [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
 | Smoke matrix | [`Makefile`](Makefile) and [`scripts/smoke_train.py`](scripts/smoke_train.py) |
@@ -1414,6 +1464,8 @@ checklist; distribution is currently source plus the separately built Cheetah bi
 | Dependency records stay out of generation text and legacy artifacts are rejected | [`tests/test_train_monitor.py`](tests/test_train_monitor.py) + [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py) |
 | Current ingest counts replace stale Cheetah mirrors before smoothing | [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) |
 | Paraphraser guard vs rewrite policy | [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py) + [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl) |
+| Batched continuation writes: paging, key-cache priming, partial-batch fallback | `CheetahContinuationBatchTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Generic Cheetah codec, client, KV/graph/job call shapes (and a live server) | [`cheetah-db/binders/python/tests/`](cheetah-db/binders/python/tests/) — `python3 -m unittest discover -s tests -t .`, `CHEETAH_INTEGRATION=1` for the live pass |
 | Cheetah storage concurrency, trie, reducers, jobs, prediction tables, lifecycle, and formats | Test map in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
 
 Known Python test gaps: SQLite schema upgrades/transactions; tokenizer and merging; MKN math and

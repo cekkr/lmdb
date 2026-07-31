@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
-import ipaddress
 import json
 import logging
 import os
-import socket
 import struct
 import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Iterable, Sequence, NoReturn
 
@@ -51,10 +48,21 @@ from ..hashing import hash_tokens
 
 from ..settings import DBSLMSettings
 from .base import HotPathAdapter, NullHotPathAdapter
+from .cheetah_binder import (
+    BinderCheetahClient,
+    CheetahError,
+    ThreadLocalClientPool,
+    admin as binder_admin,
+    graph as binder_graph,
+    jobs as binder_jobs,
+    kv as binder_kv,
+    predict as binder_predict,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_REDUCE_PAGE_SIZE = CHEETAH_DEFAULT_REDUCE_PAGE_SIZE
+PAIR_PUT_BATCH_MAX_ITEMS = binder_kv.PAIR_PUT_BATCH_MAX_ITEMS
 PAIR_SCAN_MAX_LIMIT = CHEETAH_PAIR_SCAN_MAX_LIMIT
 PAIR_SCAN_MIN_LIMIT = CHEETAH_PAIR_SCAN_MIN_LIMIT
 READLINE_IDLE_GRACE_SECONDS = 30.0
@@ -62,67 +70,9 @@ _REDUCE_LIMIT_CACHE_TTL_SECONDS = 30.0
 _CONTEXT_MATRIX_TABLE = "context_matrices"
 
 
-def _detect_wsl() -> bool:
-    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
-        return True
-    for probe in ("/proc/sys/kernel/osrelease", "/proc/version"):
-        try:
-            contents = Path(probe).read_text(encoding="utf-8").lower()
-        except OSError:
-            continue
-        if "microsoft" in contents or "wsl" in contents:
-            return True
-    return False
-
-
-def _detect_wsl_host_ip() -> str | None:
-    resolv = Path("/etc/resolv.conf")
-    if not resolv.exists():
-        return None
-    try:
-        for raw_line in resolv.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if not line.startswith("nameserver"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            candidate = parts[1]
-            try:
-                ip = ipaddress.ip_address(candidate)
-            except ValueError:
-                continue
-            if ip.version == 4:
-                return candidate
-    except OSError:
-        return None
-    return None
-
-
-def _is_loopback_host(host: str) -> bool:
-    normalized = host.strip().lower()
-    if normalized in {"localhost", "loopback"}:
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
-
-
-def _is_unspecified_host(host: str) -> bool:
-    normalized = host.strip().lower()
-    if normalized in {"0.0.0.0", "::", "::0"}:
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_unspecified
-    except ValueError:
-        return False
-
-
-_RUNNING_IN_WSL = _detect_wsl()
-_WSL_HOST_IP = _detect_wsl_host_ip() if _RUNNING_IN_WSL else None
+# Destination resolution (`0.0.0.0` is a listen address, not a target; a WSL
+# client may have to reach the Windows host) lives in the binder's `hosts`
+# module, which `BinderCheetahClient` consults on connect.
 
 
 # --------------------------------------------------------------------------- #
@@ -250,16 +200,20 @@ def _graph_association_from_payload(entry: dict) -> GraphAssociation:
     )
 
 
-class CheetahError(RuntimeError):
-    """Raised when the cheetah-db bridge encounters a fatal error."""
-
-
 class CheetahFatalError(CheetahError):
     """Raised when the cheetah hot-path adapter becomes unusable."""
 
 
-class CheetahClient:
-    """Minimal TCP client for cheetah-db's newline-delimited protocol."""
+class CheetahClient(BinderCheetahClient):
+    """The DB-SLM dialect on top of the generic Cheetah client.
+
+    The transport, the command/response codec and the generic command surface
+    come from the binder in ``cheetah-db/binders/python``
+    (:class:`~cheetah_db.client.CheetahClient`). What stays here is what only
+    DB-SLM needs: base64-wrapped fixed-size payloads, the reducer job flow with
+    its legacy fallback, and the projections in
+    :mod:`db_slm.cheetah_types`.
+    """
 
     def __init__(
         self,
@@ -270,19 +224,13 @@ class CheetahClient:
         timeout: float = 1.0,
         idle_grace: float | None = None,
     ) -> None:
-        self.host = host
-        self.port = port
-        self.database = database
-        self.timeout = timeout
-        if idle_grace is not None and idle_grace > 0:
-            self._readline_idle_grace = idle_grace
-        else:
-            self._readline_idle_grace = max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS)
-        self._host_candidates = self._build_host_candidates(host)
-        self._active_host: str | None = None
-        self._last_errors: list[str] = []
-        self._sock: socket.socket | None = None
-        self._lock = threading.Lock()
+        super().__init__(
+            host,
+            port,
+            database=database,
+            timeout=timeout,
+            idle_grace=idle_grace if (idle_grace and idle_grace > 0) else max(timeout * 30.0, READLINE_IDLE_GRACE_SECONDS),
+        )
         async_raw = os.environ.get("CHEETAH_REDUCE_ASYNC", "1").strip().lower()
         self._async_reducers = async_raw not in {"0", "false", "no", "off"}
         poll_raw = os.environ.get("CHEETAH_REDUCE_POLL_INTERVAL_SECONDS", "").strip()
@@ -296,34 +244,12 @@ class CheetahClient:
         self._async_inherit = async_inherit_raw not in {"0", "false", "no", "off"}
 
     # ------------------------------------------------------------------ #
-    # Public helpers
+    # DB-SLM value layer
+    #
+    # Payloads are fixed-size binary records, so every value crosses the text
+    # protocol base64-wrapped. `decode_reduced_payload` is the matching unwrap
+    # on the reducer side.
     # ------------------------------------------------------------------ #
-    def healthy(self) -> bool:
-        return self._sock is not None
-
-    def set_idle_grace(self, seconds: float) -> None:
-        """Override the inactivity grace period used while reading responses."""
-        if seconds > 0:
-            self._readline_idle_grace = seconds
-
-    def describe_targets(self) -> str:
-        if not self._host_candidates:
-            return "<none>"
-        return ", ".join(f"{host}:{self.port}" for host in self._host_candidates)
-
-    def describe_failures(self) -> str:
-        if not self._last_errors:
-            return "no connection errors recorded"
-        return "; ".join(self._last_errors)
-
-    def connect(self) -> bool:
-        with self._lock:
-            return self._ensure_connection()
-
-    def close(self) -> None:
-        with self._lock:
-            self._close_socket()
-
     def insert(self, payload: bytes) -> tuple[int | None, str | None]:
         encoded = self._encode_value(payload)
         response = self._command(f"INSERT:{len(encoded)} {encoded}")
@@ -1074,6 +1000,242 @@ class CheetahClient:
             next_cursor=fields.get("next_cursor", ""),
         )
 
+    # ------------------------------------------------------------------ #
+    # Commands delegated to the binder
+    #
+    # These have no DB-SLM projection: the binder already spells the command
+    # and decodes the answer, so the only thing added here is the house style
+    # of the rest of this client — a failure is a `None`/empty answer plus a
+    # log line, not an exception through a hot path. The generic `execute`,
+    # `execute_kv` and `send` from the binder stay available for one-off
+    # commands that do not deserve a method.
+    # ------------------------------------------------------------------ #
+    def _binder_call(self, what: str, call: Callable[[], object], default: object = None) -> object:
+        try:
+            return call()
+        except CheetahError as exc:
+            logger.debug("cheetah %s failed: %s", what, exc)
+            return default
+
+    def pair_put_batch(
+        self,
+        entries: Sequence[tuple[bytes, bytes]],
+        *,
+        hidden: bool = False,
+        want_keys: bool = False,
+        continue_on_error: bool = False,
+    ) -> list[int | None] | None:
+        """Store and bind many payloads in one request (``PAIR_PUT_BATCH``).
+
+        The DB-SLM transport is preserved: each payload is base64-wrapped
+        exactly as :meth:`insert` wraps it, so a row written through the batch
+        reads back through :meth:`read` and decodes through
+        :meth:`decode_reduced_payload` like any other.
+
+        Returns the assigned absolute keys when ``want_keys`` is set, an empty
+        list otherwise, and ``None`` when the batch did not fully apply — the
+        caller must fall back rather than assume the rows exist, because this
+        is not a transaction.
+        """
+        if not entries:
+            return []
+        prepared = [(value, self._encode_value(payload)) for value, payload in entries]
+        result = self._binder_call(
+            f"PAIR_PUT_BATCH of {len(prepared)}",
+            lambda: binder_kv.put_values_batch(
+                self,
+                prepared,
+                hidden=hidden,
+                want_keys=want_keys,
+                continue_on_error=continue_on_error,
+            ),
+            default=None,
+        )
+        return result  # type: ignore[return-value]
+
+    def pair_purge_prefix(self, prefix: bytes, *, limit: int = 0, payloads: bool = True) -> int:
+        """``DEL pairs prefix=…`` — the micro-command form, with ``payloads=0``.
+
+        ``payloads=False`` unlinks the names and leaves the values readable by
+        absolute key, which :meth:`pair_purge` (the historical ``PAIR_PURGE``)
+        cannot express.
+        """
+        return int(
+            self._binder_call(
+                "DEL pairs prefix",
+                lambda: binder_kv.pair_purge(self, prefix, limit=limit, payloads=payloads),
+                default=0,
+            )
+            or 0
+        )
+
+    def graph_node_delete(self, node_id: str, *, cascade: bool = False) -> bool:
+        """Forget a node. Without ``cascade`` its incident edges are left dangling."""
+        return bool(
+            self._binder_call(
+                f"DEL graph node={node_id}",
+                lambda: binder_graph.delete_node(self, node_id, cascade=cascade),
+                default=False,
+            )
+        )
+
+    def graph_edge_delete(
+        self,
+        from_id: str,
+        to_id: str,
+        *,
+        edge_type: str | None = None,
+        directed: bool | None = None,
+    ) -> bool:
+        return bool(
+            self._binder_call(
+                f"DEL graph {from_id}->{to_id}",
+                lambda: binder_graph.delete_edge(
+                    self, from_id=from_id, to_id=to_id, edge_type=edge_type, directed=directed
+                ),
+                default=False,
+            )
+        )
+
+    def graph_edge_get(
+        self,
+        from_id: str,
+        to_id: str,
+        *,
+        edge_type: str | None = None,
+        directed: bool | None = None,
+    ) -> dict | None:
+        record = self._binder_call(
+            f"GRAPH_EDGE_GET {from_id}->{to_id}",
+            lambda: binder_graph.get_edge(
+                self, from_id=from_id, to_id=to_id, edge_type=edge_type, directed=directed
+            ),
+        )
+        return record if isinstance(record, dict) else None
+
+    def graph_degree(
+        self,
+        node_id: str,
+        *,
+        direction: str = "out",
+        edge_type: str | None = None,
+        weighted: bool = False,
+    ) -> int:
+        """How many edges a node carries — the cheapest graph question there is.
+
+        No edge record is hydrated, which is what makes it usable as a hub test
+        before deciding whether a seed is worth recalling on.
+        """
+        result = self._binder_call(
+            f"GRAPH_DEGREE {node_id}",
+            lambda: binder_graph.degree(
+                self, node_id, direction=direction, edge_type=edge_type, weighted=weighted
+            ),
+            default={"degree": 0},
+        )
+        return int((result or {}).get("degree", 0))  # type: ignore[union-attr]
+
+    def graph_neighbors(
+        self,
+        node_id: str,
+        *,
+        direction: str = "out",
+        edge_type: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> tuple[list[dict], str | None]:
+        result = self._binder_call(
+            f"GRAPH_NEIGHBORS {node_id}",
+            lambda: binder_graph.neighbors(
+                self,
+                node_id,
+                direction=direction,
+                edge_type=edge_type,
+                limit=limit,
+                cursor=cursor,
+            ),
+            default=([], None),
+        )
+        edges, next_cursor = result  # type: ignore[misc]
+        return [edge for edge in edges if isinstance(edge, dict)], next_cursor
+
+    def graph_neighbor_types(
+        self,
+        node_id: str,
+        *,
+        direction: str = "out",
+        limit: int | None = None,
+        weighted: bool = False,
+    ) -> list[dict]:
+        result = self._binder_call(
+            f"GRAPH_NEIGHBOR_TYPES {node_id}",
+            lambda: binder_graph.neighbor_types(
+                self, node_id, direction=direction, limit=limit, weighted=weighted
+            ),
+            default=([], None),
+        )
+        entries, _cursor = result  # type: ignore[misc]
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def graph_query(self, clause: str) -> dict | None:
+        """``GRAPH_QUERY`` — the clause dialect, passed through to the server."""
+        result = self._binder_call(f"GRAPH_QUERY {clause}", lambda: binder_graph.query(self, clause))
+        return result if isinstance(result, dict) else None
+
+    def predict_backend(self, *, mode: str | None = None, table: str | None = None) -> str | None:
+        """Read or switch a prediction table's merger. ``gpu`` is CPU fan-out."""
+        result = self._binder_call(
+            "PREDICT_BACKEND", lambda: binder_predict.backend(self, mode=mode, table=table)
+        )
+        return None if not isinstance(result, dict) else result.get("backend")
+
+    def predict_bench(self, *, samples: int, window: int, table: str | None = None) -> dict | None:
+        result = self._binder_call(
+            "PREDICT_BENCH",
+            lambda: binder_predict.bench(self, samples=samples, window=window, table=table),
+        )
+        return None if not isinstance(result, dict) else dict(result.get("fields") or {})
+
+    def log_flush(self, limit: int = 0) -> list[str]:
+        """Dump **and clear** the server's in-memory log ring. Keep one flusher."""
+        entries = self._binder_call("LOG_FLUSH", lambda: binder_admin.log_flush(self, limit), default=[])
+        return list(entries or ())  # type: ignore[arg-type]
+
+    def file_checkpoint(
+        self, *, idle: str | None = None, drop_cache: bool = False, close_handles: bool = False
+    ) -> int:
+        """Flush the managed-file layer now instead of at shutdown."""
+        return int(
+            self._binder_call(
+                "FILE_CHECKPOINT",
+                lambda: binder_admin.file_checkpoint(
+                    self, idle=idle, drop_cache=drop_cache, close_handles=close_handles
+                ),
+                default=0,
+            )
+            or 0
+        )
+
+    def cluster_status(self) -> dict | None:
+        result = self._binder_call("CLUSTER_STATUS", lambda: binder_admin.cluster_status(self))
+        return None if not isinstance(result, dict) else dict(result.get("fields") or {})
+
+    def fork_assign(self, prefix: bytes | None = None) -> dict | None:
+        result = self._binder_call("FORK_ASSIGN", lambda: binder_admin.fork_assign(self, prefix))
+        if not isinstance(result, dict):
+            return None
+        return {"fork_id": result.get("fork_id"), "nodes": result.get("nodes") or []}
+
+    def supports_job_api(self) -> bool:
+        """Whether this server knows the ``JOB`` micro-command.
+
+        Cached after the first probe: it is a property of the server build, and
+        the reducer path already discovers it lazily on its first submit.
+        """
+        if self._job_api is None:
+            self._job_api = binder_jobs.supports_job_api(self)
+        return bool(self._job_api)
+
     @classmethod
     def _decode_graph_payload(cls, response: str) -> object | None:
         """Decode the base64 JSON carried by ``payload=`` on a graph response."""
@@ -1166,7 +1328,10 @@ class CheetahClient:
         return (response is not None and response.startswith("SUCCESS")), response
 
     # ------------------------------------------------------------------ #
-    # Low-level protocol management
+    # DB-SLM payload transport
+    #
+    # The socket, the reconnect and the response codec belong to the binder's
+    # client; only the base64 wrapping of fixed-size binary payloads is ours.
     # ------------------------------------------------------------------ #
     def _encode_value(self, payload: bytes) -> str:
         return base64.b64encode(payload).decode("ascii")
@@ -1183,115 +1348,6 @@ class CheetahClient:
             return base64.b64decode(payload, validate=True)
         except (ValueError, binascii.Error):
             return None
-
-    def _command(self, text: str) -> str | None:
-        line = (text.strip() + "\n").encode("utf-8")
-        with self._lock:
-            if not self._ensure_connection():
-                return None
-            assert self._sock is not None
-            try:
-                self._sock.sendall(line)
-                return self._readline()
-            except OSError as exc:
-                logger.debug("cheetah command failed (%s), reconnecting...", exc)
-                self._close_socket()
-                if not self._ensure_connection():
-                    return None
-                self._sock.sendall(line)
-                return self._readline()
-
-    def _ensure_connection(self) -> bool:
-        if self._sock:
-            return True
-        errors: list[str] = []
-        for host in self._host_candidates:
-            try:
-                sock = socket.create_connection((host, self.port), self.timeout)
-                sock.settimeout(self.timeout)
-            except OSError as exc:
-                logger.debug("Unable to reach cheetah-db at %s:%s (%s)", host, self.port, exc)
-                errors.append(f"{host}:{self.port} -> {exc.__class__.__name__}: {exc}")
-                continue
-            self._sock = sock
-            self._active_host = host
-            if self.database and self.database != "default":
-                response = self._command_unlocked(f"DATABASE {self.database}")
-                if not response or not response.startswith("SUCCESS"):
-                    logger.debug(
-                        "Failed to switch cheetah database on %s:%s: %s", host, self.port, response
-                    )
-                    self._close_socket()
-                    errors.append(
-                        f"{host}:{self.port} -> DATABASE {self.database} failed ({response})"
-                    )
-                    continue
-            self._last_errors = []
-            return True
-        logger.debug("Unable to reach cheetah-db hosts (%s)", self.describe_targets())
-        self._last_errors = errors or ["no cheetah hosts configured"]
-        return False
-
-    def _command_unlocked(self, text: str) -> str | None:
-        line = (text.strip() + "\n").encode("utf-8")
-        if not self._sock:
-            return None
-        try:
-            self._sock.sendall(line)
-            return self._readline()
-        except OSError as exc:
-            logger.debug("cheetah command failed (%s) before lock acquisition", exc)
-            self._close_socket()
-            return None
-
-    def _readline(self) -> str | None:
-        if not self._sock:
-            return None
-        chunks: list[bytes] = []
-        idle_deadline = time.monotonic() + self._readline_idle_grace
-        while True:
-            try:
-                data = self._sock.recv(1)
-            except socket.timeout:
-                if time.monotonic() >= idle_deadline:
-                    logger.warning(
-                        "cheetah response timed out after %.1fs of inactivity",
-                        self._readline_idle_grace,
-                    )
-                    return None
-                continue
-            if not data:
-                self._close_socket()
-                return None
-            if data == b"\n":
-                break
-            if data != b"\r":
-                chunks.append(data)
-            idle_deadline = time.monotonic() + self._readline_idle_grace
-        return b"".join(chunks).decode("utf-8", "replace")
-
-    def _close_socket(self) -> None:
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-        self._active_host = None
-
-    def _build_host_candidates(self, host: str) -> list[str]:
-        host = host.strip()
-        hosts: list[str] = []
-        if _is_unspecified_host(host):
-            hosts.append("127.0.0.1")
-            if _RUNNING_IN_WSL and _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
-                hosts.append(_WSL_HOST_IP)
-        else:
-            hosts.append(host)
-            if _RUNNING_IN_WSL and _is_loopback_host(host):
-                if _WSL_HOST_IP and _WSL_HOST_IP not in hosts:
-                    hosts.append(_WSL_HOST_IP)
-        return hosts
 
     @staticmethod
     def _parse_key_response(response: str | None) -> int | None:
@@ -1925,70 +1981,13 @@ class CheetahSerializer:
         return ContinuationPayload(token_id=token_id, num_contexts=num_contexts)
 
 
-class _ThreadLocalCheetahClientPool:
-    """Creates or reuses one cheetah-db client per thread."""
+class _ThreadLocalCheetahClientPool(ThreadLocalClientPool):
+    """One cheetah-db client per thread.
 
-    def __init__(
-        self,
-        factory: Callable[[], CheetahClient],
-        *,
-        warm_client: CheetahClient | None = None,
-        description: str | None = None,
-    ) -> None:
-        self._factory = factory
-        self._local = threading.local()
-        self._lock = threading.Lock()
-        self._clients: list[CheetahClient] = []
-        self._description = description
-        if warm_client is not None:
-            self._local.client = warm_client
-            self._register_client(warm_client)
-
-    def acquire(self) -> CheetahClient:
-        client = getattr(self._local, "client", None)
-        if client is not None:
-            return client
-        client = self._factory()
-        connect_fn = getattr(client, "connect", None)
-        if callable(connect_fn):
-            connected = connect_fn()
-            if not connected:
-                target = getattr(client, "describe_targets", lambda: "<unknown>")()
-                raise CheetahError(f"cheetah hot-path connection failed ({target})")
-        self._local.client = client
-        self._register_client(client)
-        return client
-
-    def describe(self) -> str:
-        if self._description:
-            return self._description
-        with self._lock:
-            if self._clients:
-                client = self._clients[0]
-                host = getattr(client, "host", "<unknown>")
-                port = getattr(client, "port", "<unknown>")
-                database = getattr(client, "database", "<unknown>")
-                return f"cheetah-db://{host}:{port}/{database}"
-        return "<unknown>"
-
-    def close_all(self) -> None:
-        with self._lock:
-            clients = list(self._clients)
-            self._clients.clear()
-        for client in clients:
-            try:
-                client.close()
-            except Exception:
-                continue
-
-    def _register_client(self, client: CheetahClient) -> None:
-        with self._lock:
-            self._clients.append(client)
-            if not self._description:
-                host = getattr(client, "host", "<unknown>")
-                port = getattr(client, "port", "<unknown>")
-                database = getattr(client, "database", "<unknown>")
-                self._description = f"cheetah-db://{host}:{port}/{database}"
+    The behavior is generic and lives in the binder
+    (:class:`~cheetah_db.client.ThreadLocalClientPool`); the name is kept here
+    because it is the adapter's own vocabulary and appears in the handbook.
+    """
 
 
 class CheetahHotPathAdapter(HotPathAdapter):
@@ -2044,6 +2043,14 @@ class CheetahHotPathAdapter(HotPathAdapter):
             )
         except ValueError:
             self._pair_register_backoff = 0.25
+        batch_raw = os.environ.get("CHEETAH_PAIR_BATCH_SIZE", "").strip()
+        try:
+            parsed_batch = int(batch_raw) if batch_raw else 256
+        except ValueError:
+            parsed_batch = 256
+        # The server refuses more than 10,000 items per request (pair_batch.go);
+        # a few hundred already fill the connection.
+        self._pair_batch_size = max(1, min(parsed_batch, PAIR_PUT_BATCH_MAX_ITEMS))
         reducer_retry_raw = os.environ.get("CHEETAH_REDUCER_RETRY_ATTEMPTS", "").strip()
         try:
             parsed_reducer_retry = int(reducer_retry_raw) if reducer_retry_raw else 3
@@ -2151,18 +2158,25 @@ class CheetahHotPathAdapter(HotPathAdapter):
             self._disable(exc)
 
     def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
+        """Mirror per-token continuation counts.
+
+        Unlike the other publish paths this one is called with a whole slice of
+        the vocabulary at once, so the new rows are written through
+        ``PAIR_PUT_BATCH`` — one request per page instead of two per token.
+        Rows that already exist still take the edit path: the batch command
+        only ever creates.
+        """
         if not self._enabled or not entries:
             return
         namespace = "cont"
+        fresh: list[tuple[str, bytes]] = []
         for token_id, num_contexts in entries:
             identifier = f"{int(token_id) & 0xFFFFFFFF:08x}"
             payload = self._serializer.encode_continuation(token_id, num_contexts)
             try:
                 key = self._lookup_key(namespace, context_hash=identifier)
                 if key is None:
-                    self._submit_async(
-                        lambda identifier=identifier, payload=payload: self._insert(namespace, identifier, payload)
-                    )
+                    fresh.append((identifier, payload))
                 else:
                     self._submit_async(
                         lambda key=key, identifier=identifier, payload=payload: self._edit_or_reinsert(
@@ -2175,6 +2189,12 @@ class CheetahHotPathAdapter(HotPathAdapter):
             except CheetahError as exc:
                 self._disable(exc)
                 return
+        if not fresh:
+            return
+        try:
+            self._publish_new_rows(namespace, fresh)
+        except CheetahError as exc:
+            self._disable(exc)
 
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         if not self._enabled:
@@ -2985,6 +3005,58 @@ class CheetahHotPathAdapter(HotPathAdapter):
             last_response,
         )
         raise CheetahError("failed to register cheetah pair mapping")
+
+    def _publish_new_rows(self, namespace: str, rows: Sequence[tuple[str, bytes]]) -> None:
+        """Create several rows, batching the store+bind when the server can.
+
+        A server without ``PAIR_PUT_BATCH`` (or a client stub that does not
+        spell it) falls back to the per-row path, which is the same write in
+        2N requests instead of one — slower, never different.
+        """
+        batch = getattr(self._client, "pair_put_batch", None)
+        if not callable(batch) or len(rows) < 2:
+            for identifier, payload in rows:
+                self._submit_async(
+                    lambda identifier=identifier, payload=payload: self._insert(
+                        namespace, identifier, payload
+                    )
+                )
+            return
+        size = self._pair_batch_size
+        for start in range(0, len(rows), size):
+            page = list(rows[start : start + size])
+            self._submit_async(lambda page=page: self._insert_batch(namespace, page))
+
+    def _insert_batch(self, namespace: str, page: Sequence[tuple[str, bytes]]) -> None:
+        """One ``PAIR_PUT_BATCH`` for a page, with a verified per-row fallback.
+
+        The batch is not a transaction and reports its own accounting, so a
+        page that did not fully apply is retried through ``_insert``, which
+        confirms each binding with ``PAIR_GET``. Redoing an applied row is
+        harmless (the name is rebound to a fresh value); leaving a hole in the
+        namespace is not.
+        """
+        entries: list[tuple[bytes, bytes]] = []
+        for identifier, payload in page:
+            value = self._pair_value(namespace, context_hash=identifier)
+            if value is None:
+                raise CheetahError(f"cannot build a cheetah pair value for {namespace}:{identifier}")
+            entries.append((value, payload))
+        assigned = self._client.pair_put_batch(entries, want_keys=True)
+        if assigned is None or len(assigned) != len(page):
+            logger.warning(
+                "cheetah pair_put_batch did not fully apply %d %s row(s); falling back to single writes",
+                len(page),
+                namespace,
+            )
+            for identifier, payload in page:
+                self._insert(namespace, identifier, payload)
+            return
+        for (identifier, payload), key in zip(page, assigned):
+            if key is None:
+                self._insert(namespace, identifier, payload)
+            else:
+                self._set_cache(namespace, key, context_hash=identifier)
 
     def _register_vector_alias(self, key: int, token_ids: Sequence[int]) -> None:
         if not token_ids:
