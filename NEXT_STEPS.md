@@ -55,15 +55,13 @@
   `src/db_slm/adapters/cheetah_binder.py`, and the commands DB-SLM previously could not speak are
   available: `PAIR_PUT_BATCH`, `DEL pairs/graph`, `GRAPH_EDGE_GET`/`NEIGHBORS`/`DEGREE`/
   `NEIGHBOR_TYPES`/`QUERY`, `PREDICT_BACKEND`/`PREDICT_BENCH`, `LOG_FLUSH`, `FILE_CHECKPOINT`,
-  `CLUSTER_STATUS`, `FORK_ASSIGN`. New continuation mirror rows now go out in `PAIR_PUT_BATCH`
-  pages (`CHEETAH_PAIR_BATCH_SIZE`, default 256) with a verified per-row fallback.
+  `CLUSTER_STATUS`, `FORK_ASSIGN`. Level 1 now preserves grouped context/count/probability/Top-K/
+  continuation materializations: one paged namespace scan resolves existing rows, existing payloads
+  are edited in place, and fresh rows go out in `PAIR_PUT_BATCH` pages
+  (`CHEETAH_PAIR_BATCH_SIZE`, default 256) with a verified per-row fallback.
 
 ## Active tasks
-- Advance the submodule gitlink: the binder and its documentation are committed in the Cheetah
-  repository first (`cheetah-db/binders/python/`, `AGENTS.md`, `README.md`, `.gitignore`), then this
-  repository records the new commit. Until then a fresh clone of this repository at the recorded
-  gitlink (`8ecdf35`) cannot import `cheetah_db` and the Cheetah adapter will refuse to start.
-- Measure whether the batched continuation write is worth its complexity at scale: record ingest
+- Measure whether the grouped Level 1 batch writes are worth their complexity at scale: record ingest
   wall time and request counts with `CHEETAH_PAIR_BATCH_SIZE=1` (per-row) against the default on the
   same corpus, in `studies/BENCHMARKS.md`. Upstream measured 0.94× on 2,000 rows against 256-way
   concurrent single writes, so the win here is expected to come from request/parse overhead rather

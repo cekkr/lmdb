@@ -14,6 +14,8 @@ class FakeCheetahClient:
         self.storage: dict[int, bytes] = {}
         self.pairs: dict[bytes, int] = {}
         self._next_key = 1
+        self.pair_get_calls = 0
+        self.pair_scan_calls: list[bytes] = []
 
     def insert(self, payload: bytes) -> tuple[int, str | None]:
         key = self._next_key
@@ -35,7 +37,26 @@ class FakeCheetahClient:
         return True, None
 
     def pair_get(self, value: bytes) -> int | None:
+        self.pair_get_calls += 1
         return self.pairs.get(value)
+
+    def pair_scan(
+        self,
+        prefix: bytes,
+        *,
+        limit: int = 0,
+        cursor: bytes | None = None,
+        include_hidden: bool = False,
+    ) -> tuple[list[tuple[bytes, int]], bytes | None]:
+        self.pair_scan_calls.append(prefix)
+        rows = sorted(
+            (value, key)
+            for value, key in self.pairs.items()
+            if value.startswith(prefix) and (cursor is None or value > cursor)
+        )
+        if limit > 0 and len(rows) > limit:
+            return rows[:limit], rows[limit - 1][0]
+        return rows, None
 
 
 class BatchingFakeCheetahClient(FakeCheetahClient):
@@ -157,8 +178,8 @@ class CheetahHotPathAdapterTests(unittest.TestCase):
         self.assertEqual(projections[0].followers, ((7, 3), (8, 2)))
 
 
-class CheetahContinuationBatchTests(unittest.TestCase):
-    """New continuation rows go out as one request per page, verifiably."""
+class CheetahLevel1BatchTests(unittest.TestCase):
+    """Grouped Level 1 mirrors stay grouped through PAIR_PUT_BATCH."""
 
     def setUp(self) -> None:
         self.client = BatchingFakeCheetahClient()
@@ -185,6 +206,81 @@ class CheetahContinuationBatchTests(unittest.TestCase):
             assert record is not None
             self.assertEqual((record.token_id, record.num_contexts), (token_id, num_contexts))
 
+    def test_context_count_probability_and_topk_groups_use_batch_pages(self) -> None:
+        contexts = [
+            ("00000001", 1, (1,)),
+            ("00000002", 1, (2,)),
+            ("00000003", 1, (3,)),
+        ]
+        counts = [
+            ("00000001", ((10, 2),)),
+            ("00000002", ((11, 3),)),
+            ("00000003", ((12, 4),)),
+        ]
+        probabilities = [
+            ("00000001", ((10, 200, None),)),
+            ("00000002", ((11, 180, 400),)),
+            ("00000003", ((12, 160, None),)),
+        ]
+        topk = [
+            ("00000001", ((10, 200),)),
+            ("00000002", ((11, 180),)),
+            ("00000003", ((12, 160),)),
+        ]
+
+        self.adapter.publish_contexts(contexts)
+        self.adapter.publish_counts_batch(2, counts)
+        self.adapter.publish_probabilities_batch(2, probabilities)
+        self.adapter.publish_topk_batch(2, topk)
+        self.adapter.flush_pending()
+
+        self.assertEqual(
+            self.client.pair_scan_calls,
+            [b"ctx:", b"cnt:2:", b"prob:2:", b"topk:2:"],
+        )
+        self.assertEqual(self.client.pair_get_calls, 0)
+        self.assertEqual(sorted(len(batch) for batch in self.client.batches), [3, 3, 3, 3])
+        serializer = CheetahSerializer()
+        counts_record = serializer.decode_counts(
+            self.client.read(self.client.pairs[b"cnt:2:" + bytes.fromhex("00000002")])
+        )
+        probability_record = serializer.decode_probabilities(
+            self.client.read(self.client.pairs[b"prob:2:" + bytes.fromhex("00000002")])
+        )
+        self.assertEqual(counts_record.followers, ((11, 3),))
+        self.assertEqual(probability_record.entries, ((11, 180, 400),))
+        self.assertEqual(self.adapter.fetch_topk(2, "00000002", 1), [(11, 180)])
+        self.assertTrue(any(value.startswith(b"ctxv:") for value in self.client.pairs))
+
+    def test_batch_updates_scan_once_and_edit_existing_payloads(self) -> None:
+        self.adapter.publish_counts_batch(
+            2,
+            [("00000001", ((10, 2),)), ("00000002", ((11, 3),))],
+        )
+        self.adapter.flush_pending()
+        keys_before = {
+            value: key for value, key in self.client.pairs.items() if value.startswith(b"cnt:2:")
+        }
+        batch_count = len(self.client.batches)
+        self.client.pair_scan_calls.clear()
+
+        self.adapter.publish_counts_batch(
+            2,
+            [("00000001", ((10, 5),)), ("00000002", ((11, 7),))],
+        )
+        self.adapter.flush_pending()
+
+        self.assertEqual(self.client.pair_scan_calls, [b"cnt:2:"])
+        self.assertEqual(len(self.client.batches), batch_count)
+        self.assertEqual(
+            {value: key for value, key in self.client.pairs.items() if value.startswith(b"cnt:2:")},
+            keys_before,
+        )
+        record = CheetahSerializer().decode_counts(
+            self.client.read(self.client.pairs[b"cnt:2:" + bytes.fromhex("00000001")])
+        )
+        self.assertEqual(record.followers, ((10, 5),))
+
     def test_assigned_keys_prime_the_cache_so_a_rewrite_edits(self) -> None:
         self._publish([(1, 10), (2, 20)])
         before = dict(self.client.pairs)
@@ -204,6 +300,19 @@ class CheetahContinuationBatchTests(unittest.TestCase):
         for token_id in (1, 2):
             self.assertIn(self._pair_value(token_id), self.client.pairs)
 
+    def test_context_aliases_survive_batch_failure_fallback(self) -> None:
+        self.client.fail_next_batch = True
+        self.adapter.publish_contexts(
+            [("00000001", 1, (1,)), ("00000002", 1, (2,))]
+        )
+        self.adapter.flush_pending()
+
+        self.assertIn(b"ctx:" + bytes.fromhex("00000001"), self.client.pairs)
+        self.assertEqual(
+            sum(value.startswith(b"ctxv:") for value in self.client.pairs),
+            2,
+        )
+
     def test_a_client_without_the_batch_command_still_publishes(self) -> None:
         client = FakeCheetahClient()
         adapter = CheetahHotPathAdapter(client)
@@ -211,6 +320,13 @@ class CheetahContinuationBatchTests(unittest.TestCase):
         adapter.flush_pending()
         self.assertIn(self._pair_value(1), client.pairs)
         self.assertIn(self._pair_value(2), client.pairs)
+
+    def test_batch_size_one_uses_the_single_row_compatibility_path(self) -> None:
+        self.adapter._pair_batch_size = 1
+        self._publish([(1, 10), (2, 20)])
+        self.assertEqual(self.client.batches, [])
+        self.assertIn(self._pair_value(1), self.client.pairs)
+        self.assertIn(self._pair_value(2), self.client.pairs)
 
 
 class CheetahClientParsingTests(unittest.TestCase):

@@ -102,10 +102,17 @@ DBSLM_CHEETAH_HOST=127.0.0.1
 DBSLM_CHEETAH_PORT=4455
 DBSLM_CHEETAH_DATABASE=emotion_demo
 DBSLM_SQLITE_PATH=var/emotion_demo.sqlite3
+CHEETAH_PAIR_BATCH_SIZE=256
 ```
 
 Use a concrete client address such as `127.0.0.1`, not `0.0.0.0`. Cheetah's TCP protocol has no
 authentication or TLS, so keep it on loopback or another trusted network.
+
+Level 1 ingest keeps context, count, probability, Top-K, and continuation mirror rows grouped. The
+adapter resolves an existing namespace with a paged scan, edits existing payloads in place, and
+creates fresh rows through `PAIR_PUT_BATCH` pages. `CHEETAH_PAIR_BATCH_SIZE` controls the page size
+(maximum 10,000); set it to `1` to use the compatible single-row path. Partial batches are retried
+row by row and verified, because Cheetah batch writes are not transactions.
 
 ## Build and run Cheetah
 

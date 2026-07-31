@@ -153,21 +153,27 @@ its wire protocol, on-disk formats, tests, runtime configuration, and server ope
   Both paths are covered in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py).
 - **Cheetah pair registrations are verified and concurrency-safe.**
   [`CheetahHotPathAdapter._register_pair`](src/db_slm/adapters/cheetah.py) retries `PAIR_SET` and
-  confirms with `PAIR_GET`. The committed gitlink points to `8ecdf35`, a descendant of repair commit
+  confirms with `PAIR_GET`. The committed gitlink points to `984d4f5`, a descendant of repair commit
   `6866be9`, whose atomic high-water mark and serialized pair mutations prevent equal-size inserts
   and shared-prefix writes from overwriting each other. Before advancing the gitlink, run the focused
   Cheetah regression tests listed in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md).
-- **The batched pair write is not a transaction.**
+- **Grouped Level 1 mirrors preserve batch boundaries.**
   [`CheetahClient.pair_put_batch`](src/db_slm/adapters/cheetah.py) sends `PAIR_PUT_BATCH`, which
   stores and binds a whole page in one request instead of two per row, and reports its own
-  `requested`/`applied`/`failed` accounting. Items are independent and applied in order, so a page
-  that did not fully apply leaves the earlier rows written:
+  `requested`/`applied`/`failed` accounting. `NGramStore.ingest`, `_sync_topk`,
+  `_sync_probabilities`, and `MKNSmoother._mirror_counts` keep context/count/probability/Top-K
+  materializations grouped when calling the hot path; continuations are already naturally grouped.
+  [`CheetahHotPathAdapter._publish_rows`](src/db_slm/adapters/cheetah.py) resolves existing rows with
+  one paged namespace scan, edits them without rebinding, and batches only fresh rows. Context
+  batches retain the required `ctxv` vector aliases after key assignment. Items are independent and
+  applied in order, so a page that did not fully apply leaves the earlier rows written:
   [`CheetahHotPathAdapter._insert_batch`](src/db_slm/adapters/cheetah.py) must fall back to the
   verified single-row `_insert` path rather than assume the namespace is complete, and it primes the
   key cache from the returned absolute keys so the next publish edits instead of rebinding. Payloads
   keep the same base64 transport as `insert`, so a batched row reads back through `read` and
   `decode_reduced_payload` like any other. A client or server without the command falls back to the
-  per-row path; `CHEETAH_PAIR_BATCH_SIZE` pages the request under the server's 10,000-item cap.
+  per-row path; `CHEETAH_PAIR_BATCH_SIZE` pages the request under the server's 10,000-item cap, and
+  setting it to `1` explicitly selects the single-row compatibility path.
 - **Relational ingest counts refresh Cheetah before smoothing.**
   [`NGramStore.ingest`](src/db_slm/level1.py) writes the relational working counts, then
   [`MKNSmoother._collect_context_followers`](src/db_slm/level1.py) selects those current rows and
@@ -479,11 +485,13 @@ Modified Kneser–Ney (MKN) materialization.
 - **Called by:** [`DBSLMEngine`](src/db_slm/pipeline.py), decoder, evaluation perplexity, and
   prediction inheritance.
 - **Tests:** [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) covers current
-  relational count selection plus delta-only Cheetah mirroring; tokenizer, merge math, MKN numeric
-  output, and quantization remain uncovered.
+  relational count selection, delta-only Cheetah mirroring, and preservation of grouped context/
+  count/probability/Top-K publication; tokenizer, merge math, MKN numeric output, and quantization
+  remain uncovered.
 - **Common mistakes:** preserve registered structural tokens as atomic units; merging is disabled
-  below n-gram order 5; publish context/count/probability/Top-K changes through `HotPathAdapter`;
-  flush asynchronous count writes before a reducer can observe the namespace.
+  below n-gram order 5; publish context/count/probability/Top-K groups through the batch
+  `HotPathAdapter` methods when available and retain the single-row compatibility calls; flush
+  asynchronous count writes before a reducer can observe the namespace.
 
 ### [`src/db_slm/level2.py`](src/db_slm/level2.py)
 
@@ -720,10 +728,10 @@ Cheetah trie prefixes.
 
 Defines the complete `HotPathAdapter` protocol and `NullHotPathAdapter` SQLite-only implementation.
 
-- **Surface:** publish/fetch Level 1 state, metadata, scans/reducers, context relativism, summaries,
-  system stats, pending-write flush, prediction set/train/query/inherit operations, and the graph
-  context memory calls `graph_node_set`/`graph_node_get`/`graph_edge_set_batch`/`graph_recall`/
-  `graph_similar`/`graph_term_index`.
+- **Surface:** single and grouped publish/fetch Level 1 state, metadata, scans/reducers, context
+  relativism, summaries, system stats, pending-write flush, prediction set/train/query/inherit
+  operations, and the graph context memory calls `graph_node_set`/`graph_node_get`/
+  `graph_edge_set_batch`/`graph_recall`/`graph_similar`/`graph_term_index`.
 - **Called by:** Level 1, Level 2 metadata, context windows, decoder, trainer, and CLI diagnostics.
 - **Common mistake:** add a new capability to the protocol, null adapter, concrete adapter, and
   callers in one change.
@@ -761,8 +769,8 @@ and the graph projections in [`cheetah_types.py`](src/db_slm/cheetah_types.py).
   `CheetahHotPathAdapter`; `CheetahFatalError`. `CheetahError` is the binder's class, re-exported so
   `except CheetahError` still spans both layers.
 - **Key paths:** `pair_scan`; `pair_reduce`; `decode_reduced_payload`; `predict_*`; `graph_*`;
-  `pair_put_batch`; `_register_pair`; `_publish_new_rows`/`_insert_batch`; `_edit_or_reinsert`;
-  `build_cheetah_adapter`.
+  `pair_put_batch`; `_register_pair`; `_publish_row`/`_publish_rows`/`_publish_new_rows`/
+  `_insert_batch`; `_edit_or_reinsert`; `build_cheetah_adapter`.
 - **Delegated commands:** `pair_put_batch`, `pair_purge_prefix` (`DEL pairs`, with `payloads=0`),
   `graph_node_delete`/`graph_edge_delete`/`graph_edge_get`/`graph_degree`/`graph_neighbors`/
   `graph_neighbor_types`/`graph_query`, `predict_backend`/`predict_bench`, `log_flush`,
@@ -774,7 +782,7 @@ and the graph projections in [`cheetah_types.py`](src/db_slm/cheetah_types.py).
   `_graph_format_precision`; `_graph_association_from_payload`; `_parse_graph_recall_response`.
 - **Tests:** [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) covers serialization,
   idempotent publish/fetch, response parsing, timeout recovery, canonical job flow, legacy fallback,
-  storage transport decoding, and the batched continuation write with its fallbacks. The binder's
+  storage transport decoding, and grouped Level 1 batch writes with their fallbacks. The binder's
   own suite ([`cheetah-db/binders/python/tests/`](cheetah-db/binders/python/tests/)) covers the
   generic codec and call shapes, including a live server behind `CHEETAH_INTEGRATION=1`.
 - **Common mistakes:** `0.0.0.0` is a listen address, not a client destination (the binder's `hosts`
@@ -1087,9 +1095,10 @@ Tracked legacy snapshot of an older training script despite its `.txt` name.
 - **Behavior:** per-thread clients publish/fetch Level 1 data, page namespace scans, execute reducers
   through jobs, inspect system state, flush asynchronous mirror writes, and train/query/inherit
   prediction entries. MKN rebuilds compare current relational ingest counts with Cheetah and publish
-  only changed follower sets before calculating probabilities. New continuation rows go out through
-  `PAIR_PUT_BATCH` — one request per page instead of two per token — with a verified per-row
-  fallback.
+  only changed follower sets before calculating probabilities. Context/count/probability/Top-K/
+  continuation groups resolve existing rows with one namespace scan, edit those payloads in place,
+  and create fresh rows through `PAIR_PUT_BATCH` — one request per page instead of two per row —
+  with a verified per-row fallback.
 - **Flow and owners:** [`src/db_slm/adapters/cheetah.py`](src/db_slm/adapters/cheetah.py) on top of
   the generic binder [`cheetah-db/binders/python/`](cheetah-db/binders/python/) (imported through
   [`adapters/cheetah_binder.py`](src/db_slm/adapters/cheetah_binder.py)) → Cheetah TCP command
@@ -1464,7 +1473,7 @@ checklist; distribution is currently source plus the separately built Cheetah bi
 | Dependency records stay out of generation text and legacy artifacts are rejected | [`tests/test_train_monitor.py`](tests/test_train_monitor.py) + [`tests/test_pipeline_response.py`](tests/test_pipeline_response.py) |
 | Current ingest counts replace stale Cheetah mirrors before smoothing | [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) |
 | Paraphraser guard vs rewrite policy | [`scripts/run_paraphraser_regression.py`](scripts/run_paraphraser_regression.py) + [`studies/paraphraser_regression.jsonl`](studies/paraphraser_regression.jsonl) |
-| Batched continuation writes: paging, key-cache priming, partial-batch fallback | `CheetahContinuationBatchTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) |
+| Grouped Level 1 writes: namespace resolution, paging, context aliases, edits, key-cache priming, partial/single-row fallback | `CheetahLevel1BatchTests` in [`tests/test_cheetah_adapter.py`](tests/test_cheetah_adapter.py) + `Level1BatchPublicationTests` in [`tests/test_level1_smoothing.py`](tests/test_level1_smoothing.py) |
 | Generic Cheetah codec, client, KV/graph/job call shapes (and a live server) | [`cheetah-db/binders/python/tests/`](cheetah-db/binders/python/tests/) — `python3 -m unittest discover -s tests -t .`, `CHEETAH_INTEGRATION=1` for the live pass |
 | Cheetah storage concurrency, trie, reducers, jobs, prediction tables, lifecycle, and formats | Test map in [`cheetah-db/AGENTS.md`](cheetah-db/AGENTS.md) |
 

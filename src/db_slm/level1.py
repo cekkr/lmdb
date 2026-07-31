@@ -658,6 +658,7 @@ class NGramStore:
             self.vocab.increment_frequency(token_id)
             if progress_callback and (idx % vocab_stride == 0 or idx == total_tokens):
                 progress_callback("vocab", idx, total_tokens)
+        contexts_to_publish: Dict[str, Tuple[int, ...]] = {}
         for n in range(1, self.order + 1):
             if len(token_ids) < n:
                 break
@@ -672,6 +673,7 @@ class NGramStore:
                 next_token = ngram[-1]
                 context_hash = self._hash(context)
                 self._upsert_context(context_hash, context)
+                contexts_to_publish.setdefault(context_hash, tuple(context))
                 self.db.execute(
                     f"""
                     INSERT INTO {table}(context_hash, next_token_id, count)
@@ -694,6 +696,17 @@ class NGramStore:
                 processed = idx + 1
                 if progress_callback and (processed % window_stride == 0 or processed == windows):
                     progress_callback(f"order_{n}", processed, windows)
+        if contexts_to_publish:
+            entries = [
+                (context_hash, len(context), context)
+                for context_hash, context in contexts_to_publish.items()
+            ]
+            batch_publisher = getattr(self.hot_path, "publish_contexts", None)
+            if callable(batch_publisher):
+                batch_publisher(entries)
+            else:
+                for context_hash, order_size, context in entries:
+                    self.hot_path.publish_context(context_hash, order_size, context)
 
     def _counts_table(self, order: int) -> str:
         return f"tbl_l1_ng_counts_{order}"
@@ -721,7 +734,6 @@ class NGramStore:
             """,
             (context_hash, len(token_ids), token_blob, parent),
         )
-        self.hot_path.publish_context(context_hash, len(token_ids), token_ids)
 
     # ------------------------------------------------------------------ #
     # Retrieval
@@ -875,6 +887,10 @@ class NGramStore:
         grouped: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
         for context_hash, _rank, token_id, q in topk_rows:
             grouped[context_hash].append((token_id, q))
+        batch_publisher = getattr(self.hot_path, "publish_topk_batch", None)
+        if callable(batch_publisher):
+            batch_publisher(order, list(grouped.items()))
+            return
         for context_hash, ranked in grouped.items():
             self.hot_path.publish_topk(order, context_hash, ranked)
 
@@ -887,6 +903,10 @@ class NGramStore:
         grouped: Dict[str, List[Tuple[int, int, int | None]]] = defaultdict(list)
         for context_hash, token_id, q_logprob, backoff_alpha in rows:
             grouped[context_hash].append((token_id, q_logprob, backoff_alpha))
+        batch_publisher = getattr(self.hot_path, "publish_probabilities_batch", None)
+        if callable(batch_publisher):
+            batch_publisher(order, list(grouped.items()))
+            return
         for context_hash, entries in grouped.items():
             publisher(order, context_hash, entries)  # type: ignore[misc]
 
@@ -1110,13 +1130,18 @@ class MKNSmoother:
         if hot_counts:
             for projection in self.store.hot_path.iter_counts(order):  # type: ignore[attr-defined]
                 existing[projection.context_hash] = dict(projection.followers)
-        changed = False
+        changed_entries: list[tuple[str, List[Tuple[int, int]]]] = []
         for context_hash, followers in contexts.items():
             if existing.get(context_hash) == dict(followers):
                 continue
-            publisher(order, context_hash, followers)  # type: ignore[misc]
-            changed = True
-        if changed:
+            changed_entries.append((context_hash, followers))
+        if changed_entries:
+            batch_publisher = getattr(self.store.hot_path, "publish_counts_batch", None)
+            if callable(batch_publisher):
+                batch_publisher(order, changed_entries)
+            else:
+                for context_hash, followers in changed_entries:
+                    publisher(order, context_hash, followers)  # type: ignore[misc]
             flusher = getattr(self.store.hot_path, "flush_pending", None)
             if flusher:
                 flusher()

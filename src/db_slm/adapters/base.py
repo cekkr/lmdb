@@ -24,14 +24,34 @@ class HotPathAdapter(Protocol):
     def publish_context(self, context_hash: str, order_size: int, token_ids: Sequence[int]) -> None:
         """Persist context metadata so trie-style traversals avoid SQL lookups."""
 
+    def publish_contexts(
+        self,
+        entries: Sequence[tuple[str, int, Sequence[int]]],
+    ) -> None:
+        """Persist many context records through the backend's bulk-write path."""
+
     def publish_topk(self, order: int, context_hash: str, ranked: Sequence[tuple[int, int]]) -> None:
         """Store the ranked (token_id, q_logprob) list for a context."""
+
+    def publish_topk_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
+        """Store Top-K rows for many contexts through the bulk-write path."""
 
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         """Return cached ranked results or None when unavailable."""
 
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
         """Mirror raw follower counts for a context hash."""
+
+    def publish_counts_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
+        """Mirror raw follower counts for many contexts."""
 
     def flush_pending(self) -> None:
         """Wait for queued mirror writes to become visible to subsequent reads."""
@@ -43,6 +63,13 @@ class HotPathAdapter(Protocol):
         entries: Sequence[tuple[int, int, int | None]],
     ) -> None:
         """Mirror quantized probability rows per context."""
+
+    def publish_probabilities_batch(
+        self,
+        order: int,
+        contexts: Sequence[tuple[str, Sequence[tuple[int, int, int | None]]]],
+    ) -> None:
+        """Mirror quantized probability rows for many contexts."""
 
     def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
         """Mirror continuation metadata (token id -> num contexts)."""
@@ -228,13 +255,33 @@ class NullHotPathAdapter:
     def publish_context(self, context_hash: str, order_size: int, token_ids: Sequence[int]) -> None:
         return None
 
+    def publish_contexts(
+        self,
+        entries: Sequence[tuple[str, int, Sequence[int]]],
+    ) -> None:
+        return None
+
     def publish_topk(self, order: int, context_hash: str, ranked: Sequence[tuple[int, int]]) -> None:
+        return None
+
+    def publish_topk_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
         return None
 
     def fetch_topk(self, order: int, context_hash: str, limit: int) -> list[tuple[int, int]] | None:
         return None
 
     def publish_counts(self, order: int, context_hash: str, followers: Sequence[tuple[int, int]]) -> None:
+        return None
+
+    def publish_counts_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
         return None
 
     def flush_pending(self) -> None:
@@ -245,6 +292,13 @@ class NullHotPathAdapter:
         order: int,
         context_hash: str,
         entries: Sequence[tuple[int, int, int | None]],
+    ) -> None:
+        return None
+
+    def publish_probabilities_batch(
+        self,
+        order: int,
+        contexts: Sequence[tuple[str, Sequence[tuple[int, int, int | None]]]],
     ) -> None:
         return None
 

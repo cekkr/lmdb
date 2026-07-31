@@ -2081,24 +2081,61 @@ class CheetahHotPathAdapter(HotPathAdapter):
         except CheetahError as exc:
             self._disable(exc)
 
+    def publish_contexts(
+        self,
+        entries: Sequence[tuple[str, int, Sequence[int]]],
+    ) -> None:
+        """Batch-create context records and retain their vector aliases."""
+        if not self._enabled or not entries:
+            return
+        token_ids_by_hash: dict[str, tuple[int, ...]] = {}
+        rows: list[tuple[str, bytes]] = []
+        for context_hash, order_size, token_ids in entries:
+            tokens = tuple(int(token_id) for token_id in token_ids)
+            token_ids_by_hash[context_hash] = tokens
+            rows.append(
+                (
+                    context_hash,
+                    self._serializer.encode_context(order_size, tokens),
+                )
+            )
+        try:
+            self._publish_rows(
+                "ctx",
+                rows,
+                update_existing=False,
+                on_created=lambda identifier, key: self._register_vector_alias(
+                    key,
+                    token_ids_by_hash[identifier],
+                ),
+            )
+        except CheetahError as exc:
+            self._disable(exc)
+
     def publish_topk(self, order: int, context_hash: str, ranked: Sequence[tuple[int, int]]) -> None:
         if not self._enabled or not ranked:
             return
         namespace = f"topk:{order}"
         payload = self._serializer.encode_topk(order, ranked)
         try:
-            key = self._lookup_key(namespace, context_hash=context_hash)
-            if key is None:
-                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
-            else:
-                self._submit_async(
-                    lambda key=key, payload=payload: self._edit_or_reinsert(
-                        namespace,
-                        context_hash,
-                        key,
-                        payload,
-                    )
-                )
+            self._publish_row(namespace, context_hash, payload)
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def publish_topk_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
+        if not self._enabled or not entries:
+            return
+        rows = [
+            (context_hash, self._serializer.encode_topk(order, ranked))
+            for context_hash, ranked in entries
+            if ranked
+        ]
+        try:
+            self._publish_rows(f"topk:{order}", rows)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -2108,18 +2145,24 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace = f"cnt:{order}"
         payload = self._serializer.encode_counts(order, followers)
         try:
-            key = self._lookup_key(namespace, context_hash=context_hash)
-            if key is None:
-                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
-            else:
-                self._submit_async(
-                    lambda key=key, payload=payload: self._edit_or_reinsert(
-                        namespace,
-                        context_hash,
-                        key,
-                        payload,
-                    )
-                )
+            self._publish_row(namespace, context_hash, payload)
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def publish_counts_batch(
+        self,
+        order: int,
+        entries: Sequence[tuple[str, Sequence[tuple[int, int]]]],
+    ) -> None:
+        if not self._enabled or not entries:
+            return
+        rows = [
+            (context_hash, self._serializer.encode_counts(order, followers))
+            for context_hash, followers in entries
+            if followers
+        ]
+        try:
+            self._publish_rows(f"cnt:{order}", rows)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -2142,26 +2185,32 @@ class CheetahHotPathAdapter(HotPathAdapter):
         namespace = f"prob:{order}"
         payload = self._serializer.encode_probabilities(order, entries)
         try:
-            key = self._lookup_key(namespace, context_hash=context_hash)
-            if key is None:
-                self._submit_async(lambda: self._insert(namespace, context_hash, payload))
-            else:
-                self._submit_async(
-                    lambda key=key, payload=payload: self._edit_or_reinsert(
-                        namespace,
-                        context_hash,
-                        key,
-                        payload,
-                    )
-                )
+            self._publish_row(namespace, context_hash, payload)
+        except CheetahError as exc:
+            self._disable(exc)
+
+    def publish_probabilities_batch(
+        self,
+        order: int,
+        contexts: Sequence[tuple[str, Sequence[tuple[int, int, int | None]]]],
+    ) -> None:
+        if not self._enabled or not contexts:
+            return
+        rows = [
+            (context_hash, self._serializer.encode_probabilities(order, entries))
+            for context_hash, entries in contexts
+            if entries
+        ]
+        try:
+            self._publish_rows(f"prob:{order}", rows)
         except CheetahError as exc:
             self._disable(exc)
 
     def publish_continuations(self, entries: Sequence[tuple[int, int]]) -> None:
         """Mirror per-token continuation counts.
 
-        Unlike the other publish paths this one is called with a whole slice of
-        the vocabulary at once, so the new rows are written through
+        This path is called with a whole slice of the vocabulary at once, so
+        new rows are written through
         ``PAIR_PUT_BATCH`` — one request per page instead of two per token.
         Rows that already exist still take the edit path: the batch command
         only ever creates.
@@ -2169,30 +2218,13 @@ class CheetahHotPathAdapter(HotPathAdapter):
         if not self._enabled or not entries:
             return
         namespace = "cont"
-        fresh: list[tuple[str, bytes]] = []
+        rows: list[tuple[str, bytes]] = []
         for token_id, num_contexts in entries:
             identifier = f"{int(token_id) & 0xFFFFFFFF:08x}"
             payload = self._serializer.encode_continuation(token_id, num_contexts)
-            try:
-                key = self._lookup_key(namespace, context_hash=identifier)
-                if key is None:
-                    fresh.append((identifier, payload))
-                else:
-                    self._submit_async(
-                        lambda key=key, identifier=identifier, payload=payload: self._edit_or_reinsert(
-                            namespace,
-                            identifier,
-                            key,
-                            payload,
-                        )
-                    )
-            except CheetahError as exc:
-                self._disable(exc)
-                return
-        if not fresh:
-            return
+            rows.append((identifier, payload))
         try:
-            self._publish_new_rows(namespace, fresh)
+            self._publish_rows(namespace, rows)
         except CheetahError as exc:
             self._disable(exc)
 
@@ -3006,7 +3038,85 @@ class CheetahHotPathAdapter(HotPathAdapter):
         )
         raise CheetahError("failed to register cheetah pair mapping")
 
-    def _publish_new_rows(self, namespace: str, rows: Sequence[tuple[str, bytes]]) -> None:
+    def _publish_row(self, namespace: str, identifier: str, payload: bytes) -> None:
+        """Publish one row without paying for a whole-namespace scan."""
+        key = self._lookup_key(namespace, context_hash=identifier)
+        if key is None:
+            self._submit_async(lambda: self._insert(namespace, identifier, payload))
+            return
+        self._submit_async(
+            lambda key=key: self._edit_or_reinsert(
+                namespace,
+                identifier,
+                key,
+                payload,
+            )
+        )
+
+    def _publish_rows(
+        self,
+        namespace: str,
+        rows: Sequence[tuple[str, bytes]],
+        *,
+        update_existing: bool = True,
+        on_created: Callable[[str, int], None] | None = None,
+    ) -> None:
+        """Resolve a namespace once, edit known rows, and batch-create the rest.
+
+        A high-volume caller should not turn a grouped materialization back into
+        one ``PAIR_GET`` per row. Current clients page ``PAIR_SCAN`` once for
+        the namespace; lightweight/legacy clients without that command keep the
+        point-lookup path.
+        """
+        if not rows:
+            return
+        unique_rows = list(dict(rows).items())
+        existing_by_value: dict[bytes, int] | None = None
+        scan = getattr(self._client, "pair_scan", None)
+        if len(unique_rows) > 1 and callable(scan):
+            # A preceding group may still be creating rows on the async pool
+            # (notably baseline-token contexts immediately before merged-token
+            # contexts). Drain it before taking the namespace snapshot so the
+            # second group edits/skips those rows instead of rebinding them.
+            self.flush_pending()
+            existing_by_value = dict(self.scan_namespace(namespace))
+
+        fresh: list[tuple[str, bytes]] = []
+        namespace_prefix = namespace.encode("utf-8") + b":"
+        for identifier, payload in unique_rows:
+            key: int | None
+            if existing_by_value is None:
+                key = self._lookup_key(namespace, context_hash=identifier)
+            else:
+                pair_value = self._pair_value(namespace, context_hash=identifier)
+                raw_value = (
+                    pair_value[len(namespace_prefix) :]
+                    if pair_value is not None and pair_value.startswith(namespace_prefix)
+                    else None
+                )
+                key = existing_by_value.get(raw_value) if raw_value is not None else None
+                if key is not None:
+                    self._set_cache(namespace, key, context_hash=identifier)
+            if key is None:
+                fresh.append((identifier, payload))
+            elif update_existing:
+                self._submit_async(
+                    lambda key=key, identifier=identifier, payload=payload: self._edit_or_reinsert(
+                        namespace,
+                        identifier,
+                        key,
+                        payload,
+                    )
+                )
+        self._publish_new_rows(namespace, fresh, on_created=on_created)
+
+    def _publish_new_rows(
+        self,
+        namespace: str,
+        rows: Sequence[tuple[str, bytes]],
+        *,
+        on_created: Callable[[str, int], None] | None = None,
+    ) -> None:
         """Create several rows, batching the store+bind when the server can.
 
         A server without ``PAIR_PUT_BATCH`` (or a client stub that does not
@@ -3014,20 +3124,33 @@ class CheetahHotPathAdapter(HotPathAdapter):
         2N requests instead of one — slower, never different.
         """
         batch = getattr(self._client, "pair_put_batch", None)
-        if not callable(batch) or len(rows) < 2:
+        if not callable(batch) or self._pair_batch_size <= 1 or len(rows) < 2:
             for identifier, payload in rows:
-                self._submit_async(
-                    lambda identifier=identifier, payload=payload: self._insert(
-                        namespace, identifier, payload
-                    )
-                )
+                def insert_one(identifier: str = identifier, payload: bytes = payload) -> None:
+                    key = self._insert(namespace, identifier, payload)
+                    if on_created is not None:
+                        on_created(identifier, key)
+
+                self._submit_async(insert_one)
             return
         size = self._pair_batch_size
         for start in range(0, len(rows), size):
             page = list(rows[start : start + size])
-            self._submit_async(lambda page=page: self._insert_batch(namespace, page))
+            self._submit_async(
+                lambda page=page: self._insert_batch(
+                    namespace,
+                    page,
+                    on_created=on_created,
+                )
+            )
 
-    def _insert_batch(self, namespace: str, page: Sequence[tuple[str, bytes]]) -> None:
+    def _insert_batch(
+        self,
+        namespace: str,
+        page: Sequence[tuple[str, bytes]],
+        *,
+        on_created: Callable[[str, int], None] | None = None,
+    ) -> None:
         """One ``PAIR_PUT_BATCH`` for a page, with a verified per-row fallback.
 
         The batch is not a transaction and reports its own accounting, so a
@@ -3050,13 +3173,17 @@ class CheetahHotPathAdapter(HotPathAdapter):
                 namespace,
             )
             for identifier, payload in page:
-                self._insert(namespace, identifier, payload)
+                key = self._insert(namespace, identifier, payload)
+                if on_created is not None:
+                    on_created(identifier, key)
             return
         for (identifier, payload), key in zip(page, assigned):
             if key is None:
-                self._insert(namespace, identifier, payload)
+                key = self._insert(namespace, identifier, payload)
             else:
                 self._set_cache(namespace, key, context_hash=identifier)
+            if on_created is not None:
+                on_created(identifier, key)
 
     def _register_vector_alias(self, key: int, token_ids: Sequence[int]) -> None:
         if not token_ids:
